@@ -213,6 +213,17 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
     q = q.contiguous()
     if not out.is_contiguous():
         return False
+    if os.environ.get("VLLM_SM70_DECODE_DEBUG") == "1":
+        global _DEC_DBG
+        try:
+            _DEC_DBG += 1
+        except NameError:
+            _DEC_DBG = 1
+        if _DEC_DBG <= 3:
+            print(f"[SM70DECDBG] q={tuple(q.shape)} kv={tuple(kv_cache.shape)} "
+                  f"kv_stride0={kv_cache.stride(0)} bt={tuple(block_table.shape)} "
+                  f"kvlens={kv_lens.tolist()} splits={splits} "
+                  f"window={window_left}", flush=True)
     need = R * 2 * 8 * _NPARTS * 258
     _mod().run(q, kv_cache, block_table, kv_lens, _BUF[:need], out,
                k_scale, v_scale, sm_scale, _NPARTS, int(window_left), R)
