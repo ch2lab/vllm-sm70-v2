@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cub/block/block_scan.cuh>
 #include <cstdint>
+#include <cstdlib>
 
 namespace vllm::qsa {
 
@@ -281,6 +282,284 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
   }
 }
 
+constexpr int kFastBucketCapacity = 704;
+constexpr int kRelBins = 1024;
+
+// Three-pass EXACT selector for wide rows, robust to QSA's heavily clustered
+// scores (sigma ~1e-3 makes every absolute-bit radix prefix collapse to one
+// bucket). Bucketing is RELATIVE to the row's [min,max] and, crucially,
+// DETERMINISTIC: the bin is an integer shift, not a float multiply, so pass 2
+// and pass 3 can never disagree by an ulp about an element's bin.
+//   pass 1: ordered-key min/max.
+//   pass 2: kRelBins histogram of (key-min) >> shift.
+//   pass 3: emit every element above the pivot bin (all of them are selected)
+//           and collect the pivot bin's candidates in shared.
+// The exact 32-bit pivot and the increasing-index tie order are then resolved
+// among those candidates, so the result is bit-identical to the baseline.
+// A pivot bin wider than the capacity falls back to the baseline 4-pass radix.
+template <int TopK>
+__global__
+__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_fast_kernel(
+    const float* __restrict__ logits, const int32_t* __restrict__ lengths,
+    int32_t* __restrict__ output, uint32_t num_rows, uint32_t columns,
+    uint32_t stride) {
+  const uint32_t tx = threadIdx.x;
+  const uint32_t row = blockIdx.x;
+  if (row >= num_rows) return;
+  using Shared = LexicographicTopKShared<TopK>;
+  using BlockScan = typename Shared::BlockScan;
+
+  const int32_t raw_length = lengths[row];
+  const uint32_t length =
+      raw_length > 0 ? min(static_cast<uint32_t>(raw_length), columns) : 0;
+  const float* row_logits = logits + static_cast<uint64_t>(row) * stride;
+  int32_t* row_output = output + static_cast<uint64_t>(row) * TopK;
+
+  if (length <= TopK) {
+    for (uint32_t index = tx; index < TopK;
+         index += kLexicographicTopKThreads) {
+      row_output[index] = index < length ? static_cast<int32_t>(index) : -1;
+    }
+    return;
+  }
+
+  __shared__ Shared shared;
+  __shared__ uint32_t rel_bins[kRelBins];
+  __shared__ uint32_t bucket_key[kFastBucketCapacity];
+  __shared__ uint32_t bucket_idx[kFastBucketCapacity];
+  __shared__ uint32_t bucket_count;
+  __shared__ uint32_t key_min;
+  __shared__ uint32_t key_max;
+  __shared__ uint32_t bin_shift;
+  __shared__ uint32_t pivot_key;
+  __shared__ uint32_t above_in_bucket;
+  __shared__ int pivot_bin;
+
+  if (tx == 0) {
+    shared.greater_seen = 0;
+    shared.equal_seen = 0;
+    shared.remaining = TopK;
+    shared.prefix = 0;
+    bucket_count = 0;
+    key_min = 0xffffffffu;
+    key_max = 0u;
+    pivot_key = 0xffffffffu;
+    above_in_bucket = 0;
+    pivot_bin = 0;
+    bin_shift = 0;
+  }
+  __syncthreads();
+
+  for (uint32_t base = 0; base < length; base += kLexicographicTopKThreads) {
+    const uint32_t index = base + tx;
+    if (index < length) {
+      const uint32_t key = ordered_float_bits(row_logits[index]);
+      atomicMin(&key_min, key);
+      atomicMax(&key_max, key);
+    }
+  }
+  __syncthreads();
+  if (tx == 0) {
+    // Smallest shift that maps the row's key span into kRelBins bins. Integer
+    // only, so both scanning passes classify every element identically.
+    uint32_t shift = 0;
+    while ((uint64_t)(key_max - key_min) >> shift >= (uint64_t)kRelBins) {
+      ++shift;
+    }
+    bin_shift = shift;
+  }
+  __syncthreads();
+
+  for (uint32_t b = tx; b < kRelBins; b += kLexicographicTopKThreads) {
+    rel_bins[b] = 0u;
+  }
+  __syncthreads();
+  for (uint32_t base = 0; base < length; base += kLexicographicTopKThreads) {
+    const uint32_t index = base + tx;
+    if (index < length) {
+      const uint32_t key = ordered_float_bits(row_logits[index]);
+      const uint32_t bin = (key - key_min) >> bin_shift;
+      atomicAdd(&rel_bins[bin < (uint32_t)kRelBins ? bin
+                                                   : (uint32_t)kRelBins - 1u],
+                1u);
+    }
+  }
+  __syncthreads();
+  if (tx == 0) {
+    uint32_t remaining = shared.remaining;
+    int chosen = 0;
+    for (int b = kRelBins - 1; b >= 0; --b) {
+      const uint32_t count = rel_bins[b];
+      if (remaining > count) {
+        remaining -= count;
+      } else {
+        chosen = b;
+        shared.remaining = remaining;
+        break;
+      }
+    }
+    pivot_bin = chosen;
+  }
+  __syncthreads();
+
+  for (uint32_t base = 0; base < length; base += kLexicographicTopKThreads) {
+    const uint32_t index = base + tx;
+    uint32_t above = 0;
+    bool in_bin = false;
+    uint32_t key = 0u;
+    if (index < length) {
+      key = ordered_float_bits(row_logits[index]);
+      const uint32_t bin = (key - key_min) >> bin_shift;
+      above = bin > (uint32_t)pivot_bin ? 1u : 0u;
+      in_bin = bin == (uint32_t)pivot_bin;
+    }
+    uint64_t prefix_counts = 0;
+    uint64_t aggregate_counts = 0;
+    BlockScan(shared.scan)
+        .ExclusiveSum(static_cast<uint64_t>(above), prefix_counts,
+                      aggregate_counts);
+    __syncthreads();
+    if (tx == 0) {
+      shared.chunk_greater_base = shared.greater_seen;
+      shared.greater_seen += static_cast<uint32_t>(aggregate_counts);
+    }
+    __syncthreads();
+    if (above) {
+      row_output[shared.chunk_greater_base +
+                 static_cast<uint32_t>(prefix_counts)] =
+          static_cast<int32_t>(index);
+    }
+    if (in_bin) {
+      const uint32_t slot = atomicAdd(&bucket_count, 1u);
+      if (slot < kFastBucketCapacity) {
+        bucket_key[slot] = key;
+        bucket_idx[slot] = index;
+      }
+    }
+    __syncthreads();
+  }
+
+  const uint32_t nb = bucket_count;
+  const uint32_t ties = shared.remaining;
+  if (nb <= kFastBucketCapacity && nb > 0 && ties > 0) {
+    if (tx < nb) {
+      uint32_t greater = 0;
+      uint32_t eqg = 0;
+      for (uint32_t other = 0; other < nb; ++other) {
+        const uint32_t k = bucket_key[other];
+        if (k > bucket_key[tx]) ++greater;
+        if (k >= bucket_key[tx]) ++eqg;
+      }
+      if (greater < ties && eqg >= ties) pivot_key = bucket_key[tx];
+    }
+    __syncthreads();
+    if (tx == 0) {
+      uint32_t above = 0;
+      for (uint32_t other = 0; other < nb; ++other) {
+        if (bucket_key[other] > pivot_key) ++above;
+      }
+      above_in_bucket = above;
+    }
+    __syncthreads();
+    if (tx < nb && pivot_key != 0xffffffffu) {
+      const uint32_t my_index = bucket_idx[tx];
+      uint32_t greater_rank = 0;
+      uint32_t equal_rank = 0;
+      for (uint32_t other = 0; other < nb; ++other) {
+        if (bucket_idx[other] >= my_index) continue;
+        const uint32_t k = bucket_key[other];
+        if (k > pivot_key) {
+          ++greater_rank;
+        } else if (k == pivot_key) {
+          ++equal_rank;
+        }
+      }
+      if (bucket_key[tx] > pivot_key) {
+        row_output[shared.greater_seen + greater_rank] =
+            static_cast<int32_t>(my_index);
+      } else if (bucket_key[tx] == pivot_key && equal_rank < ties) {
+        row_output[shared.greater_seen + above_in_bucket + equal_rank] =
+            static_cast<int32_t>(my_index);
+      }
+    }
+    return;
+  }
+
+  // Fallback: baseline 4-pass radix + emit over the whole row.
+  if (tx == 0) {
+    shared.greater_seen = 0;
+    shared.equal_seen = 0;
+    shared.remaining = TopK;
+    shared.prefix = 0;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int pass = 0; pass < 4; ++pass) {
+    for (uint32_t bin = tx; bin < kLexicographicTopKBins;
+         bin += kLexicographicTopKThreads) {
+      shared.histogram[bin] = 0;
+    }
+    __syncthreads();
+    const int shift = 24 - pass * 8;
+    const uint32_t prefix = shared.prefix;
+    const uint32_t prefix_mask = pass == 0 ? 0 : (~uint32_t{0} << (shift + 8));
+    for (uint32_t index = tx; index < length;
+         index += kLexicographicTopKThreads) {
+      const uint32_t key = ordered_float_bits(row_logits[index]);
+      if ((key & prefix_mask) == prefix) {
+        atomicAdd(&shared.histogram[(key >> shift) & 0xffu], 1u);
+      }
+    }
+    __syncthreads();
+    if (tx == 0) {
+      uint32_t remaining = shared.remaining;
+      for (int bin = kLexicographicTopKBins - 1; bin >= 0; --bin) {
+        const uint32_t count = shared.histogram[bin];
+        if (remaining > count) {
+          remaining -= count;
+        } else {
+          shared.prefix |= static_cast<uint32_t>(bin) << shift;
+          shared.remaining = remaining;
+          break;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (tx == 0) shared.pivot = shared.prefix;
+  __syncthreads();
+  for (uint32_t base = 0; base < length; base += kLexicographicTopKThreads) {
+    const uint32_t index = base + tx;
+    const uint32_t key =
+        index < length ? ordered_float_bits(row_logits[index]) : 0u;
+    const uint32_t greater = (index < length && key > shared.pivot) ? 1u : 0u;
+    const uint32_t equal = (index < length && key == shared.pivot) ? 1u : 0u;
+    const uint64_t counts = (static_cast<uint64_t>(greater) << 32) | equal;
+    uint64_t prefix_counts = 0;
+    uint64_t aggregate_counts = 0;
+    BlockScan(shared.scan)
+        .ExclusiveSum(counts, prefix_counts, aggregate_counts);
+    __syncthreads();
+    if (tx == 0) {
+      shared.chunk_greater_base = shared.greater_seen;
+      shared.chunk_equal_base = shared.equal_seen;
+      shared.greater_seen += static_cast<uint32_t>(aggregate_counts >> 32);
+      shared.equal_seen += static_cast<uint32_t>(aggregate_counts);
+    }
+    __syncthreads();
+    const uint32_t greater_before =
+        shared.chunk_greater_base + static_cast<uint32_t>(prefix_counts >> 32);
+    const uint32_t equal_before =
+        shared.chunk_equal_base + static_cast<uint32_t>(prefix_counts);
+    const bool selected = greater || (equal && equal_before < shared.remaining);
+    if (selected) {
+      row_output[greater_before + min(equal_before, shared.remaining)] =
+          static_cast<int32_t>(index);
+    }
+    __syncthreads();
+  }
+}
+
 // Single-token QSA decode has only about two thousand live block scores at the
 // common 8K context length. After the first radix byte, scanning all scores for
 // the other three bytes wastes most of the work. Compact the selected coarse
@@ -506,6 +785,13 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
     qsa_lexicographic_decode_topk_kernel<TopK>
         <<<1, kLexicographicTopKThreads, 0, stream>>>(logits, lengths, output,
                                                       columns);
+  } else if (columns >= 2048u) {
+    // Wide rows: the relative-bucketing selector scans the score row twice
+    // instead of four times (plus the emit), which is where long-context
+    // prefill spends its indexer time.
+    qsa_lexicographic_topk_fast_kernel<TopK>
+        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
+            logits, lengths, output, num_rows, columns, stride);
   } else {
     qsa_lexicographic_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(

@@ -349,3 +349,4 @@ void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
   STD_TORCH_CHECK(false, "qsa_lexicographic_topk is not supported on ROCm");
 #endif
 }
+
