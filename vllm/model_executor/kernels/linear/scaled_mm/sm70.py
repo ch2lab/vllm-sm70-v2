@@ -103,6 +103,11 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
         self._weight_deq: torch.Tensor | None = None
         self._qpn: torch.Tensor | None = None
         self._qpn_axes: tuple[int, int] | None = None
+        # per-channel weight scale: the scalar the fragment feed takes is the
+        # MAX of the row scales (keeps every intermediate in fp16 range), and
+        # the per-row residual is multiplied back after the GEMM.
+        self._qpn_row_scale: torch.Tensor | None = None
+        self._qpn_wscale: torch.Tensor | None = None
 
     @classmethod
     def is_supported(
@@ -151,6 +156,35 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
         # must go through the FP16 dequantise path instead (where the
         # channelwise multiply happens at load).
         qpn_eligible = self.config.weight_quant_key.scale.group_shape.is_per_tensor()
+        if not qpn_eligible and _qpn_available() and self.config.input_dtype == torch.float16:
+            ws = w_s.detach().float().flatten()
+            out_f = (getattr(layer, "output_size_per_partition", None)
+                     or getattr(layer, "num_embeddings", None)
+                     or getattr(layer, "out_features", None))
+            in_f = (getattr(layer, "input_size_per_partition", None)
+                    or getattr(layer, "embedding_dim", None)
+                    or getattr(layer, "in_features", None))
+            src = None
+            if out_f is not None and in_f is not None:
+                if tuple(w.shape) == (int(out_f), int(in_f)):
+                    src = w.t()
+                elif tuple(w.shape) == (int(in_f), int(out_f)):
+                    src = w
+            if src is not None and ws.numel() == int(out_f):
+                src = src.contiguous()
+                k, n = int(src.shape[0]), int(src.shape[1])
+                if n % 32 == 0 and k % 16 == 0:
+                    self._qpn = torch.ops._C.sm70_fp8_qpn_pack(src.view(torch.uint8))
+                    self._qpn_axes = (k, n)
+                    wmax = ws.max().reshape(1)
+                    self._qpn_wscale = wmax
+                    self._qpn_row_scale = (ws / wmax).view(1, n)
+                    if hasattr(layer, "weight"):
+                        del layer.weight
+                    return
+            logger.warning(
+                "SM70 FP8 QPN per-channel skipped for %s: w=%s out=%s in=%s scales=%d",
+                layer, tuple(w.shape), out_f, in_f, int(ws.numel()))
         if (
             _qpn_available()
             and self.config.input_dtype == torch.float16
@@ -234,6 +268,9 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
         w, w_s, x_s, x_s_ub = self.layer_param_names
         if self._qpn is not None:
             view = self._qpn.view(self._qpn_axes)
+            if self._qpn_row_scale is not None:
+                return (view, self._qpn_wscale,
+                        getattr(layer, x_s, None), getattr(layer, x_s_ub, None))
             return (
                 view,
                 getattr(layer, w_s),
@@ -289,6 +326,8 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
                 device=a.device,
             )
             torch.ops._C.sm70_fp8_qpn_dispatch(out, a, self._qpn, Bs, 16)
+            if self._qpn_row_scale is not None:
+                out = (out.float() * self._qpn_row_scale).to(out.dtype)
         else:
             out = a @ B
         if bias is not None:
