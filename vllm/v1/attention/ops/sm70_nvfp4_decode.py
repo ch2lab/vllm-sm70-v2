@@ -38,6 +38,8 @@ Sliding window (``window_left >= 0``) matches the FlashInfer FA2 mask: the
 query attends to KV tokens ``[max(0, kv_len - 1 - window_left), kv_len)``.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -324,6 +326,16 @@ def sm70_nvfp4_paged_decode(
     D = 2 * (F * 8 // 9)
     R, HQ = q.shape[0], q.shape[1]
     assert HQ % H == 0, f"GQA requires {HQ} qo heads over {H} kv heads"
+    # Optional hand-written CUDA kernel (env-gated; default off -> unchanged).
+    # Shape-gated + falls back to the Triton path below on any mismatch.
+    if os.environ.get("VLLM_SM70_DECODE_CUDA") == "1":
+        from .sm70_nvfp4_decode_cuda import try_paged_decode_cuda
+
+        if try_paged_decode_cuda(
+            q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,
+            sm_scale, window_left, splits, workspace,
+        ):
+            return
     RP = triton.next_power_of_2(HQ // H)
     assert R * H * splits * RP * (D + 2) <= workspace.numel()
     # Head-dim slice per combine program: keeps the [splits, DC] tile small
