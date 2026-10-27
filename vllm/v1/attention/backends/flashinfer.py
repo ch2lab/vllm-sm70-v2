@@ -2367,8 +2367,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         self.is_kvcache_nvfp4, self.model_config.dtype
                     )
                     raw_disable_split = False
+                    # Mixed decode+prefill steps are excluded: the native
+                    # op's q/KV row splicing is only consistent for
+                    # prefill-only steps (verified: with num_decode_tokens>0
+                    # both the Triton and the CUDA kernel produce NaN rows /
+                    # degenerate output, while prefill-only steps are exact).
+                    # Falling back keeps the proven fp16-shadow path there.
                     native_prefill = (
-                        self.sm70_nvfp4_shadow and _SM70_NATIVE_PREFILL
+                        self.sm70_nvfp4_shadow
+                        and _SM70_NATIVE_PREFILL
+                        and prefill_start == 0
                     )
                     _n_pre = qo_indptr_prefill_cpu.shape[0] - 1
                     _q_len0 = int(
@@ -3449,6 +3457,25 @@ class FlashInferImpl(AttentionImpl):
                     assert prefill_query.dtype == torch.float16
                     assert prefill_query.is_contiguous()
                     assert kv_cache.dtype == torch.uint8
+                    if (os.environ.get("VLLM_SM70_PREFILL_DEBUG") == "1"
+                            and num_prefill_tokens >= 256):
+                        global _SM70PF_DBG
+                        try:
+                            _SM70PF_DBG += 1
+                        except NameError:
+                            _SM70PF_DBG = 1
+                        if _SM70PF_DBG <= 10:
+                            _md = attn_metadata.prefill
+                            print(
+                                f"[SM70PFDBG] n_dec={num_decode_tokens}"
+                                f" n_pre={num_prefill_tokens}"
+                                f" q={tuple(prefill_query.shape)}"
+                                f" indptr={_md.native_qo_indptr.tolist()}"
+                                f" kvlens={_md.native_kv_lens.tolist()}"
+                                f" maxq={_md.native_max_q_len}"
+                                f" bt={tuple(_md.block_tables.shape)}",
+                                flush=True,
+                            )
                     sm70_nvfp4_paged_prefill(
                         prefill_query,
                         kv_cache,
