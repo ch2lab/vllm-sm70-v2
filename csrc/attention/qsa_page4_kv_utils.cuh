@@ -196,11 +196,17 @@ __device__ __forceinline__ uint4 load_nvfp4_pool_vector(
     const void* __restrict__ kv_cache, const int* __restrict__ page_ids,
     const int vec_col, const int token_offset, const int panel_offset,
     const int64_t block_stride, const int pages_per_block,
-    const uint16_t* __restrict__ nvfp4_lut = nullptr) {
+    const uint16_t* __restrict__ nvfp4_lut = nullptr,
+    const int num_pool_blocks = 0x7fffffff) {
   const int logical_page = token_offset >> 2;
   const int token_in_page = token_offset & 3;
   const int physical_page = page_ids[logical_page];
   const int pool_block = physical_page / pages_per_block;
+  // Defensive guard (500K IMA, "incident #3"): an out-of-range physical page
+  // must not become an OOB KV-pool read; drop the token (zero vector).
+  if (pool_block < 0 || pool_block >= num_pool_blocks) {
+    return make_uint4(0, 0, 0, 0);
+  }
   const int page_in_block = physical_page - pool_block * pages_per_block;
   const int token_in_block = page_in_block * 4 + token_in_page;
   const int abs_dim = panel_offset + 8 * vec_col;
@@ -230,11 +236,19 @@ __device__ __forceinline__ void load_nvfp4_pool_vector_pair(
     const void* __restrict__ kv_cache, const int* __restrict__ page_ids,
     const int vec_pair, const int token_offset, const int panel_offset,
     const int64_t block_stride, const int pages_per_block, uint4& lo,
-    uint4& hi, const uint16_t* __restrict__ nvfp4_lut = nullptr) {
+    uint4& hi, const uint16_t* __restrict__ nvfp4_lut = nullptr,
+    const int num_pool_blocks = 0x7fffffff) {
   const int logical_page = token_offset >> 2;
   const int token_in_page = token_offset & 3;
   const int physical_page = page_ids[logical_page];
   const int pool_block = physical_page / pages_per_block;
+  // Defensive guard (500K IMA, "incident #3"): drop the pair instead of an
+  // OOB KV-pool read.
+  if (pool_block < 0 || pool_block >= num_pool_blocks) {
+    lo = make_uint4(0, 0, 0, 0);
+    hi = make_uint4(0, 0, 0, 0);
+    return;
+  }
   const int page_in_block = physical_page - pool_block * pages_per_block;
   const int token_in_block = page_in_block * 4 + token_in_page;
   const int abs_dim = panel_offset + 16 * vec_pair;

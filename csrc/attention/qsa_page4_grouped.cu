@@ -76,14 +76,14 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
     const int panel_offset, const int pages_per_block,
     const uint16_t* __restrict__ e4m3_lut = nullptr,
     const uint16_t* __restrict__ nvfp4_lut = nullptr,
-    const int abl = 0) {
+    const int abl = 0, const int num_pool_blocks = 0x7fffffff) {
   const int row = copy_idx / panel_d_stride_uint4;
   const int vec_col = copy_idx % panel_d_stride_uint4;
   const int token_offset = tile_page_offset + kv_tile_start + row;
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_NVFP4) {
     return load_nvfp4_pool_vector<BLOCK_SIZE, true>(
         kv_cache, page_ids, vec_col, token_offset, panel_offset, block_stride,
-        pages_per_block, nvfp4_lut);
+        pages_per_block, nvfp4_lut, num_pool_blocks);
   }
   static_assert(BLOCK_SIZE == 0 || BLOCK_SIZE == 4 || BLOCK_SIZE == 16 ||
                     BLOCK_SIZE == 784 || BLOCK_SIZE == 800 ||
@@ -183,7 +183,7 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
     // ABL (offline diagnostic, experiment builds only; 0 = production):
     //   3 = replace the page-table indirection with the identity mapping,
     //       isolating the cost of the SCATTERED page gathers.
-    const int abl = 0) {
+    const int abl = 0, const int num_pool_blocks = 0x7fffffff) {
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
   if constexpr (FP8_PAIR_LOAD) {
     static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
@@ -271,7 +271,7 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
         uint4 lo, hi;
         load_nvfp4_pool_vector_pair<BLOCK_SIZE, true>(
             kv_cache, page_ids, vec_pair, token_offset, panel_offset,
-            block_stride, pages_per_block, lo, hi, nvfp4_lut);
+            block_stride, pages_per_block, lo, hi, nvfp4_lut, num_pool_blocks);
         shared_vec[row * kv_smem_stride_uint4 + 2 * vec_pair] = lo;
         shared_vec[row * kv_smem_stride_uint4 + 2 * vec_pair + 1] = hi;
       }
@@ -288,7 +288,7 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
               kv_cache, page_ids, copy_idx, panel_d_stride_uint4,
               tile_page_offset, kv_tile_start, block_size, kv_head_idx,
               block_stride, token_stride, head_stride, panel_offset,
-              pages_per_block, e4m3_lut, nvfp4_lut, abl);
+              pages_per_block, e4m3_lut, nvfp4_lut, abl, num_pool_blocks);
     }
   }
 }
@@ -489,7 +489,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const float qk_scale, const float v_scale,
     const uint32_t* __restrict__ sparse_token_masks = nullptr,
     const int num_groups = 1, const int* row_lengths = nullptr,
-    const int abl = 0) {
+    const int abl = 0, const int num_pool_blocks = 0x7fffffff) {
   static_assert(!ROW_SEQLENS || !SPARSE_PAGE4,
                 "explicit row lengths apply to dense causal groups only");
   static_assert(
@@ -680,7 +680,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
           kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
           k_block_stride, k_token_stride, k_head_stride, 0, pages_per_block,
           threadIdx.x,
-          nullptr, smem.nvfp4_lut, abl);
+          nullptr, smem.nvfp4_lut, abl, num_pool_blocks);
       for (int idx = tid + valid_k_rows * kSharedStrideVec;
            idx < kGroupedVerifyBlockN * kSharedStrideVec;
            idx += kGroupedVerifyThreads) {
@@ -790,7 +790,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
         k_block_stride, k_token_stride, k_head_stride, 0, pages_per_block,
         threadIdx.x,
-        nullptr, smem.nvfp4_lut, abl);
+        nullptr, smem.nvfp4_lut, abl, num_pool_blocks);
     for (int idx = tid + valid_k_rows * kSharedStrideVec;
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
@@ -937,7 +937,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
         v_block_stride, v_token_stride, v_head_stride, 0, pages_per_block,
         threadIdx.x,
-        nullptr, smem.nvfp4_lut, abl);
+        nullptr, smem.nvfp4_lut, abl, num_pool_blocks);
     for (int idx = tid + valid_k_rows * kSharedStrideVec;
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
@@ -1277,7 +1277,8 @@ torch::stable::Tensor flash_attention_grouped_sparse_page4(
                 (packed_kv ? static_cast<float>(k_scale) : 1.0f),             \
             packed_kv ? static_cast<float>(v_scale) : 1.0f,                   \
             token_masks.const_data_ptr<uint32_t>(),                           \
-            static_cast<int>(num_groups), nullptr, abl);                                    \
+            static_cast<int>(num_groups), nullptr, abl,                            \
+            static_cast<int>(k_cache.sizes()[0]));                                    \
   } while (0)
   if (e4m3_kv) {
     LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
