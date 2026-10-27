@@ -732,12 +732,38 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # Serve the full configured context even when the checkpoint's
+        # max_position_embeddings is shorter: with rope_type=default the cache
+        # is the same frequency formula evaluated at more positions, so the
+        # extension is exact rather than an approximation. The drafter keeps its
+        # own config limit while consuming the target's positions, so it has to
+        # cover the target's context too.
+        spec = vllm_config.speculative_config
+        target_model_config = spec.target_model_config if spec is not None else None
+        self._rope_cache_positions = max(
+            int(config.max_position_embeddings),
+            int(model_config.max_model_len),
+            int(target_model_config.max_model_len)
+            if target_model_config is not None
+            else 0,
+        )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=self._rope_cache_positions,
             rope_parameters=config.rope_parameters,
             mrope_positions_factor=mrope_positions_factor(vllm_config),
         )
+        # Nothing bounds the cos/sin row index at use time: the fused QSA
+        # prepare kernel and the rotary kernels index the cache with raw token
+        # positions. A cache shorter than the served context reads past its end,
+        # which faults only when that memory happens to be unmapped (and
+        # otherwise silently returns garbage).
+        if self.rotary_emb.cos_sin_cache.shape[0] < self._rope_cache_positions:
+            raise ValueError(
+                "RoPE cos/sin cache covers "
+                f"{self.rotary_emb.cos_sin_cache.shape[0]} positions but the "
+                f"served context needs {self._rope_cache_positions}"
+            )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
