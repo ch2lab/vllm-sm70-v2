@@ -11,6 +11,7 @@ from transformers import Qwen4ExpTextConfig
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -22,7 +23,10 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
+
 from .ops.qsa_prepare import qsa_prepare
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from .qsa import Qwen4ExpQSAAttention
@@ -154,7 +158,16 @@ class QSAIndexer(nn.Module):
             "bf16"
         )
         if self.indexer_kv_dtype == "fp8":
-            indexer_dtype = torch.float8_e4m3fn
+            # Triton on SM70 cannot name e4m3 at all (only e5m2), and the index
+            # cache is read by Triton kernels, so Volta stores e5m2. Same byte
+            # cost; two mantissa bits instead of three.
+            sm70 = torch.cuda.get_device_capability()[0] == 7
+            indexer_dtype = torch.float8_e5m2 if sm70 else torch.float8_e4m3fn
+            logger.info_once(
+                "QSA indexer cache dtype: %s (%s)",
+                indexer_dtype,
+                "sm70 Triton has no e4m3" if sm70 else "e4m3",
+            )
         elif self.indexer_kv_dtype == "bf16":
             indexer_dtype = torch.bfloat16
         else:

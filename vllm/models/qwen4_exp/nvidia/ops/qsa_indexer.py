@@ -23,24 +23,25 @@ logger = init_logger(__name__)
 # so a quantised indexer cache is passed as raw bytes and dequantised with a
 # table lookup before any arithmetic. That keeps e4m3's precision instead of
 # falling back to e5m2's two mantissa bits.
-_E4M3_LUT: tuple[torch.device, torch.Tensor] | None = None
+_FP8_LUT: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
 def _is_fp8(dtype: torch.dtype) -> bool:
     return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
-def _e4m3_lut(device: torch.device) -> torch.Tensor:
-    """Byte -> fp16 table for e4m3 (identical bit pattern for e5m2 rows: rare)."""
-    global _E4M3_LUT
-    if _E4M3_LUT is None or _E4M3_LUT[0] != device:
+def _fp8_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Byte -> fp16 table for whichever fp8 format the cache holds."""
+    key = (device, dtype)
+    table = _FP8_LUT.get(key)
+    if table is None:
         table = (
             torch.arange(256, dtype=torch.uint8, device=device)
-            .view(torch.float8_e4m3fn)
+            .view(dtype)
             .to(torch.float16)
         )
-        _E4M3_LUT = (device, table)
-    return _E4M3_LUT[1]
+        _FP8_LUT[key] = table
+    return table
 
 
 @triton.jit
@@ -227,7 +228,7 @@ def _qsa_gather_single_request_keys(
             page_table[0],
             keys,
             valid,
-            _e4m3_lut(k_cache.device) if fp8 else keys,
+            _fp8_lut(k_cache.device, k_cache.dtype) if fp8 else keys,
             cache.stride(0),
             cache.stride(1),
             cache.stride(3),
@@ -776,7 +777,7 @@ def _prefill_logits(
         query_start_loc,
         visible_blocks,
         logits,
-        _e4m3_lut(k_cache.device) if fp8 else logits,
+        _fp8_lut(k_cache.device, k_cache.dtype) if fp8 else logits,
         *q.stride()[:-1],
         *k_cache.stride()[:2],
         *page_table.stride()[:-1],
@@ -903,9 +904,11 @@ def qsa_select_paged_decode(
     assert token_topk % compress_ratio == 0
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
     assert decode_query_len > 0 and q.shape[0] % decode_query_len == 0
-    assert q.dtype == k_cache.dtype or (
-        _is_fp8(k_cache.dtype) and q.dtype == torch.float16
-    ), "Q and the compressed K cache must match"
+    assert q.dtype == k_cache.dtype or _is_fp8(k_cache.dtype), (
+        "Q and the compressed K cache must match"
+    )
+    if _is_fp8(q.dtype):
+        q = q.to(torch.float16)
     num_requests = q.shape[0] // decode_query_len
     assert page_table.shape[0] == num_requests
     assert visible_blocks.shape == (q.shape[0],)
@@ -924,7 +927,7 @@ def qsa_select_paged_decode(
         page_table,
         visible_blocks,
         logits,
-        _e4m3_lut(k_cache.device) if fp8 else logits,
+        _fp8_lut(k_cache.device, k_cache.dtype) if fp8 else logits,
         *q.stride()[:-1],
         *k_cache.stride()[:2],
         *page_table.stride()[:-1],
@@ -984,7 +987,11 @@ def qsa_select_paged_prefill(
     """
     assert token_topk % compress_ratio == 0
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
-    assert q.dtype == k_cache.dtype, "Q and the compressed K cache must match"
+    assert q.dtype == k_cache.dtype or _is_fp8(k_cache.dtype), (
+        "Q and the compressed K cache must match"
+    )
+    if _is_fp8(q.dtype):
+        q = q.to(torch.float16)
     rows = q.shape[0]
     # Exact, deterministic selector (1Cat's production choice on Volta):
     # persistent_topk is racy on near-tie rows once a row has more live
