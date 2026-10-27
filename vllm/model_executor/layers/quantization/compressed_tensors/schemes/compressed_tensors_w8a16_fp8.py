@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8StaticTensorSym,
 )
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
 )
@@ -51,7 +52,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # turing and up
+        # turing and up; on exact SM70 (V100) the FP16 dequant fallback
+        # kernel covers w8a16, so the gate drops to 70 there.
+        cap = current_platform.get_device_capability()
+        if cap is not None and cap.to_int() == 70:
+            return 70
         return 75
 
     def create_weights(

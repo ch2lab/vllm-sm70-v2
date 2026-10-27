@@ -1224,6 +1224,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.sm70_nvfp4_shadow = (
                 self.is_kvcache_nvfp4 and sm70_nvfp4_kv_enabled()
             )
+            if self.sm70_nvfp4_shadow:
+                # SM70 serves NVFP4 KV through the fp16 shadow + mature FA2
+                # paged kernels, so the wrappers must use the fa2 ("auto")
+                # backend, NOT the SM100-only trtllm-gen (TllmGenFmhaRunner
+                # faults on sm_70).
+                self.nvfp4_fa2 = True
+                self.nvfp4_trtllm = False
+                # Optional hand-written CUDA decode kernel: compile/load it now
+                # (engine init / before CUDA-graph capture; compiling during
+                # capture corrupts the graph). No-op unless env-gated.
+                if os.environ.get("VLLM_SM70_DECODE_CUDA") == "1":
+                    from vllm.v1.attention.ops.sm70_nvfp4_decode_cuda import (
+                        warmup_compile,
+                    )
+
+                    _dev = getattr(self, "device", None) or torch.device(
+                        "cuda", torch.cuda.current_device()
+                    )
+                    warmup_compile(_dev, getattr(self, "max_num_reqs", 8))
             # SM70 FP8 KV-cache: V100 has no FP8 hardware and the flashinfer
             # fp8 paged kernels are not sm_70-safe; mirror the NVFP4 shadow
             # architecture (fp16 shadow dequant, see sm70_fp8_paged_dequant).
@@ -2436,6 +2455,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             ) = sm70_shadow_plan_tensors(
                                 shadow_kv_lens, self.page_size
                             )
+                            if (
+                                os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1"
+                                and not getattr(self, "_sm70_dbg_done", False)
+                            ):
+                                self._sm70_dbg_done = True
+                                import sys
+
+                                print(
+                                    f"[SM70DBG] prefill-plan page_size="
+                                    f"{self.page_size} spec_bs="
+                                    f"{self.kv_cache_spec.block_size} "
+                                    f"who={type(self).__name__} kv_lens="
+                                    f"{shadow_kv_lens.tolist()} "
+                                    f"shadow_blocks={shadow_blocks} "
+                                    f"fp8={self.sm70_fp8_shadow} "
+                                    f"nvfp4={self.sm70_nvfp4_shadow} "
+                                    f"window_left={self.window_left} "
+                                    f"n_pre={qo_indptr_prefill_cpu.shape[0] - 1}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                             n_pre = qo_indptr_prefill_cpu.shape[0] - 1
                             qo_diff = (
                                 qo_indptr_prefill_cpu[1:]
@@ -3527,6 +3567,75 @@ class FlashInferImpl(AttentionImpl):
                             layer._k_scale_float,
                             layer._v_scale_float,
                         )
+                        if (
+                            os.environ.get("VLLM_SM70_QSA_DBG") == "1"
+                            and not getattr(self, "_qdbg_pre_done", False)
+                        ):
+                            self._qdbg_pre_done = True
+                            torch.cuda.synchronize()
+                            import sys as _qsysp
+
+                            _sk = attn_metadata.prefill.shadow_kv
+                            _c0 = int(shadow_bt[0, 0])
+                            _p0 = kv_cache.flatten()[
+                                _c0 * kv_cache.stride(0) :
+                                _c0 * kv_cache.stride(0) + kv_cache.stride(0)
+                            ]
+                            print(
+                                f"[QDBG-PRE] cache={tuple(kv_cache.shape)} "
+                                f"stride={kv_cache.stride()} "
+                                f"page_nz={_p0.ne(0).sum().item()}/"
+                                f"{_p0.numel()} "
+                                f"shadow={tuple(_sk.shape)} "
+                                f"shadow_nz={_sk[:1].ne(0).sum().item()}/"
+                                f"{_sk[:1].numel()} "
+                                f"shadow_kv_lens="
+                                f"{attn_metadata.prefill.shadow_kv_lens.tolist()[:2]} "
+                                f"shadow_bt={shadow_bt[:1, :4].tolist()} "
+                                f"ksf={layer._k_scale_float} "
+                                f"vsf={layer._v_scale_float}",
+                                file=_qsysp.stderr,
+                                flush=True,
+                            )
+                            for _fname in (
+                                "_qo_indptr",
+                                "_paged_kv_indptr",
+                                "_paged_kv_last_page_len",
+                                "_kv_lens",
+                            ):
+                                _t = getattr(
+                                    attn_metadata.prefill.wrapper, _fname, None
+                                )
+                                if torch.is_tensor(_t):
+                                    print(
+                                        f"[QDBG-PLAN] {_fname}="
+                                        f"{_t[:8].tolist()}",
+                                        file=_qsysp.stderr,
+                                        flush=True,
+                                    )
+                            _pw = attn_metadata.prefill.wrapper
+                            for _fn in (
+                                "_qo_indptr_buf",
+                                "_paged_kv_indptr_buf",
+                                "_paged_kv_indices_buf",
+                                "_paged_kv_last_page_len_buf",
+                                "_kv_lens_buffer",
+                            ):
+                                _t = getattr(_pw, _fn, None)
+                                if torch.is_tensor(_t):
+                                    print(
+                                        f"[QDBG-PLAN] {_fn}="
+                                        f"{_t.cpu()[:8].tolist()}",
+                                        file=_qsysp.stderr,
+                                        flush=True,
+                                    )
+                            print(
+                                f"[QDBG-PLAN] q={tuple(prefill_query.shape)} "
+                                f"sm_scale={self.scale} "
+                                f"qo_last={getattr(_pw, '_qo_indptr_last', '?')}",
+                                file=_qsysp.stderr,
+                                flush=True,
+                            )
                         shadow_kv = attn_metadata.prefill.shadow_kv
                         kv_cache_for_fi = (
                             shadow_kv[..., : self.head_size],
@@ -3547,6 +3656,27 @@ class FlashInferImpl(AttentionImpl):
                             w_blocks = attn_metadata.prefill.shadow_kv.shape[0]
                             start = attn_metadata.prefill.shadow_bt_start
                             shadow_bt = shadow_bt[:, start : start + w_blocks]
+                        if (
+                            os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1"
+                            and not getattr(self, "_sm70_dbg2", False)
+                        ):
+                            self._sm70_dbg2 = True
+                            import sys
+
+                            print(
+                                f"[SM70DBG] fp8_call who="
+                                f"{type(self).__name__} "
+                                f"layer={type(layer).__name__} "
+                                f"specH={self.num_kv_heads} specD={self.head_size} "
+                                f"cache={tuple(kv_cache_permute.shape)} "
+                                f"stride={kv_cache_permute.stride()} "
+                                f"bt={tuple(shadow_bt.shape)} "
+                                f"bt0={shadow_bt[0, :4].tolist()} "
+                                f"kv_lens={attn_metadata.prefill.shadow_kv_lens.tolist()} "
+                                f"out={tuple(attn_metadata.prefill.shadow_kv.shape)}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                         sm70_fp8_paged_dequant(
                             kv_cache_permute,
                             shadow_bt,
@@ -3707,6 +3837,32 @@ class FlashInferImpl(AttentionImpl):
                             out=out_prefill,
                             kv_cache_sf=kv_cache_sf,
                         )
+                        if (
+                            os.environ.get("VLLM_SM70_QSA_DBG") == "1"
+                            and getattr(self, "_qdbg_post_cnt", 0) < 6
+                        ):
+                            self._qdbg_post_cnt = getattr(
+                                self, "_qdbg_post_cnt", 0
+                            ) + 1
+                            torch.cuda.synchronize()
+                            import sys as _qsysq
+
+                            _op = out_prefill.float()
+                            _q = prefill_query.float()
+                            _sk = attn_metadata.prefill.shadow_kv
+                            print(
+                                f"[QDBG-POST] qo={prefill_query.shape[0]} "
+                                f"skvl="
+                                f"{attn_metadata.prefill.shadow_kv_lens.tolist()} "
+                                f"sk_nz={_sk.ne(0).sum().item()}/"
+                                f"{_sk.numel()} "
+                                f"out sum={_op.sum().item():.7g} "
+                                f"max={_op.abs().max().item():.7g} "
+                                f"nz={_op.ne(0).sum().item()}/{_op.numel()} "
+                                f"q_max={_q.abs().max().item():.7g}",
+                                file=_qsysq.stderr,
+                                flush=True,
+                            )
 
                     if needs_fp8_out_prefill:
                         output[
@@ -3886,6 +4042,25 @@ class FlashInferImpl(AttentionImpl):
                     assert self.sinks is None
                     assert not self.logits_soft_cap
                     assert attn_metadata.decode.shadow_kv is not None
+                    if (
+                        os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1"
+                        and not getattr(self, "_sm70_dbg3", False)
+                    ):
+                        self._sm70_dbg3 = True
+                        import sys
+
+                        print(
+                            f"[SM70DBG] fp8_decode_call who="
+                            f"{type(self).__name__} "
+                            f"layer={type(layer).__name__} "
+                            f"specH={self.num_kv_heads} specD={self.head_size} "
+                            f"cache={tuple(kv_cache_permute.shape)} "
+                            f"bt={tuple(attn_metadata.decode.block_tables.shape)} "
+                            f"kv_lens={attn_metadata.decode.shadow_kv_lens.tolist()} "
+                            f"out={tuple(attn_metadata.decode.shadow_kv.shape)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     sm70_fp8_paged_dequant(
                         kv_cache_permute,
                         attn_metadata.decode.block_tables,
@@ -3899,16 +4074,298 @@ class FlashInferImpl(AttentionImpl):
                         shadow_kv[..., : self.head_size],
                         shadow_kv[..., self.head_size :],
                     )
+                    if os.environ.get("VLLM_SM70_FA2_RECONTIG") == "1":
+                        # Give FA2 each its own contiguous [B, H, N, D] cache
+                        # (the shadow views above are strided: token stride
+                        # 2*head_size instead of head_size).
+                        kv_cache_for_fi = (
+                            kv_cache_for_fi[0].contiguous(),
+                            kv_cache_for_fi[1].contiguous(),
+                        )
+                    if os.environ.get("VLLM_SM70_SHADOW_CANARY") == "1":
+                        from vllm.v1.attention.ops.sm70_nvfp4_dequant import (
+                            sm70_canary_check,
+                        )
+
+                        sm70_canary_check("pre-fa2-decode")
+                    if os.environ.get("VLLM_SM70_FA2_SKIP") == "1":
+                        # Bisection valve: no-op the FA2 decode kernel.
+                        output[:num_decode_tokens].zero_()
+                        return output_padded
+                    # FA2 dump valve: save everything decode_wrapper.run sees,
+                    # for standalone replay under compute-sanitizer.
+                    if os.environ.get("VLLM_SM70_FA2DUMP") == "1":
+                        try:
+                            _fcnt = getattr(
+                                self, "_fa2dumpcnt", 0
+                            )
+                            _sps = attn_metadata.decode.shadow_kv.shape[2]
+                            if (
+                                attn_metadata.decode.shadow_kv_lens
+                                is not None
+                                and int(
+                                    attn_metadata.decode.shadow_kv_lens.max()
+                                )
+                                == 11
+                                and _fcnt == 0
+                            ):
+                                self._fa2dumpcnt = 1
+                                import sys as _f2sys
+
+                                _f2rk = (
+                                    attn_metadata.decode.shadow_kv.device
+                                    .index
+                                    or 0
+                                )
+                                _plan = sm70_shadow_plan_tensors(
+                                    attn_metadata.decode.shadow_kv_lens,
+                                    _sps,
+                                )
+                                torch.save(
+                                    {
+                                        "shadow_kv": attn_metadata.decode.shadow_kv.cpu(),
+                                        "q": decode_query.detach().cpu(),
+                                        "out": output[:num_decode_tokens].detach().cpu().clone(),
+                                        "indptr": list(_plan[0]),
+                                        "indices": list(_plan[1]),
+                                        "last_page_len": list(_plan[2]),
+                                        "seq_lens": list(attn_metadata.decode.shadow_kv_lens),
+                                        "num_qo_heads": decode_query.shape[-2],
+                                        "num_kv_heads": attn_metadata.decode.shadow_kv.shape[1],
+                                        "head_dim": attn_metadata.decode.shadow_kv.shape[3] // 2,
+                                        "page_size": _sps,
+                                        "sm_scale": float(self.scale),
+                                        "window_left": int(self.window_left),
+                                        "fixed_split_size": -1,
+                                        "disable_split_kv": False,
+                                        "q_dtype": str(decode_query.dtype),
+                                        "out_dtype": str(output.dtype),
+                                    },
+                                    f"/tmp/fa2dump_r{_f2rk}.pt",
+                                )
+                                print(
+                                    f"[FA2DUMP] r{_f2rk} saved shadow={tuple(attn_metadata.decode.shadow_kv.shape)} "
+                                    f"q={tuple(decode_query.shape)} "
+                                    f"out={tuple(output[:num_decode_tokens].shape)}",
+                                    file=_f2sys.stderr,
+                                    flush=True,
+                                )
+                                # Pointer audit: where does sreq/st0 sit
+                                # relative to every FA2-visible buffer?
+                                import vllm.v1.attention.ops.sm70_nvfp4_dequant as _dq
+                                _can = getattr(_dq.sm70_fp8_paged_dequant, "_canary", None)
+                                _sreqp = _can[0].data_ptr() if _can is not None else 0
+                                _st0p = _can[1].data_ptr() if _can is not None else 0
+                                _wsv = _f2sys
+                                print(
+                                    f"[FA2PTR] r{_f2rk} "
+                                    f"q={decode_query.data_ptr():#x} "
+                                    f"out={output[:num_decode_tokens].data_ptr():#x} "
+                                    f"shadow={attn_metadata.decode.shadow_kv.data_ptr():#x} "
+                                    f"sreq={_sreqp:#x} st0={_st0p:#x}",
+                                    file=_wsv.stderr,
+                                    flush=True,
+                                )
+                                for _bn in (
+                                    "_float_workspace_buffer",
+                                    "_int_workspace_buffer",
+                                    "_plan_info",
+                                    "_qo_indptr_buf",
+                                    "_paged_kv_indptr_buf",
+                                    "_paged_kv_indices_buf",
+                                    "_paged_kv_last_page_len_buf",
+                                ):
+                                    _bt = getattr(decode_wrapper, _bn, None)
+                                    if torch.is_tensor(_bt):
+                                        print(
+                                            f"[FA2PTR] r{_f2rk} {_bn} "
+                                            f"ptr={_bt.data_ptr():#x} shape={tuple(_bt.shape)} "
+                                            f"n={_bt.numel()}",
+                                            file=_wsv.stderr,
+                                            flush=True,
+                                        )
+                                    else:
+                                        print(
+                                            f"[FA2PTR] r{_f2rk} {_bn}=None",
+                                            file=_wsv.stderr,
+                                            flush=True,
+                                        )
+                                print(
+                                    f"[FA2PTR] r{_f2rk} "
+                                    f"plan_info={decode_wrapper._plan_info.cpu().tolist() if torch.is_tensor(getattr(decode_wrapper, '_plan_info', None)) else 'n/a'}",
+                                    file=_wsv.stderr,
+                                    flush=True,
+                                )
+                        except Exception as _f2e:
+                            import sys as _f2sys2
+
+                            print(f"[FA2DUMP] failed: {_f2e}", file=_f2sys2.stderr)
+                    # OOB probe valve: route FA2's out into a zeroed 1 MiB
+                    # slab so an OOB write past out's logical end is visible
+                    # (in the normal allocator layout it silently lands on
+                    # adjacent live tensors such as the dequant plan).
+                    _fa2_out = output[:num_decode_tokens]
+                    if os.environ.get("VLLM_SM70_QODUMP") == "1":
+                        import sys as _qsys
+
+                        _kvmax = (
+                            int(attn_metadata.decode.shadow_kv_lens.max())
+                            if attn_metadata.decode.shadow_kv_lens is not None
+                            else -1
+                        )
+                        if _kvmax in (9, 10, 11):
+                            try:
+                                torch.cuda.synchronize()
+                                _qib = decode_wrapper._qo_indptr_buf
+                                _pkib = decode_wrapper._paged_kv_indptr_buf
+                                _pklb = decode_wrapper._paged_kv_last_page_len_buf
+                                _pi = getattr(decode_wrapper, "_plan_info", None)
+                                _pi_s = (
+                                    _pi.tolist()
+                                    if torch.is_tensor(_pi) and _pi.dim() <= 1
+                                    else (f"tensor {tuple(_pi.shape)}" if torch.is_tensor(_pi) else repr(_pi))
+                                )
+                                _iws = getattr(decode_wrapper, "_int_workspace_buffer", None)
+                                _iws_s = (
+                                    _iws.view(torch.int32)[:20].cpu().tolist()
+                                    if torch.is_tensor(_iws)
+                                    else None
+                                )
+                                _fws = getattr(decode_wrapper, "_float_workspace_buffer", None)
+                                _tws = getattr(decode_wrapper, "_int_workspace_buffer", None)
+                                print(
+                                    f"[QODUMP] kv={_kvmax} "
+                                    f"qo_indptr={_qib.cpu().tolist()} "
+                                    f"pv_indptr={_pkib.cpu().tolist() if _pkib is not None else None} "
+                                    f"last={_pklb.cpu().tolist() if _pklb is not None else None} "
+                                    f"plan_info={_pi_s} "
+                                    f"int_ws[:20]={_iws_s} "
+                                    f"fws={_fws.numel() if torch.is_tensor(_fws) else '?'} "
+                                    f"iws={_tws.numel() if torch.is_tensor(_tws) else '?'}",
+                                    file=_qsys.stderr,
+                                    flush=True,
+                                )
+                            except Exception as _qe:
+                                print(f"[QODUMP] failed: {_qe}", file=_qsys.stderr)
+                    if os.environ.get("VLLM_SM70_FA2SLAB") == "1":
+                        _slab = getattr(self, "_fa2slab", None)
+                        if (
+                            _slab is None
+                            or _slab.device != output.device
+                            or not _fa2_out.is_contiguous()
+                        ):
+                            _slab = torch.zeros(
+                                1 << 20,
+                                dtype=torch.uint8,
+                                device=output.device,
+                            )
+                            self._fa2slab = _slab
+                        _ob = _fa2_out.numel() * _fa2_out.element_size()
+                        _fa2_out = (
+                            _slab[:_ob]
+                            .view(output.dtype)
+                            .view(_fa2_out.shape)
+                        )
+                    if os.environ.get("VLLM_SM70_FA2SLAB") != "1" and os.environ.get(
+                        "VLLM_SM70_FA2_PAD"
+                    ) != "0":
+                        # SM70 FA2 OOB mitigation: the sm70 tensor-core decode
+                        # kernel (flashinfer paged-prefill path) writes one
+                        # duplicate output row past the requested rows
+                        # (observed in vivo: exactly num_heads*head_size*2B
+                        # past out, byte-identical to row 0). FlashInfer's
+                        # shape check requires out to match q (B rows), so we
+                        # pass a VIEW of a larger buffer starting 1 row in:
+                        # the kernel's OOB row B then lands in-row B+1 of the
+                        # buffer (in-range). Valid rows are copied back from
+                        # buffer[1 : 1+B] into the model output.
+                        _off = 1
+                        _need = num_decode_tokens + _off + 1  # rows in buffer
+                        _pad = getattr(self, "_sm70_fa2_pad_buf", None)
+                        if (
+                            _pad is None
+                            or _pad.shape[0] < _need + 1
+                            or _pad.device != output.device
+                            or _pad.dtype != output.dtype
+                        ):
+                            _pad = torch.empty(
+                                max(_need + 1, 8),
+                                output.shape[-2],
+                                output.shape[-1],
+                                dtype=output.dtype,
+                                device=output.device,
+                            )
+                            self._sm70_fa2_pad_buf = _pad
+                        _fa2_out = _pad[_off : _off + num_decode_tokens]
+                        self._sm70_fa2_pad_off = _off
+                        self._sm70_fa2_pad_rows = num_decode_tokens
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
                         q_scale=1.0,
                         k_scale=1.0,
                         v_scale=1.0,
-                        out=output[:num_decode_tokens],
+                        out=_fa2_out,
                         kv_cache_sf=None,
                         sinks=self.sinks,
                     )
+                    if os.environ.get("VLLM_SM70_FA2SLAB") == "1":
+                        torch.cuda.synchronize()
+                        _nz = (_slab[_ob:] != 0).nonzero().flatten()
+                        if len(_nz):
+                            _runs = []
+                            _s = _nz[0].item()
+                            _p = _s
+                            for _b in _nz[1:].tolist():
+                                if _b == _p + 1:
+                                    _p = _b
+                                else:
+                                    _runs.append((_s + _ob, _p - _s + 1))
+                                    _s = _b
+                                    _p = _b
+                            _runs.append((_s + _ob, _p - _s + 1))
+                            _kv = (
+                                int(attn_metadata.decode.shadow_kv_lens.max())
+                                if attn_metadata.decode.shadow_kv_lens
+                                is not None
+                                else -1
+                            )
+                            import sys as _slabsys
+
+                            _r0 = _slab[:_ob].view(torch.float16)[:16].cpu().tolist()
+                            _ro = _slab[_nz[0].item() + _ob : _nz[0].item() + _ob + 32].view(
+                                torch.float16
+                            )[:16].cpu().tolist()
+                            print(
+                                f"[FA2OOB] kv={_kv} out_bytes={_ob} "
+                                f"runs(offset,len)={_runs[:4]} row0={_r0} oobrow={_ro}",
+                                file=_slabsys.stderr,
+                                flush=True,
+                            )
+                        _slab.zero_()
+                    if (
+                        os.environ.get("VLLM_SM70_FA2_PAD") != "0"
+                        and os.environ.get("VLLM_SM70_FA2SLAB") != "1"
+                        and getattr(self, "_sm70_fa2_pad_rows", 0) > 0
+                    ):
+                        # Valid rows (0..B-1) computed by the kernel land in
+                        # buffer[_off : _off+B]; move them into the model
+                        # output.
+                        _off = self._sm70_fa2_pad_off
+                        output[:num_decode_tokens].copy_(
+                            _pad[_off : _off + num_decode_tokens]
+                        )
+                        self._sm70_fa2_pad_rows = 0
+                    # IMA canary hook: did the FA2 decode corrupt the QSA plan
+                    # tensors (sreq/st0)?
+                    if os.environ.get("VLLM_SM70_SHADOW_CANARY") == "1":
+                        from vllm.v1.attention.ops.sm70_nvfp4_dequant import (
+                            sm70_canary_check,
+                        )
+
+                        sm70_canary_check("post-fa2-decode")
+                    if os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1":
+                        torch.cuda.synchronize()
                     return output_padded
                 elif self.sm70_nvfp4_shadow:
                     # SM70 NVFP4: native in-kernel-dequant split-KV paged
@@ -3917,6 +4374,35 @@ class FlashInferImpl(AttentionImpl):
                     assert self.sinks is None
                     assert not self.logits_soft_cap
                     assert output.dtype == torch.float16
+                    if os.environ.get("VLLM_SM70_QSA_DBG") == "1" and not getattr(
+                        self, "_qdbg_done", False
+                    ):
+                        self._qdbg_done = True
+                        torch.cuda.synchronize()
+                        import sys as _qsys
+                        _bt0 = int(
+                            attn_metadata.decode.block_tables[0, 0].item()
+                        )
+                        _c = kv_cache
+                        _page = _c.flatten()[
+                            _bt0 * _c.stride(0) : _bt0 * _c.stride(0)
+                            + _c.stride(0)
+                        ]
+                        print(
+                            f"[QDBG] cache={tuple(_c.shape)} "
+                            f"stride={_c.stride()} N={_c.shape[2]} "
+                            f"bt0={_bt0} page_nz={_page.ne(0).sum().item()}"
+                            f"/{_page.numel()} "
+                            f"bt={attn_metadata.decode.block_tables[:1, :4].tolist()} "
+                            f"kvlens={attn_metadata.decode.shadow_kv_lens_dev[:2].tolist()} "
+                            f"splits={attn_metadata.decode.shadow_splits} "
+                            f"q={tuple(decode_query.shape)} "
+                            f"ksf={layer._k_scale_float} "
+                            f"vsf={layer._v_scale_float}",
+                            file=_qsys.stderr,
+                            flush=True,
+                        )
+                    _qout = output[:num_decode_tokens]
                     sm70_nvfp4_paged_decode(
                         decode_query,
                         kv_cache,
@@ -3930,6 +4416,21 @@ class FlashInferImpl(AttentionImpl):
                         attn_metadata.decode.shadow_splits,
                         attn_metadata.decode.shadow_ws,
                     )
+                    if (
+                        os.environ.get("VLLM_SM70_QSA_DBG") == "1"
+                        and not getattr(self, "_qdbg_out_done", False)
+                    ):
+                        self._qdbg_out_done = True
+                        torch.cuda.synchronize()
+                        _o = _qout.float()
+                        import sys as _qsys2
+                        print(
+                            f"[QDBG-OUT] sum={_o.sum().item():.7g} "
+                            f"max={_o.abs().max().item():.7g} "
+                            f"nz={_o.ne(0).sum().item()}/{_o.numel()}",
+                            file=_qsys2.stderr,
+                            flush=True,
+                        )
                     return output_padded
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)

@@ -522,6 +522,9 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
 
 _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        # SM70-only dequant fallback; first so it wins on V100 before the
+        # Marlin/Humming kernels (which require SM80+ FP8 hardware).
+        Sm70Fp8DequantLinearKernel,
         HummingFP8ScaledMMLinearKernel,
         MarlinFP8ScaledMMLinearKernel,
     ],

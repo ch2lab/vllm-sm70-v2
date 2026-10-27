@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -46,6 +48,23 @@ class Sm70NvFp4LinearKernel(NvFp4LinearKernel):
                     f"SM70 NVFP4 kernel requires layer.{attr}")
         n = layer.output_size_per_partition
         k = layer.input_size_per_partition
+        if os.environ.get("VLLM_SM70_NVFP4_LOADDBG") == "1":
+            import sys as _lsys
+            import torch.distributed as _dist
+            _lrank = (
+                _dist.get_rank() if _dist.is_initialized() else 0
+            )
+            _w = layer.weight.detach()
+            _ws = layer.weight_scale.detach().float()
+            print(
+                f"[NLOAD] r{_lrank} {getattr(layer, 'prefix', '?')[-44:]} "
+                f"n={n} k={k} wsum={_w.sum().item():.6g} "
+                f"wmax={_w.float().max().item():.3f} "
+                f"wssum={_ws.sum().item():.6g} "
+                f"wshape={tuple(layer.weight.shape)}",
+                file=_lsys.stderr,
+                flush=True,
+            )
         # QPN2 requires n % 32 == 0. A layer whose output dim is not a
         # multiple of 32 is zero-padded: the extra rows dequantize to 0 and
         # are sliced off in apply_weights.

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 
 import torch
@@ -125,7 +126,15 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
             and c.weight_quant_key.scale.group_shape.is_per_tensor()
         ):
             return True, None
-        return False, "requires per-tensor weight and activation scales."
+        # w8a16: 16-bit runtime activations (the dynamic key never quantizes
+        # the input at runtime) may carry per-channel weight scales; the
+        # scale is baked into the FP16 weight copy at load time.
+        if (
+            c.input_dtype == torch.float16
+            and c.activation_quant_key != kFp8StaticTensorSym
+        ):
+            return True, None
+        return False, "requires per-tensor scales, or FP16 runtime inputs."
 
     def input_quant_key(self) -> QuantKey | None:
         if self.config.activation_quant_key == kFp8StaticTensorSym:
@@ -137,7 +146,16 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w, w_s = layer.weight, layer.weight_scale
-        if _qpn_available() and self.config.input_dtype == torch.float16:
+        # The QPN feed passes the weight scale straight to
+        # sm70_fp8_qpn_dispatch, which takes a scalar: per-channel scales
+        # must go through the FP16 dequantise path instead (where the
+        # channelwise multiply happens at load).
+        qpn_eligible = self.config.weight_quant_key.scale.group_shape.is_per_tensor()
+        if (
+            _qpn_available()
+            and self.config.input_dtype == torch.float16
+            and qpn_eligible
+        ):
             try:
                 src = _weight_as_input_major(w, layer)
             except ValueError as e:
@@ -166,7 +184,49 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
                     k,
                     n,
                 )
-        self._weight_deq = (w.float() * w_s).to(self.config.input_dtype)
+        w_f = w.float()
+        s = w_s.float()
+        # Per-channel (per-output-channel) weight scale: align to the OUTPUT
+        # axis. The dequant weight is [input, output] (input-major) here, so the
+        # output is dim1. When the scale size matches only one dim the old
+        # numel heuristic was fine, but on a SQUARE weight (e.g. GDN out_proj
+        # [2048, 2048] at TP2) it matched dim0 and silently scaled the wrong
+        # axis. Disambiguate with the layer's output_size_per_partition,
+        # preferring the output dim (dim1) on a square weight.
+        _outp = getattr(layer, "output_size_per_partition", None)
+        if _outp is not None and s.numel() == _outp:
+            if w_f.shape[1] == _outp:
+                s = s.reshape(1, -1)
+            else:
+                s = s.reshape(-1, 1)
+        elif s.numel() == w_f.shape[0]:
+            s = s.reshape(-1, 1)
+        elif s.numel() == w_f.shape[1]:
+            s = s.reshape(1, -1)
+        self._weight_deq = (w_f * s).to(self.config.input_dtype)
+        if os.environ.get("VLLM_SM70_FP8_LOADDBG") == "1":
+            import sys as _fsys
+            import torch.distributed as _fdist
+            _frank = (
+                _fdist.get_rank() if _fdist.is_initialized() else 0
+            )
+            _w = w.detach()
+            _deq = self._weight_deq
+            print(
+                f"[F8LOAD] r{_frank} {getattr(layer, 'prefix', '?')[-46:]} "
+                f"wshp={tuple(_w.shape)} wsum={_w.float().sum().item():.6g} "
+                f"wshp_raw={tuple(w_s.shape)} "
+                f"ssum={w_s.float().sum().item():.6g} "
+                f"srow0={w_s.float().flatten()[0].item():.6g} "
+                f"srowL={w_s.float().flatten()[-1].item():.6g} "
+                f"deqsum={_deq.sum().item():.6g} "
+                f"deqmax={_deq.abs().max().item():.6g} "
+                f"deqshp={tuple(_deq.shape)} "
+                f"d0half={_deq[: _deq.shape[0] // 2].sum().item():.6g} "
+                f"d1half={_deq[:, : _deq.shape[1] // 2].sum().item():.6g}",
+                file=_fsys.stderr,
+                flush=True,
+            )
         if hasattr(layer, "weight"):
             del layer.weight
 

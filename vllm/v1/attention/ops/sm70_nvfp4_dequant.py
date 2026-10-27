@@ -547,6 +547,7 @@ def _sm70_fp8_dequant_kernel(
     bt_ptr,  # int32 [num_reqs, max_blocks]
     sreq_ptr,  # int32 [B_s] shadow block -> request
     st0_ptr,  # int32 [B_s] shadow block -> first token index (i0 * N)
+    toks_ptr,  # int32 [B_s] valid tokens per shadow block (<= N)
     out_ptr,  # fp16 [B_s, H, N, 2D] (K = [:D], V = [D:2D])
     k_scale,  # f32 scalar: layer _k_scale_float
     v_scale,  # f32 scalar: layer _v_scale_float
@@ -554,9 +555,11 @@ def _sm70_fp8_dequant_kernel(
     stride_head,  # i64 source head stride
     stride_tok,  # i64 source token stride
     bt_cols: tl.constexpr,  # block_table row width
-    H: tl.constexpr,  # num kv heads
+    H: tl.constexpr,  # num kv heads dequantized into the shadow buffer
     D: tl.constexpr,  # head dim
-    N: tl.constexpr,  # block size
+    N: tl.constexpr,  # shadow page size (tokens per shadow block)
+    N_phys: tl.constexpr,  # tokens per physical source block (1 on
+    # kernel-block-split / per-token caches; equals N on classic paged)
 ):
     """One program per (shadow block, kv head, token in block).
 
@@ -567,33 +570,51 @@ def _sm70_fp8_dequant_kernel(
     the layer's per-tensor scale (no per-16-dim scale, unlike NVFP4). K and V
     share the last dimension of the paged page (K in ``[0:D]``, V in
     ``[D:2D]``); source strides come from the HND-canonicalized view.
+
+    Token ``n`` of shadow block ``b`` lives at block-table column
+    ``i0 + n // N_phys``, row offset ``(n % N_phys) * stride_tok``: classic
+    paged caches have ``N_phys == N`` (one table entry per page, tokens walk
+    the page); per-token caches have ``N_phys == 1`` (one table entry per
+    token, each token its own physical row).
     """
     pid_b = tl.program_id(0)  # shadow block
     pid_h = tl.program_id(1)  # kv head
     n = tl.program_id(2)  # token within the shadow block
 
     r = tl.load(sreq_ptr + pid_b)
-    i0 = tl.load(st0_ptr + pid_b) // N
-    b = tl.load(bt_ptr + r * bt_cols + i0).to(tl.int64)
+    i0 = tl.load(st0_ptr + pid_b)  # first token index of the block (j*PAGE)
+    tok = tl.load(toks_ptr + pid_b)
 
     d = tl.arange(0, D)
-    src_base = (
-        b * stride_block.to(tl.int64)
-        + pid_h.to(tl.int64) * stride_head.to(tl.int64)
-        + n.to(tl.int64) * stride_tok.to(tl.int64)
-    )
-    k_code = tl.load(kv_ptr + src_base + d)  # uint8 E4M3 code
-    v_code = tl.load(kv_ptr + src_base + D + d)  # uint8 E4M3 code
-    k = tl.load(lut_ptr + k_code.to(tl.int32)).to(tl.float32)
-    v = tl.load(lut_ptr + v_code.to(tl.int32)).to(tl.float32)
-
     dst_base = (
         pid_b.to(tl.int64) * (H * N * 2 * D)
         + pid_h.to(tl.int64) * (N * 2 * D)
         + n.to(tl.int64) * (2 * D)
     )
-    tl.store(out_ptr + dst_base + d, (k * k_scale).to(tl.float16))
-    tl.store(out_ptr + dst_base + D + d, (v * v_scale).to(tl.float16))
+    if n < tok:
+        # Columns past the request's valid kv_len hold stale block ids from
+        # earlier steps and may point far outside the pool: never
+        # dereference them (zero-fill the tail; FA2's last_page_len keeps
+        # those slots unread).
+        # Column = (first_token_idx + n) // N_phys: per-token caches (N_phys=1)
+        # map each token to its own block-table column; classic paged
+        # (N_phys=PAGE) collapse a whole shadow block to column j.
+        b = tl.load(bt_ptr + r * bt_cols + (i0 + n) // N_phys).to(tl.int64)
+        src_base = (
+            b * stride_block.to(tl.int64)
+            + pid_h.to(tl.int64) * stride_head.to(tl.int64)
+            + (n % N_phys).to(tl.int64) * stride_tok.to(tl.int64)
+        )
+        k_code = tl.load(kv_ptr + src_base + d)  # uint8 E4M3 code
+        v_code = tl.load(kv_ptr + src_base + D + d)  # uint8 E4M3 code
+        k = tl.load(lut_ptr + k_code.to(tl.int32)).to(tl.float32)
+        v = tl.load(lut_ptr + v_code.to(tl.int32)).to(tl.float32)
+        tl.store(out_ptr + dst_base + d, (k * k_scale).to(tl.float16))
+        tl.store(out_ptr + dst_base + D + d, (v * v_scale).to(tl.float16))
+    else:
+        zero = tl.zeros([D], dtype=tl.float16)
+        tl.store(out_ptr + dst_base + d, zero)
+        tl.store(out_ptr + dst_base + D + d, zero)
 
 
 _LUT_CACHE: dict = {}
@@ -652,9 +673,61 @@ def sm70_fp8_paged_dequant(
     _, H, N, two_d = kv_cache.shape
     D = two_d // 2
     strides = kv_cache.stride()
+    # A shadow page holds PAGE tokens (the plan's page size). The physical
+    # source block may hold fewer (kernel-block-split layouts, e.g. per-token
+    # fp8 caches); token rows are addressed through the view's strides, so
+    # the mapping only needs the shadow page size. Heads dequantized into
+    # the shadow buffer follow the buffer, not the physical cache (the FA2
+    # plan reads exactly the spec's head count).
+    PAGE = out.shape[2]
+    H_eff = out.shape[1]
 
     B_s = out.shape[0]
-    sreq, st0 = _shadow_block_maps(B_s, kv_lens, N, kv_cache.device)
+    if os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1":
+        import sys
+
+        _n = max(1, int(kv_lens.max()))
+        _sl = block_table[:, :_n]
+        print(
+            f"[SM70DBG] fp8_dequant kv_cache={tuple(kv_cache.shape)} "
+            f"kv_lens={kv_lens.tolist()} B_s={B_s} PAGE={PAGE} "
+            f"need={int(((kv_lens + PAGE - 1) // PAGE).sum())} "
+            f"bt={tuple(block_table.shape)} "
+            f"bt_max_used={int(_sl.max())} bt_min_used={int(_sl.min())} "
+            f"bt0={block_table[0, :_n].tolist()} "
+            f"pool_rows={kv_cache.shape[0]}",
+            file=sys.stderr,
+            flush=True,
+        )
+    sreq, st0 = _shadow_block_maps(B_s, kv_lens, PAGE, kv_cache.device)
+    # Valid token count per shadow block: every block is a full page except
+    # each request's last one (kv_len % PAGE tokens). Block-table columns
+    # beyond the valid prefix are stale (ids left by earlier steps); the
+    # kernel zero-fills the tail instead of dereferencing them.
+    toks = torch.full((B_s,), PAGE, dtype=torch.int32)
+    kv_cpu = kv_lens.tolist()
+    base = 0
+    for ln in kv_cpu:
+        nb = (ln + PAGE - 1) // PAGE
+        if nb:
+            toks[base + nb - 1] = ln % PAGE or PAGE
+        base += nb
+    toks = toks.to(kv_cache.device)
+
+    if os.environ.get("VLLM_SM70_SHADOW_PTR") == "1":
+        import sys as _psys
+        import torch.distributed as _pdist
+
+        _prk = _pdist.get_rank() if _pdist.is_initialized() else 0
+        print(
+            f"[SHADOWPTR] r{_prk} kv={kv_cache.data_ptr():#x} "
+            f"bt={block_table.data_ptr():#x} "
+            f"sreq={sreq.data_ptr():#x} st0={st0.data_ptr():#x} "
+            f"toks={toks.data_ptr():#x} out={out.data_ptr():#x} "
+            f"lens={kv_lens.tolist()}",
+            file=_psys.stderr,
+            flush=True,
+        )
 
     # Byte-reinterpret the fp8 cache as uint8 (both 1 byte), preserving the
     # HND view's shape/strides/offset; .set_ works for non-contiguous views.
@@ -664,13 +737,122 @@ def sm70_fp8_paged_dequant(
         kv_cache.shape,
         kv_cache.stride(),
     )
-    grid = (B_s, H, N)
+    grid = (B_s, H_eff, PAGE)
+    # IMA dump valve: save every input of the first kv_len==11 dequant so the
+    # kernel can be replayed standalone (and under compute-sanitizer).
+    if os.environ.get("VLLM_SM70_SHADOW_DUMP") == "1":
+        try:
+            import sys as _dsys
+            import torch.distributed as _ddist
+
+            _drk = _ddist.get_rank() if _ddist.is_initialized() else 0
+            _cnt = getattr(sm70_fp8_paged_dequant, "_dumpcnt", {})
+            if int(kv_lens.max()) == 11:
+                _n = _cnt.get(_drk, 0)
+                _cnt[_drk] = _n + 1
+                sm70_fp8_paged_dequant._dumpcnt = _cnt
+                if _n < 10:
+                    _d = f"/tmp/dqdump_r{_drk}_{_n}"
+                _l = _e4m3_lut(kv_cache.device)
+                torch.save(
+                    {
+                        "bt": block_table.cpu(),
+                        "sreq": sreq.cpu(),
+                        "st0": st0.cpu(),
+                        "toks": toks.cpu(),
+                        "kv_lens": kv_lens.cpu(),
+                        "k_scale": k_scale,
+                        "v_scale": v_scale,
+                        "kv_shape": tuple(kv_cache.shape),
+                        "kv_stride": list(strides),
+                        "out_shape": tuple(out.shape),
+                        "out_stride": list(out.stride()),
+                        "kv_base": kv_cache.data_ptr(),
+                        "out_base": out.data_ptr(),
+                        "bt_base": block_table.data_ptr(),
+                        "lut": _l.cpu(),
+                    },
+                    _d + ".pt",
+                )
+                print(
+                    f"[DQDUMP] r{_drk} saved -> {_d}.pt "
+                    f"kv_base={kv_cache.data_ptr():#x} "
+                    f"out_base={out.data_ptr():#x} "
+                    f"bt_base={block_table.data_ptr():#x} "
+                    f"sreq_base={sreq.data_ptr():#x}",
+                    file=_dsys.stderr,
+                    flush=True,
+                )
+        except Exception as _de:
+            import sys as _dsys2
+
+            print(f"[DQDUMP] dump failed: {_de}", file=_dsys2.stderr)
+    # IMA canary: expected plan tensors (tiny; always computed) so cross-op
+    # canary hooks (sm70_canary_check) can verify sreq/st0 at any point.
+    _exp_sreq = torch.zeros(B_s, dtype=torch.int32)
+    _exp_st0 = torch.zeros(B_s, dtype=torch.int32)
+    _base = 0
+    for _r in range(len(kv_cpu)):
+        _nb = (kv_cpu[_r] + PAGE - 1) // PAGE
+        if _nb:
+            _exp_sreq[_base : _base + _nb] = _r
+            _exp_st0[_base : _base + _nb] = torch.arange(
+                _nb, dtype=torch.int32
+            ) * PAGE
+        _base += _nb
+    if os.environ.get("VLLM_SM70_SHADOW_CANARY") == "1":
+        try:
+            import sys as _csys
+            import torch.distributed as _cdist
+
+            _crk = _cdist.get_rank() if _cdist.is_initialized() else 0
+            _cs = sreq.cpu().tolist()
+            _cs0 = st0.cpu().tolist()
+            if _cs != _exp_sreq.tolist() or _cs0 != _exp_st0.tolist():
+                print(
+                    f"[SREQCORRUPT] r{_crk} kv_lens={kv_cpu} "
+                    f"sreq={_cs} expect={_exp_sreq.tolist()} "
+                    f"st0={_cs0} expect={_exp_st0.tolist()} "
+                    f"(corrupted by a kernel since the previous dequant)",
+                    file=_csys.stderr,
+                    flush=True,
+                )
+        except Exception as _ce:
+            import sys as _csys2
+
+            print(f"[SREQCORRUPT] canary check failed: {_ce}", file=_csys2.stderr)
+    # IMA bisection valve: full-device sync BEFORE the (driver-API, async)
+    # Triton launch. Any still-unreported device error is raised HERE with a
+    # clean torch.cuda.synchronize traceback, pinning the fault to the ops
+    # executed since the previous dequant.
+    if os.environ.get("VLLM_SM70_SHADOW_SYNC") == "1":
+        try:
+            torch.cuda.synchronize()
+        except Exception as _se:
+            import sys as _s2
+            print(
+                f"[SYNCFAIL] pre-dequant full sync raised; kv_lens={kv_lens.tolist()} "
+                f"B_s={B_s} (layer = the SM70DBG/SHADOWPTR line immediately above): "
+                f"{type(_se).__name__}: {_se}",
+                file=_s2.stderr,
+                flush=True,
+            )
+            raise
+    # Always park the current plan tensors for the cross-op canary hooks.
+    sm70_fp8_paged_dequant._canary = (
+        sreq,
+        st0,
+        _exp_sreq,
+        _exp_st0,
+        f"kv_lens={kv_cpu}",
+    )
     _sm70_fp8_dequant_kernel[grid](
         kv_u8,
         _e4m3_lut(kv_cache.device),
         block_table,
         sreq,
         st0,
+        toks,
         out,
         k_scale=k_scale,
         v_scale=v_scale,
@@ -678,8 +860,45 @@ def sm70_fp8_paged_dequant(
         stride_head=strides[1],
         stride_tok=strides[2],
         bt_cols=block_table.shape[1],
-        H=H,
+        H=H_eff,
         D=D,
-        N=N,
+        N=PAGE,
+        N_phys=N,
         num_warps=4,
     )
+    # IMA bisection valve: Triton launches are driver-API (async even under
+    # CUDA_LAUNCH_BLOCKING), so a faulting Triton kernel only surfaces at a
+    # LATER launch. Full-device sync here pins the fault to this kernel.
+    if os.environ.get("VLLM_SM70_SHADOW_SYNC") == "1":
+        torch.cuda.synchronize()
+    if os.environ.get("VLLM_SM70_SHADOW_CANARY") == "1":
+        sm70_canary_check("post-dequant-end")
+    if os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1":
+        torch.cuda.synchronize()
+
+
+def sm70_canary_check(tag: str) -> None:
+    """Cross-op canary: verify the last dequant's sreq/st0 plan tensors are
+    uncorrupted. Gated by VLLM_SM70_SHADOW_CANARY. Print on first corruption
+    at each call site."""
+    if os.environ.get("VLLM_SM70_SHADOW_CANARY") != "1":
+        return
+    try:
+        can = getattr(sm70_fp8_paged_dequant, "_canary", None)
+        if can is None:
+            return
+        sreq, st0, _exp_sreq, _exp_st0, _ctx = can
+        cs = sreq.cpu().tolist()
+        cs0 = st0.cpu().tolist()
+        if cs != _exp_sreq.tolist() or cs0 != _exp_st0.tolist():
+            import sys as _qsys
+
+            print(
+                f"[SREQCORRUPT-AT] {tag} ctx={_ctx} sreq={cs} "
+                f"expect={_exp_sreq.tolist()} st0={cs0} "
+                f"expect={_exp_st0.tolist()}",
+                file=_qsys.stderr,
+                flush=True,
+            )
+    except Exception:
+        pass

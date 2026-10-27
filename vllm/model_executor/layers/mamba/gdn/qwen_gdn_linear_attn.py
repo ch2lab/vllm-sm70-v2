@@ -547,6 +547,22 @@ class ChunkGatedDeltaRule(CustomOp):
             chunk_gated_delta_rule_sm70_gated,
         )
 
+        if os.environ.get("VLLM_SM70_GDNDBG") == "1":
+            import sys as _gdsys
+            _grk = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            for _nm, _t in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
+                _f = _t.detach().float()
+                print(
+                    f"[GDN] r{_grk} IN {_nm} shp={tuple(_f.shape)} "
+                    f"sum={_f.sum().item():.6g} max={_f.abs().max().item():.6g}",
+                    file=_gdsys.stderr,
+                    flush=True,
+                )
+
         # Env-gated valve: VLLM_SM70_GDN_CHUNKED=1 -> K2 chunked shadow kernel,
         # else the incumbent serial kernel (byte-identical default behavior).
         o, final_state = chunk_gated_delta_rule_sm70_gated(
@@ -567,6 +583,20 @@ class ChunkGatedDeltaRule(CustomOp):
             o_flat = o.squeeze(0).reshape(-1)
             co_flat = core_attn_out.reshape(-1)
             co_flat[: o_flat.numel()].copy_(o_flat)
+        if os.environ.get("VLLM_SM70_GDNDBG") == "1":
+            import sys as _gdsys2
+            _grk2 = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            _of = o.detach().float()
+            print(
+                f"[GDN] r{_grk2} OUT o shp={tuple(_of.shape)} "
+                f"sum={_of.sum().item():.6g} max={_of.abs().max().item():.6g}",
+                file=_gdsys2.stderr,
+                flush=True,
+            )
         return o, final_state
 
     def forward_cutedsl(
@@ -1206,6 +1236,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if not _DIAG_SKIP_GDN_NORM:
             core_attn_out = self.norm(core_attn_out, z)
         if (
+            os.environ.get("VLLM_SM70_GDNPROJ") == "1"
+            and self.layer_idx == 0
+        ):
+            import sys as _osys
+            import torch.distributed as _odist
+            _orank = _odist.get_rank() if _odist.is_initialized() else 0
+            _on = core_attn_out.detach().float()
+            _onh = _on[..., :2048] if _on.dim() == 2 else _on
+            _onh0 = _on[..., 0, :] if _on.dim() == 3 else _on
+            _onh2 = _on[..., :16, :] if _on.dim() == 3 else _on
+            _onph = _onh2.reshape(-1, _onh2.shape[-1])
+            _np = _onph.shape[0]
+            _ons = " ".join(
+                f"{_onph[i].sum().item():.4g}" for i in range(min(16, _np))
+            )
+            print(
+                f"[GDNNORM] r{_orank} normed shp={tuple(_on.shape)} "
+                f"sumh={_onh.sum().item():.6g} "
+                f"l2={(_on**2).sum().item():.6g} "
+                f"l2h0={(_onh0**2).sum().item():.6g} "
+                f"psum=[{_ons}] "
+                f"max={_on.abs().max().item():.6g}",
+                file=_osys.stderr,
+                flush=True,
+            )
+        if (
             _DIAG_SHAPE_GDN
             and core_attn_out.shape[0] <= 8
             and not getattr(self, "_sm70_shape_logged", False)
@@ -1225,6 +1281,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 tuple(self.out_proj.weight.shape),
             )
         output, _ = self.out_proj(core_attn_out.flatten(-2))
+        if (
+            os.environ.get("VLLM_SM70_GDNPROJ") == "1"
+            and self.layer_idx == 0
+        ):
+            import sys as _osys2
+            import torch.distributed as _odist2
+            _orank2 = _odist2.get_rank() if _odist2.is_initialized() else 0
+            _of = output.detach().float()
+            print(
+                f"[GDNNORM] r{_orank2} out shp={tuple(_of.shape)} "
+                f"sum={_of.sum().item():.6g} l2={(_of**2).sum().item():.6g} "
+                f"max={_of.abs().max().item():.6g}",
+                file=_osys2.stderr,
+                flush=True,
+            )
         return output
 
     def forward_hip(
@@ -1276,6 +1347,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        if (
+            os.environ.get("VLLM_SM70_GDNWGT") == "1"
+            and not getattr(self, "_qkvz_wgt_dumped", False)
+        ):
+            self._qkvz_wgt_dumped = True
+            import sys as _wsys
+            _wrk = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            for _wn, _wm in (("qkvz", self.in_proj_qkvz), ("ba", self.in_proj_ba)):
+                for _sn, _sv in _wm.state_dict().items():
+                    if isinstance(_sv, torch.Tensor):
+                        print(
+                            f"[WGT] r{_wrk} {_wn} {_sn} shp={tuple(_sv.shape)} "
+                            f"dtype={_sv.dtype}",
+                            file=_wsys.stderr,
+                            flush=True,
+                        )
         # SM70 Qwen3.8: one merged qkvz+ba GEMV launch (set by
         # enable_qwen38_sm70_fp16_gemv on the exact-model contract); the op
         # falls back to the two standard projections outside M=1 decode.
@@ -1286,6 +1377,88 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
+        if os.environ.get("VLLM_SM70_GDNPROJ") == "1":
+            import sys as _psys
+            import torch.distributed as _pdist
+            _prk = _pdist.get_rank() if _pdist.is_initialized() else 0
+            _hin = hidden_states.detach().float()
+            _qo = mixed_qkvz.detach().float()
+            _bo = ba.detach().float()
+            print(
+                f"[PROJ] r{_prk} {self.prefix[-30:]} "
+                f"in_sum={_hin.sum().item():.6g} in_max={_hin.abs().max().item():.6g} "
+                f"qkvz_sum={_qo.sum().item():.6g} qkvz_max={_qo.abs().max().item():.6g} "
+                f"qkvz_shp={tuple(_qo.shape)} ba_sum={_bo.sum().item():.6g} "
+                f"ba_shp={tuple(_bo.shape)}",
+                file=_psys.stderr,
+                flush=True,
+            )
+            # Dump the actual weight the qkvz layer holds / uses.
+            _kern = getattr(self.in_proj_qkvz.quant_method, "fp8_linear", None)
+            for _attr, _src in (
+                ("weight", lambda: getattr(self.in_proj_qkvz, "weight", None)),
+                ("deq", lambda: getattr(_kern, "_weight_deq", None)),
+                ("qpn", lambda: getattr(_kern, "_qpn", None)),
+            ):
+                _wt = _src()
+                if isinstance(_wt, torch.Tensor):
+                    _wf = _wt.detach().float()
+                    print(
+                        f"[PROJW] r{_prk} {self.prefix[-30:]} {_attr} "
+                        f"shp={tuple(_wt.shape)} sum={_wf.sum().item():.6g} "
+                        f"max={_wf.abs().max().item():.6g}",
+                        file=_psys.stderr,
+                        flush=True,
+                    )
+            # GDN-specific params that must be TP-sharded correctly.
+            for _pn, _pt in (
+                ("conv1d", self.conv1d.weight),
+                ("A_log", self.A_log),
+                ("dt_bias", self.dt_bias),
+                ("norm", self.norm.weight),
+            ):
+                if isinstance(_pt, torch.Tensor):
+                    _pf = _pt.detach().float()
+                    print(
+                        f"[PROJW] r{_prk} {self.prefix[-30:]} {_pn} "
+                        f"shp={tuple(_pt.shape)} sum={_pf.sum().item():.6g} "
+                        f"max={_pf.abs().max().item():.6g}",
+                        file=_psys.stderr,
+                        flush=True,
+                    )
+            # out_proj (RowParallelLinear): verify weight sharding. Each rank's
+            # weight [out, in_per_rank] must equal TP1 weight [out, in_full][:,
+            # rank*in_per_rank : (rank+1)*in_per_rank].
+            _opw = getattr(self.out_proj, "weight", None)
+            if not isinstance(_opw, torch.Tensor):
+                # FP8 out_proj: the SM70 kernel deletes .weight and keeps the
+                # dequantized FP16 copy on the kernel.
+                _k = getattr(
+                    getattr(self.out_proj, "quant_method", None),
+                    "fp8_linear",
+                    None,
+                )
+                if _k is not None:
+                    _opw = getattr(_k, "_weight_deq", None)
+                    if _opw is None:
+                        _opw = getattr(_k, "_qpn", None)
+            if isinstance(_opw, torch.Tensor):
+                _opw = _opw.detach().float()
+                # first-half input slice: == this rank's full weight at TP2,
+                # == TP1 weight's first-half input columns. Comparable across TP.
+                _half = self.value_dim // 2
+                _wsum = _opw.sum().item()
+                _wfirst = _opw[..., :_half].sum().item()
+                _row0first = _opw[0, :_half].sum().item()
+                _row1first = _opw[1, :_half].sum().item()
+                print(
+                    f"[PROJW] r{_prk} {self.prefix[-30:]} out_proj "
+                    f"shp={tuple(_opw.shape)} sum={_wsum:.6g} "
+                    f"first_insum={_wfirst:.6g} "
+                    f"row0={_row0first:.6g} row1={_row1first:.6g}",
+                    file=_psys.stderr,
+                    flush=True,
+                )
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode
@@ -1349,6 +1522,51 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
+        if (
+            os.environ.get("VLLM_SM70_GDNPROJ") == "1"
+            and self.layer_idx == 0
+        ):
+            import sys as _crosys
+            import torch.distributed as _crdist
+            _crrk = _crdist.get_rank() if _crdist.is_initialized() else 0
+            _cro = core_attn_out.detach().float()
+            # First-half heads: == TP2-rank0 full, == TP1 first 16 heads.
+            _croh = _cro[..., :16, :] if _cro.dim() == 3 else _cro
+            _z = z.detach().float() if z is not None else None
+            _zh = _z[..., :16, :] if (_z is not None and _z.dim() == 3) else _z
+            _zsumh = _zh.sum().item() if _z is not None else float("nan")
+            _zmax = _z.abs().max().item() if _z is not None else float("nan")
+            _crol2h = (_croh**2).sum().item()
+            _croh0 = _croh[..., 0, :] if _croh.dim() == 3 else _croh
+            _crol2h0 = (_croh0**2).sum().item()
+            # Per-head L2 (first min(16,Hv) heads) to spot element-wise errors
+            # that cancel in the aggregate.
+            _nh = _croh.shape[-2] if _croh.dim() == 3 else 0
+            _ph = _croh.reshape(-1, _croh.shape[-1]) if _nh else _croh
+            _perhead = " ".join(
+                f"{(_ph[i]**2).sum().item():.4g}" for i in range(min(16, _nh))
+            )
+            # Signed per-head sums (sign-sensitive, catches element-wise
+            # sign errors that L2 cancels).
+            _perhead_s = " ".join(
+                f"{_ph[i].sum().item():.4g}" for i in range(min(16, _nh))
+            )
+            print(
+                f"[GDNCONV] r{_crrk} core shp={tuple(_cro.shape)} "
+                f"sumh={_croh.sum().item():.6g} l2h={_crol2h:.6g} "
+                f"perhead=[{_perhead}] "
+                f"psum=[{_perhead_s}] "
+                f"zsumh={_zsumh:.6g} zmax={_zmax:.6g}",
+                file=_crosys.stderr,
+                flush=True,
+            )
+        # IMA canary hook: verify the QSA plan tensors survived this GDN layer.
+        if os.environ.get("VLLM_SM70_SHADOW_CANARY") == "1":
+            from vllm.v1.attention.ops.sm70_nvfp4_dequant import (
+                sm70_canary_check,
+            )
+
+            sm70_canary_check(f"post-gdn {self.prefix[-30:]}")
         return self._output_projection(core_attn_out, z)
 
     def forward_xpu(
@@ -1836,6 +2054,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 metadata=attn_metadata,
             ).transpose(0, 1)
             named_marker("gdn_after_conv")
+            if (
+                os.environ.get("VLLM_SM70_GDNPROJ") == "1"
+                and self.layer_idx == 0
+            ):
+                import sys as _cvsys
+                import torch.distributed as _cvdist
+                _cvrk = (
+                    _cvdist.get_rank() if _cvdist.is_initialized() else 0
+                )
+                _cv = mixed_qkv_non_spec.detach().float()
+                # First-half channels: == TP2-rank0 full, == TP1 first 4096.
+                _cvh = _cv[..., :4096]
+                print(
+                    f"[GDNCONV] r{_cvrk} prefill shp={tuple(_cv.shape)} "
+                    f"sum={_cv.sum().item():.6g} sumh={_cvh.sum().item():.6g} "
+                    f"max={_cv.abs().max().item():.6g}",
+                    file=_cvsys.stderr,
+                    flush=True,
+                )
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec = causal_conv1d_update(

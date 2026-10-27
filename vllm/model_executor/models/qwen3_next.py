@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -602,6 +603,23 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, sp_pad))
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
 
+        if os.environ.get("VLLM_SM70_LAYERDBG") == "1":
+            import sys as _ldsys
+            _rk = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            if _rk == 0:
+                torch.cuda.synchronize()
+                _hd = hidden_states.detach().float()
+                print(
+                    f"[LD] r{_rk} L{self.layer_idx}:{self.layer_type} POSTATTN "
+                    f"sum={_hd.sum().item():.7g} max={_hd.abs().max().item():.7g} "
+                    f"shp={tuple(_hd.shape)}",
+                    file=_ldsys.stderr,
+                    flush=True,
+                )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.use_attn_reduce_scatter_for_moe:
@@ -626,6 +644,23 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
+        if os.environ.get("VLLM_SM70_LAYERDBG") == "1":
+            import sys as _ldsys
+            _rk = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            if _rk == 0:
+                torch.cuda.synchronize()
+                _hd = hidden_states.detach().float()
+                print(
+                    f"[LD] r{_rk} L{self.layer_idx}:{self.layer_type} POSTMLP "
+                    f"sum={_hd.sum().item():.7g} max={_hd.abs().max().item():.7g} "
+                    f"shp={tuple(_hd.shape)}",
+                    file=_ldsys.stderr,
+                    flush=True,
+                )
         return hidden_states, residual
 
 
