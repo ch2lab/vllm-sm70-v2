@@ -395,6 +395,54 @@ def get_varlen_cudagraph_unsupported_backend(
     return None
 
 
+def _log_kv_cache_bytes(
+    kv_caches: dict[str, Any], vllm_config: VllmConfig
+) -> None:
+    """Report where the KV budget goes, straight from the allocated tensors.
+
+    Each cache family (main attention pages, the QSA compressed key cache, the
+    QSA raw-key ring, Mamba states) is allocated independently, so the pool size
+    is only explainable once their real byte counts are known.
+    """
+    try:
+        # A group allocates one tensor and every layer name in it points at the
+        # same storage, so count each distinct allocation once.
+        buckets: dict[tuple[str, tuple[int, ...]], list[int]] = {}
+        seen: dict[int, tuple[str, tuple[int, ...]]] = {}
+        for tensor in kv_caches.values():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            ptr = tensor.data_ptr()
+            if ptr in seen:
+                continue  # alias of an allocation already counted
+            key = (str(tensor.dtype).rsplit(".", 1)[-1], tuple(tensor.shape[1:]))
+            seen[ptr] = key
+            entry = buckets.setdefault(key, [0, 0])
+            entry[0] += 1
+            entry[1] += tensor.numel() * tensor.element_size()
+        total = sum(entry[1] for entry in buckets.values())
+        tokens = getattr(vllm_config.cache_config, "kv_cache_size_tokens", 0) or 0
+        logger.info_once(
+            "[KV-BYTES] total=%.3f GiB for %s tokens -> %.0f B/token",
+            total / 2**30,
+            f"{tokens:,}",
+            total / tokens if tokens else 0.0,
+        )
+        for (dtype_name, shape), (count, size) in sorted(
+            buckets.items(), key=lambda item: -item[1][1]
+        ):
+            logger.info_once(
+                "[KV-BYTES]   %-9s %-26s n=%2d %8.2f MiB  %6.1f B/token",
+                dtype_name,
+                str(shape),
+                count,
+                size / 2**20,
+                size / tokens if tokens else 0.0,
+            )
+    except Exception as exc:  # diagnostics must never take the engine down
+        logger.warning("[KV-BYTES] accounting failed: %r", exc)
+
+
 def init_kv_cache(
     forward_context: dict[str, Any],
     kv_cache_config: KVCacheConfig,
@@ -425,6 +473,7 @@ def init_kv_cache(
                 vllm_config.cache_config.get_resolved_kv_cache_layout(),
                 kernel_block_sizes,
             )
+        _log_kv_cache_bytes(kv_caches, vllm_config)
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
         kv_caches[layer_name] = kv_caches[target]
     # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
