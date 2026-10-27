@@ -368,7 +368,11 @@ class QSAIndexer(nn.Module):
                 self.q_layernorm.variance_epsilon,
             ).reshape_as(q)
             q = apply_qsa_rope(self.rotary_emb, positions, q)
-            q = q.to(self.indexer_dtype)
+            # A quantised index cache is dequantised at the point of use
+            # (Triton on SM70 cannot take e4m3 at all), so keep q at fp16.
+            q = q.to(
+                torch.float16 if self.indexer_kv_dtype == "fp8" else self.indexer_dtype
+            )
 
             raw_key_cache = raw_key_state_cache.key_cache
             rope_position_cache = raw_key_state_cache.rope_position_cache
