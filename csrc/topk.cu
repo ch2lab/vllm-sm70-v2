@@ -10,6 +10,7 @@
 
 #ifndef USE_ROCM
   #include "qsa_lexicographic_topk.cuh"
+  #include "qsa_prefilter_topk.cuh"
   #include "persistent_topk.cuh"
   #include "sampled_topk.cuh"
 #endif
@@ -350,3 +351,81 @@ void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
 #endif
 }
 
+
+// Exact tile-max prefilter selection. See qsa_prefilter_topk.cuh for the
+// bound that makes it exact. `tiles`, `candidates`, `positions`, `tile_lengths`
+// and `span_lengths` are caller-provided workspaces:
+//   tiles        [rows, k]      int32
+//   candidates   [rows, k*tile] float32
+//   positions    [rows, k]      int32
+//   tile_lengths [rows]         int32
+//   span_lengths [rows]         int32
+void qsa_prefilter_topk(const torch::stable::Tensor& logits,
+                        const torch::stable::Tensor& tile_max,
+                        const torch::stable::Tensor& lengths,
+                        torch::stable::Tensor& tiles,
+                        torch::stable::Tensor& candidates,
+                        torch::stable::Tensor& positions,
+                        torch::stable::Tensor& tile_lengths,
+                        torch::stable::Tensor& span_lengths,
+                        torch::stable::Tensor& output, int64_t tile,
+                        int64_t k) {
+#ifndef USE_ROCM
+  STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
+  STD_TORCH_CHECK(tile_max.is_cuda(), "tile_max must be CUDA tensor");
+  STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
+  STD_TORCH_CHECK(logits.scalar_type() == torch::headeronly::ScalarType::Float,
+                  "Only float32 logits are supported");
+  STD_TORCH_CHECK(tile_max.scalar_type() ==
+                      torch::headeronly::ScalarType::Float,
+                  "tile_max must be float32");
+  STD_TORCH_CHECK(lengths.scalar_type() == torch::headeronly::ScalarType::Int,
+                  "lengths must be int32");
+  STD_TORCH_CHECK(logits.dim() == 2 && tile_max.dim() == 2,
+                  "logits and tile_max must be 2D");
+  STD_TORCH_CHECK(logits.stride(1) == 1 && tile_max.is_contiguous(),
+                  "logits must be contiguous in the column dimension");
+  STD_TORCH_CHECK(k == 512, "qsa_prefilter_topk supports only k=512, got k=",
+                  k);
+  STD_TORCH_CHECK(tile == 16, "qsa_prefilter_topk requires tile=16, got ",
+                  tile);
+
+  const int64_t num_rows = logits.size(0);
+  if (num_rows == 0) return;
+  const int64_t columns = logits.size(1);
+  const int64_t num_tiles = tile_max.size(1);
+  STD_TORCH_CHECK(num_tiles == (columns + tile - 1) / tile,
+                  "tile_max width must be ceil(columns / tile)");
+  STD_TORCH_CHECK(lengths.numel() == num_rows, "lengths size mismatch");
+  STD_TORCH_CHECK(tiles.size(0) == num_rows && tiles.size(1) == k,
+                  "tiles workspace size mismatch");
+  STD_TORCH_CHECK(candidates.size(0) == num_rows &&
+                      candidates.size(1) == k * tile,
+                  "candidates workspace size mismatch");
+  STD_TORCH_CHECK(positions.size(0) == num_rows && positions.size(1) == k,
+                  "positions workspace size mismatch");
+  STD_TORCH_CHECK(tile_lengths.numel() == num_rows,
+                  "tile_lengths workspace size mismatch");
+  STD_TORCH_CHECK(span_lengths.numel() == num_rows,
+                  "span_lengths workspace size mismatch");
+  STD_TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
+                  "output size mismatch");
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      logits.get_device_index());
+  vllm::qsa::launch_qsa_prefilter_topk<512>(
+      logits.const_data_ptr<float>(), tile_max.const_data_ptr<float>(),
+      lengths.const_data_ptr<int32_t>(), tile_lengths.mutable_data_ptr<int32_t>(),
+      span_lengths.mutable_data_ptr<int32_t>(), tiles.mutable_data_ptr<int32_t>(),
+      candidates.mutable_data_ptr<float>(),
+      positions.mutable_data_ptr<int32_t>(),
+      output.mutable_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
+      static_cast<uint32_t>(columns), static_cast<uint32_t>(num_tiles),
+      static_cast<uint32_t>(tile), get_current_cuda_stream());
+  const cudaError_t err = cudaGetLastError();
+  STD_TORCH_CHECK(err == cudaSuccess, "qsa_prefilter_topk failed: ",
+                  cudaGetErrorString(err));
+#else
+  STD_TORCH_CHECK(false, "qsa_prefilter_topk is not supported on ROCm");
+#endif
+}

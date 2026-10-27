@@ -37,6 +37,12 @@ _SM70_INDEXER_CUBLAS_MIN_ROWS = int(
 _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = int(
     os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS", str(1024**2))
 )
+# Exact tile-max prefilter for the selection stage (see
+# csrc/qsa_prefilter_topk.cuh). The tile maxes are produced for free by the
+# score epilogue; the selector then only scans the 512 tiles that can contain
+# a top-k element instead of the whole row.
+_SM70_INDEXER_PREFILTER = os.getenv("VLLM_SM70_QSA_PREFILTER", "1") == "1"
+_SM70_INDEXER_PREFILTER_TILE = 16
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
@@ -91,14 +97,17 @@ def _qsa_relu_headsum_visible_kernel(
     visible_ptr,
     key_valid_ptr,
     logits_ptr,
+    tile_max_ptr,
     stride_score_row,
     stride_score_column,
     stride_logits_row,
+    stride_tile_row,
     width,
     column_start,
     score_divisor,
     NUM_HEADS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    TILE: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -120,10 +129,23 @@ def _qsa_relu_headsum_visible_kernel(
             other=0.0,
         ).to(tl.float32)
         score += tl.maximum(values, 0.0)
+    logit = tl.where(live, score / score_divisor, -float("inf"))
     tl.store(
         logits_ptr + row * stride_logits_row + absolute_columns,
-        tl.where(live, score / score_divisor, -float("inf")),
+        logit,
         mask=columns < width,
+    )
+    # Per-TILE maximum of the logits this program just produced. The tile-max
+    # prefilter selects its candidates from these, so they must be the same
+    # values the selector would have read back (masked lanes are -inf).
+    tile_max = tl.max(tl.reshape(logit, (BLOCK_N // TILE, TILE)), axis=1)
+    tile_ids = (
+        column_start + tl.program_id(1) * BLOCK_N
+    ) // TILE + tl.arange(0, BLOCK_N // TILE)
+    tl.store(
+        tile_max_ptr + row * stride_tile_row + tile_ids,
+        tile_max,
+        mask=tile_ids < stride_tile_row,
     )
 
 
@@ -187,6 +209,7 @@ def _qsa_mqa_cublas(
     keys: torch.Tensor,
     key_valid: torch.Tensor,
     visible: torch.Tensor,
+    tile_max: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score one request with Volta Tensor Cores and a fused QSA epilogue."""
 
@@ -194,7 +217,7 @@ def _qsa_mqa_cublas(
     columns = keys.shape[0]
     logits = torch.empty((rows, columns), dtype=torch.float32, device=q.device)
     if not rows or not columns:
-        return logits, visible
+        return logits, tile_max
 
     q2 = q.reshape(rows * num_heads, head_dim)
     bytes_per_column = max(1, q2.shape[0] * 4)
@@ -220,17 +243,20 @@ def _qsa_mqa_cublas(
             visible,
             key_valid,
             logits,
+            tile_max,
             scores.stride(0),
             scores.stride(1),
             logits.stride(0),
+            tile_max.stride(0),
             width,
             column_start,
             math.sqrt(head_dim),
             NUM_HEADS=num_heads,
             BLOCK_N=256,
+            TILE=_SM70_INDEXER_PREFILTER_TILE,
             num_warps=4,
         )
-    return logits, visible
+    return logits, tile_max
 
 
 @triton.jit
@@ -937,15 +963,69 @@ def qsa_select_paged_prefill(
             topk_workspace = torch.empty(
                 (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
             )
+            block_topk = token_topk // compress_ratio
+            prefilter = _SM70_INDEXER_PREFILTER and block_topk == 512
+            tile = _SM70_INDEXER_PREFILTER_TILE
+            num_tiles = triton.cdiv(score_columns, tile)
+            # The score epilogue always emits per-tile maxima (0.25 B per
+            # candidate); the prefilter is what consumes them.
+            tile_max = torch.empty(
+                (rows_per_chunk, num_tiles),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            if prefilter:
+                span = block_topk * tile
+                logger.info_once(
+                    "QSA indexer prefilter active: tile=%d span=%d "
+                    "tiles_per_row=%d (VLLM_SM70_QSA_PREFILTER).",
+                    tile,
+                    span,
+                    num_tiles,
+                )
+                # Selection workspaces, sized for the widest row chunk.
+                tiles_ws = torch.empty(
+                    (rows_per_chunk, block_topk),
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                cand_ws = torch.empty(
+                    (rows_per_chunk, span), dtype=torch.float32, device=q.device
+                )
+                pos_ws = torch.empty_like(tiles_ws)
+                tile_len_ws = torch.empty(
+                    (rows_per_chunk,), dtype=torch.int32, device=q.device
+                )
+                span_len_ws = torch.empty_like(tile_len_ws)
             for query_start in range(0, rows, rows_per_chunk):
                 query_end = min(query_start + rows_per_chunk, rows)
                 query_slice = slice(query_start, query_end)
+                chunk = query_end - query_start
                 q_chunk = q[query_slice]
                 if q_chunk.dtype != torch.float16:
                     q_chunk = q_chunk.to(torch.float16)
-                logits, _ = _qsa_mqa_cublas(
-                    q_chunk, keys, key_valid, visible_blocks[query_slice]
+                logits, chunk_tile_max = _qsa_mqa_cublas(
+                    q_chunk,
+                    keys,
+                    key_valid,
+                    visible_blocks[query_slice],
+                    tile_max[:chunk],
                 )
+                if prefilter:
+                    torch.ops._C.qsa_prefilter_topk(
+                        logits,
+                        chunk_tile_max,
+                        visible_blocks[query_slice],
+                        tiles_ws[:chunk],
+                        cand_ws[:chunk],
+                        pos_ws[:chunk],
+                        tile_len_ws[:chunk],
+                        span_len_ws[:chunk],
+                        block_indices[query_slice],
+                        tile,
+                        block_topk,
+                    )
+                    continue
                 _topk(
                     logits,
                     visible_blocks[query_slice],

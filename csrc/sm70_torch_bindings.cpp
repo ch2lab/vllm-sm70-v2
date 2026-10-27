@@ -18,10 +18,26 @@ void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
                             const torch::stable::Tensor& lengths,
                             torch::stable::Tensor& output, int64_t k);
 
+void qsa_prefilter_topk(const torch::stable::Tensor& logits,
+                        const torch::stable::Tensor& tile_max,
+                        const torch::stable::Tensor& lengths,
+                        torch::stable::Tensor& tiles,
+                        torch::stable::Tensor& candidates,
+                        torch::stable::Tensor& positions,
+                        torch::stable::Tensor& tile_lengths,
+                        torch::stable::Tensor& span_lengths,
+                        torch::stable::Tensor& output, int64_t tile, int64_t k);
+
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "qsa_lexicographic_topk(Tensor logits, Tensor lengths, Tensor! output, "
       "int k) -> ()");
+  ops.def(
+      "qsa_prefilter_topk(Tensor logits, Tensor tile_max, Tensor lengths, "
+      "Tensor! tiles, Tensor! candidates, Tensor! positions, "
+      "Tensor! tile_lengths, Tensor! span_lengths, Tensor! output, "
+      "int tile, int k) -> ()");
 
   ops.impl("qsa_lexicographic_topk", TORCH_BOX(&qsa_lexicographic_topk));
+  ops.impl("qsa_prefilter_topk", TORCH_BOX(&qsa_prefilter_topk));
 }
