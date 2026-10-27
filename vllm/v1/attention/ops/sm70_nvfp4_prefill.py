@@ -36,6 +36,8 @@ Dequant semantics and the LBHNC page layout are identical to
 the SM70 store kernel; fp16-rounded K/V, same as the old shadow path).
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -243,6 +245,16 @@ def sm70_nvfp4_paged_prefill(
     assert kv_cache.dtype == torch.uint8 and block_table.dtype == torch.int32
     assert qo_indptr.dtype == torch.int32 and kv_lens.dtype == torch.int32
     assert bt >= 16 and (bt & (bt - 1)) == 0
+    # Optional hand-written WMMA kernel (env-gated; default off -> unchanged).
+    # Shape-gated + falls back to the Triton kernel below on any mismatch.
+    if os.environ.get("VLLM_SM70_PREFILL_CUDA") == "1":
+        from .sm70_nvfp4_prefill_cuda import try_paged_prefill_cuda
+
+        if try_paged_prefill_cuda(
+            q, kv_cache, block_table, qo_indptr, kv_lens, out, k_scale, v_scale,
+            sm_scale, window_left, max_q_len,
+        ):
+            return
     _, two_h, N, F = kv_cache.shape
     H = two_h // 2
     D = 2 * (F * 8 // 9)
