@@ -66,6 +66,9 @@ def apply_qsa_rope(
     return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
 
 
+_INDEXER_INT8_SCALE = 32.0
+
+
 def _supports_fused_pre_indexer(
     rotary_emb: nn.Module,
     head_dim: int,
@@ -176,6 +179,18 @@ class QSAIndexer(nn.Module):
             # up in an fp16 table.
             indexer_dtype = torch.float8_e4m3fn
             logger.info_once("QSA indexer cache dtype: %s (e4m3 bytes)", indexer_dtype)
+        elif self.indexer_kv_dtype == "int8":
+            # Fixed point, not float: for RMSNormed keys a single int8 with a
+            # per-tensor scale is 4.4x more accurate than e4m3 at the same 128 B
+            # per row, and the decode is one native int->fp16 cast. The scale
+            # never has to be applied, because a positive global scale leaves
+            # the ranking (the only consumer) unchanged.
+            indexer_dtype = torch.int8
+            logger.info_once(
+                "QSA indexer cache dtype: %s (int8 x %.1f, ranking-only scale)",
+                indexer_dtype,
+                _INDEXER_INT8_SCALE,
+            )
         elif self.indexer_kv_dtype == "nvfp4":
             # Packed 4-bit E2M1 with one e4m3 scale byte per 16 dims. The cache
             # is a uint8 buffer of 72 bytes per row (8 scales + 64 packed).
@@ -337,7 +352,7 @@ class QSAIndexer(nn.Module):
                 self.index_head_dim,
                 dtype=(
                     torch.float16
-                    if self.indexer_kv_dtype in ("fp8", "fp8_e4m3", "nvfp4")
+                    if self.indexer_kv_dtype in ("fp8", "fp8_e4m3", "int8", "nvfp4")
                     else self.indexer_dtype
                 ),
             )
@@ -408,7 +423,7 @@ class QSAIndexer(nn.Module):
             # (Triton on SM70 cannot take e4m3 at all), so keep q at fp16.
             q = q.to(
                 torch.float16
-                if self.indexer_kv_dtype in ("fp8", "fp8_e4m3", "nvfp4")
+                if self.indexer_kv_dtype in ("fp8", "fp8_e4m3", "int8", "nvfp4")
                 else self.indexer_dtype
             )
 

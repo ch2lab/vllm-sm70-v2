@@ -138,6 +138,19 @@ def _e4m3_value(byte):
 
 
 @triton.jit
+def _to_int8_byte(y):
+    """Fixed-point encode: round(y * 32), saturating at +/-127.
+
+    32 is chosen so RMSNormed indexer keys (|x| <~ 3) keep their full range;
+    the scale is never applied on the read side because a positive global
+    scale cannot change the ranking, which is all this cache feeds.
+    """
+    scaled = y * 32.0
+    scaled = scaled + tl.where(scaled >= 0, 0.5, -0.5)
+    return tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8)
+
+
+@triton.jit
 def _to_dst_dtype(x, dst, scale, E4M3_BYTES: tl.constexpr):
     """Round to BF16 like the unfused path, then scale for an FP8 destination."""
     out_ty = dst.dtype.element_ty
@@ -211,6 +224,7 @@ def _qsa_prepare_kernel(
     COMP_PAGE_SIZE: tl.constexpr,
     NVFP4: tl.constexpr,
     COMP_E4M3_BYTES: tl.constexpr,
+    COMP_INT8: tl.constexpr,
     IS_2D_POSITIONS: tl.constexpr,
     IS_K_MROPE: tl.constexpr,
     CACHE_HAS_ROPE_POS: tl.constexpr,
@@ -549,6 +563,8 @@ def _qsa_prepare_kernel(
                     (lo | (hi << 4)).to(tl.uint8),
                     mask=valid,
                 )
+            elif COMP_INT8:
+                tl.store(row_ptr + dims, _to_int8_byte(yv.to(tl.float32)), mask=valid)
             elif COMP_E4M3_BYTES:
                 # sm_70 Triton has no fp8e4nv type: encode the e4m3fn byte by
                 # hand and land it in a uint8 view of the cache.
@@ -817,6 +833,7 @@ def qsa_prepare(
         COMP_PAGE_SIZE=compressed_cache.shape[1],
         NVFP4=compressed_cache.dtype == torch.uint8,
         COMP_E4M3_BYTES=comp_e4m3_bytes,
+        COMP_INT8=compressed_cache.dtype == torch.int8,
         IS_2D_POSITIONS=is_2d_positions,
         IS_K_MROPE=is_k_mrope,
         CACHE_HAS_ROPE_POS=cache_has_rope_pos,

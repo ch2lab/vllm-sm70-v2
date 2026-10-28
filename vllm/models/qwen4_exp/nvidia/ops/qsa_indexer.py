@@ -29,22 +29,28 @@ _E2M1_LEVELS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
-def _nvfp4_pair_lut(device: torch.device) -> torch.Tensor:
-    """[code << 8 | e4m3 scale byte] -> value * scale as fp16 (4096 entries).
+_NVFP4_SCALE_BASE = 4096
 
-    One L1-resident table (8 KiB) replaces the per-element exponent maths:
-    E2M1 has 16 levels and the block scale is an e4m3 byte, so every product
-    the dequant can produce is already in here.
+
+def _nvfp4_pair_lut(device: torch.device) -> torch.Tensor:
+    """Two tables: E2M1 levels at [0:16], e4m3 block scales at [4096:4352].
+
+    The 4096-entry table of every (code, scale) product was tried first and is
+    slower (51.3 us vs 43.1 on 16.4k columns): the value table is 32 bytes and
+    stays in cache, while the scale table is read once per 16 dims and the
+    product is one multiply. The layout keeps the offsets as constants.
     """
     table = _NVFP4_PAIR_LUT.get(device)
     if table is None:
-        levels = torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float32)
-        scales = (
+        table = torch.zeros(
+            _NVFP4_SCALE_BASE + 256, dtype=torch.float16, device=device
+        )
+        table[:16] = torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float16)
+        table[_NVFP4_SCALE_BASE:] = (
             torch.arange(256, dtype=torch.uint8, device=device)
             .view(torch.float8_e4m3fn)
-            .to(torch.float32)
+            .to(torch.float16)
         )
-        table = (levels[:, None] * scales[None, :]).reshape(-1).to(torch.float16)
         _NVFP4_PAIR_LUT[device] = table
     return table
 
@@ -58,6 +64,11 @@ def _is_nvfp4_index_cache(k_cache: torch.Tensor, head_dim: int) -> bool:
 
 def _is_fp8(dtype: torch.dtype) -> bool:
     return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _is_int8(dtype: torch.dtype) -> bool:
+    """Fixed-point index cache: one byte, decoded by a native int->fp16 cast."""
+    return dtype == torch.int8
 
 
 def _fp8_needs_table(cache: torch.Tensor) -> bool:
@@ -83,29 +94,24 @@ def _fp8_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 
 @triton.jit
 def _fp8_byte_value(raw, lut_ptr):
-    """e4m3 byte -> fp16 in registers (no table gather).
+    """e4m3 byte -> fp16 through a 256-entry table.
 
     Volta's Triton rejects fp8e4nv outright, so an e4m3 index cache is carried
-    as bytes and rebuilt here; e5m2 takes the native cast instead. e4m3 and
-    fp16 differ only by a constant exponent bias (7 vs 15) and a 4-bit shift
-    of the mantissa, so the normal case is two shifts and an or. Subnormals
-    (e == 0) are m * 2^-9 and exact in fp16, so they take one multiply.
+    as bytes and decoded here; e5m2 takes the native cast instead. Measured
+    against a pure load floor of 29.4 us on 16.4k columns: this table costs
+    32.8 us, the exact bit reconstruction 39.7, and a branchy version 50.5.
+    A 512-byte table stays hot enough that its gather wins outright.
     """
-    b = raw.to(tl.int32)
-    e = (b >> 3) & 0xF
-    m = b & 0x7
-    sign = (b & 0x80) << 8
-    sub = (m.to(tl.float32) * 0.001953125).to(tl.float16)
-    sub_bits = sub.to(tl.uint16, bitcast=True).to(tl.int32)
-    bits = tl.where(e == 0, sub_bits, ((e + 8) << 10) | (m << 7)) | sign
-    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
+    return tl.load(lut_ptr + raw.to(tl.int32))
 
 
 @triton.jit
 def _dequant_nvfp4(raw, sbyte, pair_ptr, half):
-    """NVFP4 nibble -> fp16 through the (code, e4m3 scale) product table."""
+    """NVFP4 nibble -> fp16: level from the value table, scale from the byte."""
     code = (raw.to(tl.int32) >> (4 * (half % 2))) & 0xF
-    return tl.load(pair_ptr + ((code << 8) | sbyte.to(tl.int32)))
+    value = tl.load(pair_ptr + code)
+    scale = tl.load(pair_ptr + 4096 + sbyte.to(tl.int32))
+    return value * scale
 
 
 @triton.jit
@@ -144,9 +150,12 @@ def _load_nvfp4_rows(
         (BLOCK_R, n64),
     )
     idx = sb64.to(tl.int32)
-    lo = tl.load(pair_ptr + (((raw.to(tl.int32) & 0xF) << 8) | idx))
-    hi = tl.load(pair_ptr + ((((raw.to(tl.int32) >> 4) & 0xF) << 8) | idx))
-    return tl.reshape(tl.join(lo, hi), (BLOCK_R, HEAD_DIM))
+    lo = tl.load(pair_ptr + (raw.to(tl.int32) & 0xF))
+    hi = tl.load(pair_ptr + ((raw.to(tl.int32) >> 4) & 0xF))
+    values = tl.reshape(tl.join(lo, hi), (BLOCK_R, HEAD_DIM))
+    scales = tl.load(pair_ptr + 4096 + idx)
+    scales = tl.reshape(tl.join(scales, scales), (BLOCK_R, HEAD_DIM))
+    return values * scales
 
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -161,8 +170,9 @@ _DECODE_BLOCK_N = 64
 _SM70_DECODE_SCAN = {
     "bf16": (64, 2, 2, 4),
     "fp8": (32, 2, 1, 1),
-    "e4m3": (16, 2, 3, 1),
+    "e4m3": (64, 2, 1, 2),
     "nvfp4": (64, 2, 2, 2),
+    "int8": (32, 2, 1, 1),
 }
 
 
@@ -178,6 +188,8 @@ def _sm70_decode_scan_config(
         key = "e4m3"
     elif cache.dtype == torch.float8_e5m2:
         key = "fp8"
+    elif cache.dtype == torch.int8:
+        key = "int8"
     else:
         key = "bf16"
     return _SM70_DECODE_SCAN[key]
@@ -228,6 +240,7 @@ def _qsa_gather_single_request_keys_kernel(
     DEQUANT: tl.constexpr,
     NVFP4: tl.constexpr,
     FP8_LUT: tl.constexpr,
+    INT8_CACHE: tl.constexpr,
 ) -> None:
     column = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
@@ -262,7 +275,7 @@ def _qsa_gather_single_request_keys_kernel(
         key = tl.load(
             row_base + dims * stride_cache_dim,
             mask=valid & (dims < HEAD_DIM),
-            other=0.0,
+            other=0 if INT8_CACHE else 0.0,
         )
         if DEQUANT:
             key = key.to(tl.float16)
@@ -344,7 +357,7 @@ def _qsa_indexer_cublas_shape_supported(
     at RMS=1) and V100 has no BF16 HMMA.
     """
 
-    fp8_cache = _is_fp8(k_cache.dtype)
+    fp8_cache = _is_fp8(k_cache.dtype) or _is_int8(k_cache.dtype)
     # A packed nvfp4 cache is uint8 with a 72-byte row, so both the dtype and
     # the last-dim check have to accept it or prefill silently falls back from
     # cuBLAS to the Triton scan (measured 8x slower: 1102 vs 8858 tok/s).
@@ -374,7 +387,7 @@ def _qsa_gather_single_request_keys(
     columns: int,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8 = _is_fp8(k_cache.dtype)
+    fp8 = _is_fp8(k_cache.dtype) or _is_int8(k_cache.dtype)
     nvfp4 = _is_nvfp4_index_cache(k_cache, head_dim)
     fp8_lut = _fp8_needs_table(k_cache)
     cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
@@ -413,6 +426,7 @@ def _qsa_gather_single_request_keys(
             DEQUANT=fp8,
             NVFP4=nvfp4,
             FP8_LUT=fp8_lut,
+            INT8_CACHE=_is_int8(k_cache.dtype),
             num_warps=4,
         )
     return keys, valid
@@ -499,6 +513,7 @@ def _qsa_mqa_paged_uniform_kernel(
     DEQUANT: tl.constexpr,
     NVFP4: tl.constexpr,
     FP8_LUT: tl.constexpr,
+    INT8_CACHE: tl.constexpr,
 ) -> None:
     NUM_COLUMNS: tl.constexpr = PAGE_TABLE_WIDTH * PAGE_SIZE
     DECODE_QUERY_LEN_PADDED: tl.constexpr = triton.next_power_of_2(DECODE_QUERY_LEN)
@@ -584,7 +599,7 @@ def _qsa_mqa_paged_uniform_kernel(
             keys = tl.load(
                 row_base + dims[None, :],
                 mask=in_row,
-                other=0.0,
+                other=0 if INT8_CACHE else 0.0,
                 eviction_policy="evict_first",
             )
             if DEQUANT:
@@ -634,6 +649,7 @@ def _qsa_mqa_paged_prefill_kernel(
     DEQUANT: tl.constexpr,
     NVFP4: tl.constexpr,
     FP8_LUT: tl.constexpr,
+    INT8_CACHE: tl.constexpr,
 ) -> None:
     num_columns = page_table_width * PAGE_SIZE
     NUM_HEADS_PADDED: tl.constexpr = triton.next_power_of_2(NUM_HEADS)
@@ -733,7 +749,7 @@ def _qsa_mqa_paged_prefill_kernel(
             keys = tl.load(
                 row_base + dims[None, :],
                 mask=in_row,
-                other=0.0,
+                other=0 if INT8_CACHE else 0.0,
                 eviction_policy="evict_first",
             )
             if DEQUANT:
@@ -867,7 +883,7 @@ def warmup_qsa_mqa_paged_decode(
     if not profiles:
         return ()
 
-    fp8 = _is_fp8(k_cache.dtype)
+    fp8 = _is_fp8(k_cache.dtype) or _is_int8(k_cache.dtype)
     # A uint8 cache is the packed nvfp4 layout; the decode kernel then reads
     # nibbles, so the warmup must compile that branch, not the fp8 cast one.
     nvfp4 = k_cache.dtype == torch.uint8
@@ -935,6 +951,7 @@ def warmup_qsa_mqa_paged_decode(
             DEQUANT=fp8,
             NVFP4=nvfp4,
             FP8_LUT=fp8_lut,
+            INT8_CACHE=_is_int8(k_cache.dtype),
             num_warps=warps,
             grid=(
                 num_requests,
@@ -969,7 +986,7 @@ def _prefill_logits(
     )
 
     # tuned on GB300
-    fp8 = _is_fp8(k_cache.dtype)
+    fp8 = _is_fp8(k_cache.dtype) or _is_int8(k_cache.dtype)
     nvfp4 = _is_nvfp4_index_cache(k_cache, q.shape[2])
     fp8_lut = _fp8_needs_table(k_cache)
     cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
@@ -1044,6 +1061,7 @@ def _prefill_logits(
         DEQUANT=fp8,
         NVFP4=nvfp4,
         FP8_LUT=fp8_lut,
+        INT8_CACHE=_is_int8(k_cache.dtype),
         num_warps=num_warps,
     )
     return logits
@@ -1157,6 +1175,7 @@ def qsa_select_paged_decode(
     assert (
         q.dtype == k_cache.dtype
         or _is_fp8(k_cache.dtype)
+        or _is_int8(k_cache.dtype)
         or _is_nvfp4_index_cache(k_cache, q.shape[2])
     ), "Q and the compressed K cache must match"
     if _is_fp8(q.dtype):
@@ -1171,7 +1190,7 @@ def qsa_select_paged_decode(
     block_n = _DECODE_BLOCK_N
     stages = 2
     warps = 0
-    fp8 = _is_fp8(k_cache.dtype)
+    fp8 = _is_fp8(k_cache.dtype) or _is_int8(k_cache.dtype)
     nvfp4 = _is_nvfp4_index_cache(k_cache, q.shape[2])
     fp8_lut = _fp8_needs_table(k_cache)
     cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
@@ -1211,6 +1230,7 @@ def qsa_select_paged_decode(
         DEQUANT=fp8,
         NVFP4=nvfp4,
         FP8_LUT=fp8_lut,
+        INT8_CACHE=_is_int8(k_cache.dtype),
         num_warps=warps or (1 if fp8 else 2),
     )
     _topk(
@@ -1258,6 +1278,7 @@ def qsa_select_paged_prefill(
     assert (
         q.dtype == k_cache.dtype
         or _is_fp8(k_cache.dtype)
+        or _is_int8(k_cache.dtype)
         or _is_nvfp4_index_cache(k_cache, q.shape[2])
     ), "Q and the compressed K cache must match"
     if _is_fp8(q.dtype):
