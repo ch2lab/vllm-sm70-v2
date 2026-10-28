@@ -168,6 +168,14 @@ class QSAIndexer(nn.Module):
                 indexer_dtype,
                 "sm70 Triton has no e4m3" if sm70 else "e4m3",
             )
+        elif self.indexer_kv_dtype == "fp8_e4m3":
+            # Three mantissa bits instead of e5m2's two, at the same byte cost.
+            # Volta's Triton cannot name fp8e4nv, so the cache holds e4m3 bit
+            # patterns and both directions go through a uint8 view: the writer
+            # encodes bytes in-kernel (_to_e4m3_byte) and the reader looks them
+            # up in an fp16 table.
+            indexer_dtype = torch.float8_e4m3fn
+            logger.info_once("QSA indexer cache dtype: %s (e4m3 bytes)", indexer_dtype)
         elif self.indexer_kv_dtype == "nvfp4":
             # Packed 4-bit E2M1 with one e4m3 scale byte per 16 dims. The cache
             # is a uint8 buffer of 72 bytes per row (8 scales + 64 packed).
@@ -298,6 +306,7 @@ class QSAIndexer(nn.Module):
 
         from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
         from .ops.qsa_indexer import (
+            _fp8_needs_table,
             expand_qsa_block_indices,
             qsa_select_paged_decode,
             qsa_select_paged_prefill,
@@ -328,7 +337,7 @@ class QSAIndexer(nn.Module):
                 self.index_head_dim,
                 dtype=(
                     torch.float16
-                    if self.indexer_kv_dtype in ("fp8", "nvfp4")
+                    if self.indexer_kv_dtype in ("fp8", "fp8_e4m3", "nvfp4")
                     else self.indexer_dtype
                 ),
             )
@@ -399,7 +408,7 @@ class QSAIndexer(nn.Module):
             # (Triton on SM70 cannot take e4m3 at all), so keep q at fp16.
             q = q.to(
                 torch.float16
-                if self.indexer_kv_dtype in ("fp8", "nvfp4")
+                if self.indexer_kv_dtype in ("fp8", "fp8_e4m3", "nvfp4")
                 else self.indexer_dtype
             )
 
@@ -494,6 +503,9 @@ class QSAIndexer(nn.Module):
             and num_decode_tokens > 0
             and num_decode_tokens == num_tokens
             and decode_query_len == 1
+            # The fused selector reads the cache directly; an e4m3 cache on
+            # Volta can only be read through the byte table.
+            and not _fp8_needs_table(compressed_key_cache)
         ):
             num_decodes = compressed_metadata.num_decodes
             if num_decodes * decode_query_len != num_decode_tokens:

@@ -210,6 +210,7 @@ def _qsa_prepare_kernel(
     STATE_SIZE: tl.constexpr,
     COMP_PAGE_SIZE: tl.constexpr,
     NVFP4: tl.constexpr,
+    COMP_E4M3_BYTES: tl.constexpr,
     IS_2D_POSITIONS: tl.constexpr,
     IS_K_MROPE: tl.constexpr,
     CACHE_HAS_ROPE_POS: tl.constexpr,
@@ -548,6 +549,14 @@ def _qsa_prepare_kernel(
                     (lo | (hi << 4)).to(tl.uint8),
                     mask=valid,
                 )
+            elif COMP_E4M3_BYTES:
+                # sm_70 Triton has no fp8e4nv type: encode the e4m3fn byte by
+                # hand and land it in a uint8 view of the cache.
+                tl.store(
+                    row_ptr + dims,
+                    _to_e4m3_byte(yv.to(tl.float32)).to(tl.uint8),
+                    mask=valid,
+                )
             else:
                 tl.store(row_ptr + dims, yv, mask=valid)
 
@@ -703,6 +712,15 @@ def qsa_prepare(
         TILE_T_Q, TILE_H_Q = 2, 2
     else:
         TILE_T_Q, TILE_H_Q = 2, 4
+    # The index cache is read by Triton, which on Volta cannot name fp8e4nv;
+    # an e4m3 cache therefore travels as bytes and is encoded here.
+    comp_e4m3_bytes = (
+        compressed_cache.dtype == torch.float8_e4m3fn
+        and torch.cuda.get_device_capability(compressed_cache.device.index)[0] < 8
+    )
+    compressed_cache_arg = (
+        compressed_cache.view(torch.uint8) if comp_e4m3_bytes else compressed_cache
+    )
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
     num_main_work = num_tokens * (num_main_q_heads + num_main_kv_heads)
@@ -783,7 +801,7 @@ def qsa_prepare(
         logical_positions,
         compressed_slots,
         k_work_metadata,
-        compressed_cache,
+        compressed_cache_arg,
         compressed_cache.stride(0),
         compressed_cache.stride(1),
         num_tokens,
@@ -798,6 +816,7 @@ def qsa_prepare(
         STATE_SIZE=state_cache.shape[1],
         COMP_PAGE_SIZE=compressed_cache.shape[1],
         NVFP4=compressed_cache.dtype == torch.uint8,
+        COMP_E4M3_BYTES=comp_e4m3_bytes,
         IS_2D_POSITIONS=is_2d_positions,
         IS_K_MROPE=is_k_mrope,
         CACHE_HAS_ROPE_POS=cache_has_rope_pos,

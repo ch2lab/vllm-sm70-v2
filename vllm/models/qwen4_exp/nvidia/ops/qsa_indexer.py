@@ -60,6 +60,13 @@ def _is_fp8(dtype: torch.dtype) -> bool:
     return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
+def _fp8_needs_table(cache: torch.Tensor) -> bool:
+    """True when an e4m3 cache must travel as bytes (Volta has no fp8e4nv)."""
+    return cache.dtype == torch.float8_e4m3fn and (
+        torch.cuda.get_device_capability(cache.device.index)[0] < 8
+    )
+
+
 def _fp8_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Byte -> fp16 table for whichever fp8 format the cache holds."""
     key = (device, dtype)
@@ -72,6 +79,26 @@ def _fp8_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         )
         _FP8_LUT[key] = table
     return table
+
+
+@triton.jit
+def _fp8_byte_value(raw, lut_ptr):
+    """e4m3 byte -> fp16 in registers (no table gather).
+
+    Volta's Triton rejects fp8e4nv outright, so an e4m3 index cache is carried
+    as bytes and rebuilt here; e5m2 takes the native cast instead. e4m3 and
+    fp16 differ only by a constant exponent bias (7 vs 15) and a 4-bit shift
+    of the mantissa, so the normal case is two shifts and an or. Subnormals
+    (e == 0) are m * 2^-9 and exact in fp16, so they take one multiply.
+    """
+    b = raw.to(tl.int32)
+    e = (b >> 3) & 0xF
+    m = b & 0x7
+    sign = (b & 0x80) << 8
+    sub = (m.to(tl.float32) * 0.001953125).to(tl.float16)
+    sub_bits = sub.to(tl.uint16, bitcast=True).to(tl.int32)
+    bits = tl.where(e == 0, sub_bits, ((e + 8) << 10) | (m << 7)) | sign
+    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
 
 
 @triton.jit
@@ -125,6 +152,36 @@ def _load_nvfp4_rows(
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
 
+# Per-dtype launch shapes for the Volta decode scan, measured on 16.4k columns
+# with two query rows (min of 30, logits bit-identical to the default config):
+# bf16 59.5 us, fp8 52.8, e4m3 66.8, nvfp4 70.9 -- versus 78/109/73 us for the
+# GB300-tuned default. The kernel is latency-bound, so it wants either many
+# one-warp programs or fewer wide ones depending on how much work each element
+# needs to decode.
+_SM70_DECODE_SCAN = {
+    "bf16": (64, 2, 2, 4),
+    "fp8": (32, 2, 1, 1),
+    "e4m3": (16, 2, 3, 1),
+    "nvfp4": (64, 2, 2, 2),
+}
+
+
+def _sm70_decode_scan_config(
+    cache: torch.Tensor, block_n: int, tpp: int, stages: int, warps: int
+) -> tuple[int, int, int, int]:
+    """Launch shape for the decode scan, or the defaults off Volta."""
+    if not current_platform.is_device_capability(70):
+        return block_n, tpp, stages, warps
+    if cache.dtype == torch.uint8:
+        key = "nvfp4"
+    elif cache.dtype == torch.float8_e4m3fn:
+        key = "e4m3"
+    elif cache.dtype == torch.float8_e5m2:
+        key = "fp8"
+    else:
+        key = "bf16"
+    return _SM70_DECODE_SCAN[key]
+
 # SM70 cuBLAS indexer path (ported from 1Cat-vLLM's production SM70 stack,
 # 2026-10-02). For the exact single-request fp16 shape, gather this
 # request's paged compressed keys once, score with cuBLAS (Volta HMMA) in
@@ -170,6 +227,7 @@ def _qsa_gather_single_request_keys_kernel(
     BLOCK_D: tl.constexpr,
     DEQUANT: tl.constexpr,
     NVFP4: tl.constexpr,
+    FP8_LUT: tl.constexpr,
 ) -> None:
     column = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
@@ -190,6 +248,16 @@ def _qsa_gather_single_request_keys_kernel(
         raw = tl.load(row_base + (HEAD_DIM // 16) + dims // 2, mask=in_row, other=0)
         sbyte = tl.load(row_base + dims // 16, mask=in_row, other=0)
         key = _dequant_nvfp4(raw, sbyte, lut_ptr, dims)
+    elif FP8_LUT:
+        # uint8 view of an e4m3 cache
+        key = _fp8_byte_value(
+            tl.load(
+                row_base + dims * stride_cache_dim,
+                mask=valid & (dims < HEAD_DIM),
+                other=0,
+            ),
+            lut_ptr,
+        )
     else:
         key = tl.load(
             row_base + dims * stride_cache_dim,
@@ -308,7 +376,8 @@ def _qsa_gather_single_request_keys(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     fp8 = _is_fp8(k_cache.dtype)
     nvfp4 = _is_nvfp4_index_cache(k_cache, head_dim)
-    cache = k_cache
+    fp8_lut = _fp8_needs_table(k_cache)
+    cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
     keys = torch.empty(
         (columns, head_dim),
         dtype=torch.float16 if (fp8 or nvfp4) else k_cache.dtype,
@@ -343,6 +412,7 @@ def _qsa_gather_single_request_keys(
             BLOCK_D=triton.next_power_of_2(head_dim),
             DEQUANT=fp8,
             NVFP4=nvfp4,
+            FP8_LUT=fp8_lut,
             num_warps=4,
         )
     return keys, valid
@@ -428,6 +498,7 @@ def _qsa_mqa_paged_uniform_kernel(
     STAGES: tl.constexpr,
     DEQUANT: tl.constexpr,
     NVFP4: tl.constexpr,
+    FP8_LUT: tl.constexpr,
 ) -> None:
     NUM_COLUMNS: tl.constexpr = PAGE_TABLE_WIDTH * PAGE_SIZE
     DECODE_QUERY_LEN_PADDED: tl.constexpr = triton.next_power_of_2(DECODE_QUERY_LEN)
@@ -498,6 +569,17 @@ def _qsa_mqa_paged_uniform_kernel(
                 + page_offset * stride_cache_token
             )
             keys = _load_nvfp4_rows(row0, lut_ptr, page_ok, BLOCK_N, HEAD_DIM)
+        elif FP8_LUT:
+            # uint8 view of an e4m3 cache
+            keys = _fp8_byte_value(
+                tl.load(
+                    row_base + dims[None, :],
+                    mask=in_row,
+                    other=0,
+                    eviction_policy="evict_first",
+                ),
+                lut_ptr,
+            )
         else:
             keys = tl.load(
                 row_base + dims[None, :],
@@ -551,6 +633,7 @@ def _qsa_mqa_paged_prefill_kernel(
     STAGES: tl.constexpr,
     DEQUANT: tl.constexpr,
     NVFP4: tl.constexpr,
+    FP8_LUT: tl.constexpr,
 ) -> None:
     num_columns = page_table_width * PAGE_SIZE
     NUM_HEADS_PADDED: tl.constexpr = triton.next_power_of_2(NUM_HEADS)
@@ -635,6 +718,17 @@ def _qsa_mqa_paged_prefill_kernel(
                 + page_offset * stride_cache_token
             )
             keys = _load_nvfp4_rows(row0, lut_ptr, page_ok, BLOCK_N, HEAD_DIM)
+        elif FP8_LUT:
+            # uint8 view of an e4m3 cache
+            keys = _fp8_byte_value(
+                tl.load(
+                    row_base + dims[None, :],
+                    mask=in_row,
+                    other=0,
+                    eviction_policy="evict_first",
+                ),
+                lut_ptr,
+            )
         else:
             keys = tl.load(
                 row_base + dims[None, :],
@@ -777,8 +871,9 @@ def warmup_qsa_mqa_paged_decode(
     # A uint8 cache is the packed nvfp4 layout; the decode kernel then reads
     # nibbles, so the warmup must compile that branch, not the fp8 cast one.
     nvfp4 = k_cache.dtype == torch.uint8
+    fp8_lut = _fp8_needs_table(k_cache)
     k_cache_ptr = TritonWarmupTensor(
-        torch.uint8 if nvfp4 else k_cache.dtype,
+        torch.uint8 if (nvfp4 or fp8_lut) else k_cache.dtype,
         shape=tuple(k_cache.shape),
     )
     page_table_ptr = TritonWarmupTensor(
@@ -788,6 +883,11 @@ def warmup_qsa_mqa_paged_decode(
     visible_blocks_ptr = TritonWarmupTensor(torch.int32)
     # Dequantisation table dummy: fp16, matching the real e4m3 LUT.
     lut_ptr = TritonWarmupTensor(torch.float16)
+    # Compile exactly the specialisation the decode launcher will pick, or the
+    # first real step pays a JIT stall.
+    block_n, _, stages, warps = _sm70_decode_scan_config(
+        k_cache, _DECODE_BLOCK_N, 0, 2, 1 if fp8 else 2
+    )
 
     for decode_query_len, num_requests in profiles:
         num_rows = decode_query_len * num_requests
@@ -800,6 +900,16 @@ def warmup_qsa_mqa_paged_decode(
             shape=(num_rows, columns),
         )
         tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+        if current_platform.is_device_capability(70):
+            tiles_per_program = _SM70_DECODE_SCAN[
+                "nvfp4"
+                if nvfp4
+                else "e4m3"
+                if k_cache.dtype == torch.float8_e4m3fn
+                else "fp8"
+                if k_cache.dtype == torch.float8_e5m2
+                else "bf16"
+            ][1]
         _qsa_mqa_paged_uniform_kernel.warmup(
             q_ptr,
             k_cache_ptr,
@@ -819,16 +929,16 @@ def warmup_qsa_mqa_paged_decode(
             NUM_HEADS=num_heads,
             HEAD_DIM=head_dim,
             DECODE_QUERY_LEN=decode_query_len,
-            BLOCK_N=_DECODE_BLOCK_N,
+            BLOCK_N=block_n,
             TILES_PER_PROG=tiles_per_program,
-            STAGES=2,
+            STAGES=stages,
             DEQUANT=fp8,
             NVFP4=nvfp4,
-            # tuned on GB300
-            num_warps=1 if fp8 else 2,
+            FP8_LUT=fp8_lut,
+            num_warps=warps,
             grid=(
                 num_requests,
-                triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+                triton.cdiv(columns, block_n * tiles_per_program),
             ),
         )
     return profiles
@@ -861,6 +971,8 @@ def _prefill_logits(
     # tuned on GB300
     fp8 = _is_fp8(k_cache.dtype)
     nvfp4 = _is_nvfp4_index_cache(k_cache, q.shape[2])
+    fp8_lut = _fp8_needs_table(k_cache)
+    cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
     if fp8:
         TILE_R, STAGES, num_warps = 32, 2, 8
     else:
@@ -904,7 +1016,7 @@ def _prefill_logits(
     )
     _qsa_mqa_paged_prefill_kernel[grid](
         q,
-        k_cache,
+        cache,
         page_table,
         query_start_loc,
         visible_blocks,
@@ -931,6 +1043,7 @@ def _prefill_logits(
         STAGES=STAGES,
         DEQUANT=fp8,
         NVFP4=nvfp4,
+        FP8_LUT=fp8_lut,
         num_warps=num_warps,
     )
     return logits
@@ -1055,15 +1168,23 @@ def qsa_select_paged_decode(
     columns = page_table.shape[1] * k_cache.shape[1]
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     tiles_per_program = _decode_tiles_per_program(num_requests, columns)
-    grid = (
-        num_requests,
-        triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
-    )
+    block_n = _DECODE_BLOCK_N
+    stages = 2
+    warps = 0
     fp8 = _is_fp8(k_cache.dtype)
     nvfp4 = _is_nvfp4_index_cache(k_cache, q.shape[2])
+    fp8_lut = _fp8_needs_table(k_cache)
+    cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
+    block_n, tiles_per_program, stages, warps = _sm70_decode_scan_config(
+        k_cache, block_n, tiles_per_program, stages, warps
+    )
+    grid = (
+        num_requests,
+        triton.cdiv(columns, block_n * tiles_per_program),
+    )
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
-        k_cache,
+        cache,
         page_table,
         visible_blocks,
         logits,
@@ -1084,13 +1205,13 @@ def qsa_select_paged_decode(
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         DECODE_QUERY_LEN=decode_query_len,
-        BLOCK_N=_DECODE_BLOCK_N,
+        BLOCK_N=block_n,
         TILES_PER_PROG=tiles_per_program,
-        STAGES=2,
+        STAGES=stages,
         DEQUANT=fp8,
         NVFP4=nvfp4,
-        # tuned on GB300
-        num_warps=1 if fp8 else 2,
+        FP8_LUT=fp8_lut,
+        num_warps=warps or (1 if fp8 else 2),
     )
     _topk(
         logits,
