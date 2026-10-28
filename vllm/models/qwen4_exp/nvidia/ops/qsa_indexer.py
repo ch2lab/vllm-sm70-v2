@@ -24,22 +24,28 @@ logger = init_logger(__name__)
 # table lookup before any arithmetic. That keeps e4m3's precision instead of
 # falling back to e5m2's two mantissa bits.
 _FP8_LUT: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
-_NVFP4_LUT: dict[torch.device, torch.Tensor] = {}
+_NVFP4_PAIR_LUT: dict[torch.device, torch.Tensor] = {}
 _E2M1_LEVELS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
-def _nvfp4_lut(device: torch.device) -> torch.Tensor:
-    """[E2M1 codes 0:16 | e4m3 scale bytes 16:272] as fp16."""
-    table = _NVFP4_LUT.get(device)
+def _nvfp4_pair_lut(device: torch.device) -> torch.Tensor:
+    """[code << 8 | e4m3 scale byte] -> value * scale as fp16 (4096 entries).
+
+    One L1-resident table (8 KiB) replaces the per-element exponent maths:
+    E2M1 has 16 levels and the block scale is an e4m3 byte, so every product
+    the dequant can produce is already in here.
+    """
+    table = _NVFP4_PAIR_LUT.get(device)
     if table is None:
-        table = torch.cat([
-            torch.tensor(_E2M1_LEVELS, device=device),
+        levels = torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float32)
+        scales = (
             torch.arange(256, dtype=torch.uint8, device=device)
             .view(torch.float8_e4m3fn)
-            .to(torch.float32),
-        ]).to(torch.float16)
-        _NVFP4_LUT[device] = table
+            .to(torch.float32)
+        )
+        table = (levels[:, None] * scales[None, :]).reshape(-1).to(torch.float16)
+        _NVFP4_PAIR_LUT[device] = table
     return table
 
 
@@ -69,31 +75,51 @@ def _fp8_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 
 
 @triton.jit
-def _dequant_bytes(raw, lut_ptr):
-    return tl.load(lut_ptr + raw.to(tl.int32))
+def _dequant_nvfp4(raw, sbyte, pair_ptr, half):
+    """NVFP4 nibble -> fp16 through the (code, e4m3 scale) product table."""
+    code = (raw.to(tl.int32) >> (4 * (half % 2))) & 0xF
+    return tl.load(pair_ptr + ((code << 8) | sbyte.to(tl.int32)))
 
 
 @triton.jit
-def _dequant_nvfp4(raw, sbyte, lut_ptr, half):
-    """NVFP4 nibble -> fp16: E2M1 table at [0:16], e4m3 scale at [16:272]."""
-    code = (raw.to(tl.int32) >> (4 * (half % 2))) & 0xF
-    sign = (code >> 3) & 1
-    exp = (code >> 1) & 3
-    mant = code & 1
-    mag = tl.where(
-        exp == 0,
-        mant.to(tl.float32) * 0.5,
-        (1.0 + mant.to(tl.float32) * 0.5) * tl.exp2((exp - 1).to(tl.float32)),
+def _load_nvfp4_rows(
+    row0, pair_ptr, row_ok, BLOCK_R: tl.constexpr, HEAD_DIM: tl.constexpr
+):
+    """Read BLOCK_R packed rows as vectors and expand them in registers.
+
+    One row is 8 block scales + 64 nibble-packed bytes.  Loading the row
+    element-by-element issues three gathers per value (byte, broadcast scale,
+    table); loading the two vectors and spreading them over the 128 lanes
+    issues 72 loads per row instead, which is what the row count scales on.
+    """
+    n8: tl.constexpr = HEAD_DIM // 16
+    n64: tl.constexpr = HEAD_DIM // 2
+    d64 = tl.arange(0, n64)
+    d8 = tl.arange(0, n8)
+    raw = tl.load(
+        row0[:, None] + n8 + d64[None, :],
+        mask=row_ok[:, None],
+        other=0,
+        eviction_policy="evict_first",
     )
-    value = tl.where(sign != 0, -mag, mag)
-    se = (sbyte.to(tl.int32) >> 3) & 0xF
-    sm = sbyte.to(tl.int32) & 7
-    scale = tl.where(
-        se == 0,
-        sm.to(tl.float32) * 0.001953125,
-        (1.0 + sm.to(tl.float32) * 0.125) * tl.exp2((se - 7).to(tl.float32)),
+    sb = tl.load(
+        row0[:, None] + d8[None, :],
+        mask=row_ok[:, None],
+        other=0,
+        eviction_policy="evict_first",
     )
-    return (value * scale).to(tl.float16)
+    # byte j carries the scale of dims [16*(j//8), 16*(j//8)+16)
+    sb64 = tl.reshape(
+        tl.broadcast_to(
+            tl.reshape(sb, (BLOCK_R, n8, 1)),
+            (BLOCK_R, n8, HEAD_DIM // (2 * n8)),
+        ),
+        (BLOCK_R, n64),
+    )
+    idx = sb64.to(tl.int32)
+    lo = tl.load(pair_ptr + (((raw.to(tl.int32) & 0xF) << 8) | idx))
+    hi = tl.load(pair_ptr + ((((raw.to(tl.int32) >> 4) & 0xF) << 8) | idx))
+    return tl.reshape(tl.join(lo, hi), (BLOCK_R, HEAD_DIM))
 
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -296,7 +322,7 @@ def _qsa_gather_single_request_keys(
             keys,
             valid,
             (
-                _nvfp4_lut(k_cache.device)
+                _nvfp4_pair_lut(k_cache.device)
                 if nvfp4
                 else _fp8_lut(k_cache.device, k_cache.dtype)
                 if fp8
@@ -466,19 +492,12 @@ def _qsa_mqa_paged_uniform_kernel(
             + page_offset[:, None] * stride_cache_token
         )
         if NVFP4:
-            raw = tl.load(
-                row_base + (HEAD_DIM // 16) + dims[None, :] // 2,
-                mask=in_row,
-                other=0,
-                eviction_policy="evict_first",
+            row0 = (
+                k_cache_ptr
+                + safe_page.to(tl.int64) * stride_cache_block
+                + page_offset * stride_cache_token
             )
-            sbyte = tl.load(
-                row_base + dims[None, :] // 16,
-                mask=in_row,
-                other=0,
-                eviction_policy="evict_first",
-            )
-            keys = _dequant_nvfp4(raw, sbyte, lut_ptr, dims[None, :])
+            keys = _load_nvfp4_rows(row0, lut_ptr, page_ok, BLOCK_N, HEAD_DIM)
         else:
             keys = tl.load(
                 row_base + dims[None, :],
@@ -610,19 +629,12 @@ def _qsa_mqa_paged_prefill_kernel(
             + page_offset[:, None] * stride_cache_token
         )
         if NVFP4:
-            raw = tl.load(
-                row_base + (HEAD_DIM // 16) + dims[None, :] // 2,
-                mask=in_row,
-                other=0,
-                eviction_policy="evict_first",
+            row0 = (
+                k_cache_ptr
+                + safe_page.to(tl.int64) * stride_cache_block
+                + page_offset * stride_cache_token
             )
-            sbyte = tl.load(
-                row_base + dims[None, :] // 16,
-                mask=in_row,
-                other=0,
-                eviction_policy="evict_first",
-            )
-            keys = _dequant_nvfp4(raw, sbyte, lut_ptr, dims[None, :])
+            keys = _load_nvfp4_rows(row0, lut_ptr, page_ok, BLOCK_N, HEAD_DIM)
         else:
             keys = tl.load(
                 row_base + dims[None, :],
@@ -897,7 +909,11 @@ def _prefill_logits(
         query_start_loc,
         visible_blocks,
         logits,
-        _fp8_lut(k_cache.device, k_cache.dtype) if fp8 else logits,
+        _nvfp4_pair_lut(k_cache.device)
+        if nvfp4
+        else _fp8_lut(k_cache.device, k_cache.dtype)
+        if fp8
+        else logits,
         *q.stride()[:-1],
         *k_cache.stride()[:2],
         *page_table.stride()[:-1],
@@ -1052,7 +1068,7 @@ def qsa_select_paged_decode(
         visible_blocks,
         logits,
         (
-            _nvfp4_lut(k_cache.device)
+            _nvfp4_pair_lut(k_cache.device)
             if nvfp4
             else _fp8_lut(k_cache.device, k_cache.dtype)
             if fp8
