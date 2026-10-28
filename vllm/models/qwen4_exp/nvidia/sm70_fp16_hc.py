@@ -38,6 +38,9 @@ _HC_COUNT = 4
 _HC_UP_STREAM4 = os.environ.get("VLLM_SM70_HC_UP_STREAM4", "0") == "1"
 _HC_UP_STREAM4_WARPS = int(os.environ.get("VLLM_SM70_HC_UP_STREAM4_WARPS", "8"))
 _HC_DIM = 2560
+# Columns per program for the up-projection; 1 keeps the one-column kernel.
+# 8 makes each lane hold eight consecutive fp16 weights so the read coalesces.
+_HC_UP_WIDE = int(os.environ.get("VLLM_SM70_HC_UP_WIDE", "8"))
 _HC_RANK = 320
 _HC_HIDDEN = _HC_COUNT * _HC_DIM
 
@@ -613,6 +616,73 @@ def _qwen38_hc_up_gate_kernel(
         tl.store(out_ptr + 2 * DIM + column, (acc2 / COUNT).to(tl.float16))
 
 
+@triton.jit
+def _qwen38_hc_up_gate_wide_kernel(
+    lora_ptr,
+    up_ptr,
+    x_ptr,
+    out_ptr,
+    ROWS: tl.constexpr,
+    RANK: tl.constexpr,
+    DIM: tl.constexpr,
+    COUNT: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Same maths as _qwen38_hc_up_gate_kernel, BLOCK_C columns per program.
+
+    One column per program left each lane holding two or three weight scalars,
+    so the 6.5 MB of weights per call streamed at 42% of peak. Consecutive
+    columns are contiguous blocks of RANK, so a BLOCK_C-wide tile is one
+    coalesced run and `lora` is loaded once for all of them.
+    """
+    pid = tl.program_id(0)
+    cols = pid * BLOCK_C + tl.arange(0, BLOCK_C)
+    cmask = cols < DIM
+    r = tl.arange(0, BLOCK_R)
+    rmask = r < RANK
+    lora0 = tl.load(lora_ptr + r, mask=rmask, other=0.0).to(tl.float32)
+    if ROWS == 1:
+        lora1 = lora0
+        lora2 = lora0
+    else:
+        lora1 = tl.load(lora_ptr + RANK + r, mask=rmask, other=0.0).to(tl.float32)
+        if ROWS > 2:
+            lora2 = tl.load(lora_ptr + 2 * RANK + r, mask=rmask, other=0.0).to(
+                tl.float32
+            )
+        else:
+            lora2 = lora0
+    acc0 = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    for stream in tl.static_range(COUNT):
+        w = tl.load(
+            up_ptr + (stream * DIM + cols[:, None]) * RANK + r[None, :],
+            mask=cmask[:, None] & rmask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        gate0 = tl.sum(lora0[None, :] * w, axis=1).to(tl.float16).to(tl.float32)
+        acc0 += tl.sigmoid(gate0) * tl.load(
+            x_ptr + stream * DIM + cols, mask=cmask, other=0.0
+        ).to(tl.float32)
+        if ROWS > 1:
+            gate1 = tl.sum(lora1[None, :] * w, axis=1).to(tl.float16).to(tl.float32)
+            acc1 += tl.sigmoid(gate1) * tl.load(
+                x_ptr + (COUNT + stream) * DIM + cols, mask=cmask, other=0.0
+            ).to(tl.float32)
+        if ROWS > 2:
+            gate2 = tl.sum(lora2[None, :] * w, axis=1).to(tl.float16).to(tl.float32)
+            acc2 += tl.sigmoid(gate2) * tl.load(
+                x_ptr + (2 * COUNT + stream) * DIM + cols, mask=cmask, other=0.0
+            ).to(tl.float32)
+    tl.store(out_ptr + cols, (acc0 / COUNT).to(tl.float16), mask=cmask)
+    if ROWS > 1:
+        tl.store(out_ptr + DIM + cols, (acc1 / COUNT).to(tl.float16), mask=cmask)
+    if ROWS > 2:
+        tl.store(out_ptr + 2 * DIM + cols, (acc2 / COUNT).to(tl.float16), mask=cmask)
+
+
 def _qwen38_sm70_fp16_hc_up_gate(
     x: torch.Tensor,
     up_weight: torch.Tensor,
@@ -620,6 +690,21 @@ def _qwen38_sm70_fp16_hc_up_gate(
 ) -> torch.Tensor:
     rows = int(x.shape[0])
     out = x.new_empty((rows, _HC_DIM))
+    if _HC_UP_WIDE > 1:
+        _qwen38_hc_up_gate_wide_kernel[(triton.cdiv(_HC_DIM, _HC_UP_WIDE),)](
+            lora,
+            up_weight,
+            x,
+            out,
+            ROWS=rows,
+            RANK=_HC_RANK,
+            DIM=_HC_DIM,
+            COUNT=_HC_COUNT,
+            BLOCK_R=512,
+            BLOCK_C=_HC_UP_WIDE,
+            num_warps=4,
+        )
+        return out
     _qwen38_hc_up_gate_kernel[(_HC_DIM,)](
         lora,
         up_weight,
