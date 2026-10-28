@@ -168,10 +168,10 @@ def _qsa_gather_single_request_keys_kernel(
         key = tl.load(
             row_base + dims * stride_cache_dim,
             mask=valid & (dims < HEAD_DIM),
-            other=0,
+            other=0.0,
         )
         if DEQUANT:
-            key = _dequant_bytes(key, lut_ptr)
+            key = key.to(tl.float16)
     tl.store(
         keys_ptr + column * stride_keys_row + dims,
         key,
@@ -282,7 +282,7 @@ def _qsa_gather_single_request_keys(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     fp8 = _is_fp8(k_cache.dtype)
     nvfp4 = _is_nvfp4_index_cache(k_cache, head_dim)
-    cache = k_cache.view(torch.uint8) if fp8 else k_cache
+    cache = k_cache
     keys = torch.empty(
         (columns, head_dim),
         dtype=torch.float16 if (fp8 or nvfp4) else k_cache.dtype,
@@ -483,11 +483,11 @@ def _qsa_mqa_paged_uniform_kernel(
             keys = tl.load(
                 row_base + dims[None, :],
                 mask=in_row,
-                other=0,
+                other=0.0,
                 eviction_policy="evict_first",
             )
             if DEQUANT:
-                keys = _dequant_bytes(keys, lut_ptr)
+                keys = keys.to(tl.float16)
         scores = tl.dot(keys, query, out_dtype=tl.float32)
         scores = tl.where(valid_query[None, :], tl.maximum(scores, 0.0), 0.0)
         scores = tl.reshape(
@@ -627,11 +627,11 @@ def _qsa_mqa_paged_prefill_kernel(
             keys = tl.load(
                 row_base + dims[None, :],
                 mask=in_row,
-                other=0,
+                other=0.0,
                 eviction_policy="evict_first",
             )
             if DEQUANT:
-                keys = _dequant_bytes(keys, lut_ptr)
+                keys = keys.to(tl.float16)
         # With an fp8 cache, SM90 lowers this dot to reduced-precision wgmma
         # accumulation; SM100 tcgen05 accumulates in fp32. The SM90 error
         # (~1e-4 relative) is far below the e4m3 quantization noise floor.
@@ -766,7 +766,7 @@ def warmup_qsa_mqa_paged_decode(
     # nibbles, so the warmup must compile that branch, not the fp8 cast one.
     nvfp4 = k_cache.dtype == torch.uint8
     k_cache_ptr = TritonWarmupTensor(
-        torch.uint8 if (fp8 or nvfp4) else k_cache.dtype,
+        torch.uint8 if nvfp4 else k_cache.dtype,
         shape=tuple(k_cache.shape),
     )
     page_table_ptr = TritonWarmupTensor(
@@ -892,7 +892,7 @@ def _prefill_logits(
     )
     _qsa_mqa_paged_prefill_kernel[grid](
         q,
-        k_cache.view(torch.uint8) if fp8 else k_cache,
+        k_cache,
         page_table,
         query_start_loc,
         visible_blocks,
@@ -1047,7 +1047,7 @@ def qsa_select_paged_decode(
     nvfp4 = _is_nvfp4_index_cache(k_cache, q.shape[2])
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
-        k_cache.view(torch.uint8) if fp8 else k_cache,
+        k_cache,
         page_table,
         visible_blocks,
         logits,
