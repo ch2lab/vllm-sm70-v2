@@ -124,6 +124,20 @@ def _to_e4m3_byte(y):
 
 
 @triton.jit
+def _e4m3_value(byte):
+    """e4m3 byte -> f32 (arithmetic inverse of _to_e4m3_byte, no table)."""
+    e = (byte.to(tl.int32) >> 3) & 0xF
+    m = byte.to(tl.int32) & 7
+    mag = tl.where(
+        e == 0,
+        m.to(tl.float32) * 0.001953125,
+        (1.0 + m.to(tl.float32) * 0.125) * tl.exp2((e - 7).to(tl.float32)),
+    )
+    neg = (byte.to(tl.int32) & 0x80) != 0
+    return tl.where(neg, -mag, mag)
+
+
+@triton.jit
 def _to_dst_dtype(x, dst, scale, E4M3_BYTES: tl.constexpr):
     """Round to BF16 like the unfused path, then scale for an FP8 destination."""
     out_ty = dst.dtype.element_ty
@@ -195,6 +209,7 @@ def _qsa_prepare_kernel(
     COMPRESS_RATIO: tl.constexpr,
     STATE_SIZE: tl.constexpr,
     COMP_PAGE_SIZE: tl.constexpr,
+    NVFP4: tl.constexpr,
     IS_2D_POSITIONS: tl.constexpr,
     IS_K_MROPE: tl.constexpr,
     CACHE_HAS_ROPE_POS: tl.constexpr,
@@ -502,14 +517,39 @@ def _qsa_prepare_kernel(
             )
             compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
             compressed_row = compressed_slot % COMP_PAGE_SIZE
-            tl.store(
+            row_ptr = (
                 compressed_cache_ptr
                 + compressed_block * compressed_cache_stride_block
                 + compressed_row * compressed_cache_stride_token
-                + dims,
-                tl.reshape(y, (D,)),
-                mask=valid,
             )
+            yv = tl.reshape(y, (D,))
+            if NVFP4:
+                # NVFP4 row: D/16 e4m3 scale bytes, then D/2 packed nibbles.
+                g = tl.reshape(yv, (D // 16, 16))
+                sf = tl.maximum(tl.max(tl.abs(g), axis=1) / 6.0, 0.001953125)
+                sb = _to_e4m3_byte(sf)
+                sc = _e4m3_value(sb)
+                a = tl.abs(g) / sc[:, None]
+                code = tl.where(a < 0.25, 0,
+                       tl.where(a < 0.75, 1,
+                       tl.where(a < 1.25, 2,
+                       tl.where(a < 1.75, 3,
+                       tl.where(a < 2.5, 4,
+                       tl.where(a < 3.5, 5,
+                       tl.where(a < 5.0, 6, 7)))))))
+                nib = tl.where(g < 0, code + 8, code).to(tl.int32)
+                pair = tl.reshape(tl.reshape(nib, (D,)), (D // 2, 2))
+                lane = tl.arange(0, 2)
+                lo = tl.sum(tl.where(lane[None, :] == 0, pair, 0), axis=1)
+                hi = tl.sum(tl.where(lane[None, :] == 1, pair, 0), axis=1)
+                tl.store(row_ptr + tl.arange(0, D // 16), sb, mask=valid)
+                tl.store(
+                    row_ptr + D // 16 + tl.arange(0, D // 2),
+                    (lo | (hi << 4)).to(tl.uint8),
+                    mask=valid,
+                )
+            else:
+                tl.store(row_ptr + dims, yv, mask=valid)
 
         if work_in_request == 0:
             # This CTA may have just read historical rows from the circular buffer.
@@ -757,6 +797,7 @@ def qsa_prepare(
         COMPRESS_RATIO=compress_ratio,
         STATE_SIZE=state_cache.shape[1],
         COMP_PAGE_SIZE=compressed_cache.shape[1],
+        NVFP4=compressed_cache.dtype == torch.uint8,
         IS_2D_POSITIONS=is_2d_positions,
         IS_K_MROPE=is_k_mrope,
         CACHE_HAS_ROPE_POS=cache_has_rope_pos,

@@ -64,6 +64,8 @@ import os
 
 import torch
 
+from .qsa_indexer import _is_nvfp4_index_cache, _nvfp4_lut
+
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 if HAS_TRITON:
@@ -87,6 +89,7 @@ if HAS_TRITON:
         page_table_ptr,
         visible_blocks_ptr,
         logits_ptr,
+        lut_ptr,
         block_indices_ptr,
         output_ptr,
         query_positions_ptr,
@@ -103,6 +106,7 @@ if HAS_TRITON:
         PAGE_TABLE_WIDTH: tl.constexpr,
         NUM_HEADS: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        NVFP4: tl.constexpr,
         BLOCK_TOPK: tl.constexpr,
         COMPRESS_RATIO: tl.constexpr,
         OUTPUT_WIDTH: tl.constexpr,
@@ -155,15 +159,37 @@ if HAS_TRITON:
                 mask=live,
                 other=0,
             )
-            keys = tl.load(
+            in_row = live[:, None] & (dims[None, :] < HEAD_DIM)
+            row_base = (
                 k_cache_ptr
                 + physical_page[:, None].to(tl.int64) * stride_cache_block
                 + page_offset[:, None] * stride_cache_token
-                + dims[None, :],
-                mask=live[:, None] & (dims[None, :] < HEAD_DIM),
-                other=0.0,
-                eviction_policy="evict_first",
             )
+            if NVFP4:
+                # 72-byte row: D/16 e4m3 scales then D/2 packed nibbles.
+                raw = tl.load(
+                    row_base + (HEAD_DIM // 16) + dims[None, :] // 2,
+                    mask=in_row,
+                    other=0,
+                    eviction_policy="evict_first",
+                )
+                sbyte = tl.load(
+                    row_base + dims[None, :] // 16,
+                    mask=in_row,
+                    other=0,
+                    eviction_policy="evict_first",
+                )
+                code = (raw.to(tl.int32) >> (4 * (dims[None, :] % 2))) & 0xF
+                value = tl.load(lut_ptr + code).to(tl.float32)
+                scale = tl.load(lut_ptr + 16 + sbyte.to(tl.int32)).to(tl.float32)
+                keys = (value * scale).to(tl.float16)
+            else:
+                keys = tl.load(
+                    row_base + dims[None, :],
+                    mask=in_row,
+                    other=0.0,
+                    eviction_policy="evict_first",
+                )
             scores = tl.dot(keys, query, out_dtype=tl.float32)
             scores = tl.where(head_valid[None, :], tl.maximum(scores, 0.0), 0.0)
             score = tl.sum(scores, axis=1)
@@ -390,8 +416,15 @@ def qsa_select_fused_decode(
     )
     assert q.ndim == 3 and q.shape[0] > 0
     assert decode_query_len > 0 and q.shape[0] % decode_query_len == 0
-    assert q.dtype == k_cache.dtype, "Q and the compressed K cache must match"
-    assert k_cache.ndim == 4 and k_cache.shape[3] == q.shape[2]
+    nvfp4 = _is_nvfp4_index_cache(k_cache, q.shape[2])
+    assert q.dtype == k_cache.dtype or nvfp4, (
+        "Q and the compressed K cache must match"
+    )
+    if nvfp4:
+        q = q.to(torch.float16)
+    assert k_cache.ndim == 4 and (
+        k_cache.shape[3] == q.shape[2] or nvfp4
+    )
     assert page_table.ndim == 2
     assert visible_blocks.shape == (q.shape[0],)
     assert query_positions.shape == (q.shape[0],)
@@ -417,6 +450,7 @@ def qsa_select_fused_decode(
         page_table,
         visible_blocks,
         logits,
+        _nvfp4_lut(k_cache.device) if nvfp4 else logits,
         block_indices,
         out,
         query_positions,
@@ -431,6 +465,7 @@ def qsa_select_fused_decode(
         PAGE_TABLE_WIDTH=page_table.shape[1],
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
+        NVFP4=nvfp4,
         BLOCK_TOPK=block_topk,
         COMPRESS_RATIO=compress_ratio,
         OUTPUT_WIDTH=output_width,

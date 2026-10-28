@@ -168,6 +168,10 @@ class QSAIndexer(nn.Module):
                 indexer_dtype,
                 "sm70 Triton has no e4m3" if sm70 else "e4m3",
             )
+        elif self.indexer_kv_dtype == "nvfp4":
+            # Packed 4-bit E2M1 with one e4m3 scale byte per 16 dims. The cache
+            # is a uint8 buffer of 72 bytes per row (8 scales + 64 packed).
+            indexer_dtype = torch.uint8
         elif self.indexer_kv_dtype == "bf16":
             indexer_dtype = torch.bfloat16
         else:
@@ -185,8 +189,14 @@ class QSAIndexer(nn.Module):
             compress_ratio=self.compress_ratio,
             vllm_config=vllm_config,
         )
+        nvfp4_cache = self.indexer_kv_dtype == "nvfp4"
+        compressed_head_size = (
+            self.index_head_dim // 2 + self.index_head_dim // 16
+            if nvfp4_cache
+            else self.index_head_dim
+        )
         self.compressed_key_cache = QSACompressedKeyCache(
-            head_size=self.index_head_dim,
+            head_size=compressed_head_size,
             dtype=indexer_dtype,
             compress_ratio=self.compress_ratio,
             prefix=f"{cache_prefix}compressed_key_cache",
@@ -316,7 +326,11 @@ class QSAIndexer(nn.Module):
                 num_tokens,
                 self.index_n_heads,
                 self.index_head_dim,
-                dtype=self.indexer_dtype,
+                dtype=(
+                    torch.float16
+                    if self.indexer_kv_dtype in ("fp8", "nvfp4")
+                    else self.indexer_dtype
+                ),
             )
             # nvfp4: the pool is cell-interleaved (288 B per token,
             # [K data 128 | K scale 16 | V data 128 | V scale 16]), not
@@ -384,7 +398,9 @@ class QSAIndexer(nn.Module):
             # A quantised index cache is dequantised at the point of use
             # (Triton on SM70 cannot take e4m3 at all), so keep q at fp16.
             q = q.to(
-                torch.float16 if self.indexer_kv_dtype == "fp8" else self.indexer_dtype
+                torch.float16
+                if self.indexer_kv_dtype in ("fp8", "nvfp4")
+                else self.indexer_dtype
             )
 
             raw_key_cache = raw_key_state_cache.key_cache
