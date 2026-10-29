@@ -37,25 +37,19 @@ _page4_workspaces: dict[tuple[int, int], tuple[object, ...]] = {}
 # the arm goes live only after the M2 in-service A/B gate (progress.md
 # 10-15 晚(11): WIN >= 4800 / DEAD < 4600 tok/s 65K).
 #
-# Env name deliberately has NO VLLM_ prefix: empirically (10-15 M2 run)
-# worker processes in this stack only observed the unprefixed name
-# (SM70_QSA_FMA via the sm70-serve systemd drop-in); the VLLM_-prefixed
-# variant set in the serve script never reached the workers.
+# Env name has no VLLM_ prefix; it is exported by the serve script.
+# 2026-10-28: the /tmp file valves were retired. The premise they were built
+# on ("workers in this stack do not observe env set at the service level") is
+# false on the current stack: sm70_env_audit shows the worker's os.environ
+# carries the full serve-script set (see sm70/20_request_lifecycle.md §14).
 _FLASHV100_TP8_ENABLE_ENV = "SM70_PAGE4_TP8"
-# File valve (same class as VLLM_SM70_AR_HIER_FILE): the workers in this
-# stack do not observe env set at the API-server/service level, so the
-# in-service A/B flips the route by writing a file — no restart.
-_FLASHV100_TP8_MODE_FILE = "/tmp/page4_tp8_mode"
+_PAGE4_BACKEND_ENV = "SM70_QSA_PAGE4_BACKEND"
 _flashv100_tp8_mod = None
 _flashv100_tp8_attempted = False
 _page4_tp8_workspaces: dict[tuple[int, int], tuple[object, ...]] = {}
 
-# P0 localization (10-16): in-tree stable-ABI QSA page4 backend. Worker
-# valve file (same class as _FLASHV100_TP8_MODE_FILE — workers in this
-# stack do not see VLLM_-prefixed env): content "local" routes the
-# page4/XQA call sites to the torch.ops._C ops built into the vllm
-# stable module; missing ops log a warning and keep the .so route.
-_QSA_PAGE4_LOCAL_MODE_FILE = "/tmp/qsa_page4_backend"
+# P0 localization (10-16): in-tree stable-ABI QSA page4 backend, selected by
+# SM70_QSA_PAGE4_BACKEND=local (env, exported by the serve script).
 _qsa_page4_local_checked = False
 _qsa_page4_local_mod = None
 
@@ -75,12 +69,7 @@ def _qsa_page4_local_ops():
     if _qsa_page4_local_checked:
         return _qsa_page4_local_mod
     _qsa_page4_local_checked = True
-    try:
-        with open(_QSA_PAGE4_LOCAL_MODE_FILE) as f:
-            mode = f.read().strip()
-    except OSError:
-        return None
-    if mode != "local":
+    if os.getenv(_PAGE4_BACKEND_ENV, "").strip() != "local":
         return None
     if not hasattr(torch.ops._C, "grouped_sparse_page4_plan_fwd"):
         logger.warning(
@@ -94,10 +83,8 @@ def _qsa_page4_local_ops():
 
 
 def _qsa_page4_tp8_enabled() -> bool:
-    """Env first, then the file valve (hot A/B switch, no restart)."""
-    if os.getenv(_FLASHV100_TP8_ENABLE_ENV, "0") == "1":
-        return True
-    return os.path.exists(_FLASHV100_TP8_MODE_FILE)
+    """Serve-script env only (the /tmp file valve was retired 2026-10-28)."""
+    return os.getenv(_FLASHV100_TP8_ENABLE_ENV, "0") == "1"
 
 
 @lru_cache(maxsize=1)
@@ -764,10 +751,10 @@ def _flashv100_module():
     _flashv100_mod = _qsa_page4_local_ops()
     if _flashv100_mod is None:
         logger.error(
-            "QSA page4 DISABLED: in-tree stable-ABI ops missing (write "
-            "'local' to %s and check `import vllm._custom_ops`); there is no "
+            "QSA page4 DISABLED: in-tree stable-ABI ops missing (set "
+            "%s=local and check `import vllm._custom_ops`); there is no "
             ".so fallback by policy - do not trust page4 numbers",
-            _QSA_PAGE4_LOCAL_MODE_FILE,
+            _PAGE4_BACKEND_ENV,
         )
     return _flashv100_mod
 
@@ -1159,10 +1146,10 @@ def _flashv100_tp8_module():
     _flashv100_tp8_mod = _qsa_page4_local_ops()
     if _flashv100_tp8_mod is None:
         logger.error(
-            "QSA page4 TP8 DISABLED: in-tree stable-ABI ops missing (write "
-            "'local' to %s and check `import vllm._custom_ops`); there is no "
+            "QSA page4 TP8 DISABLED: in-tree stable-ABI ops missing (set "
+            "%s=local and check `import vllm._custom_ops`); there is no "
             ".so fallback by policy - do not trust page4 numbers",
-            _QSA_PAGE4_LOCAL_MODE_FILE,
+            _PAGE4_BACKEND_ENV,
         )
     return _flashv100_tp8_mod
 
@@ -2448,7 +2435,7 @@ def qsa_sparse_paged_attention(
         # raw pool bytes to the split-K kernel.
         raise NotImplementedError(
             "QSA nvfp4 KV needs the page4-TP8 route "
-            "(SM70_PAGE4_TP8=1 or /tmp/page4_tp8_mode)"
+            "(SM70_PAGE4_TP8=1)"
         )
 
     if (
@@ -2461,7 +2448,7 @@ def qsa_sparse_paged_attention(
         # deep in Triton with a CompilationError.
         raise NotImplementedError(
             "QSA fp8-e4m3 KV on sm_70 needs the page4-TP8 route "
-            "(SM70_PAGE4_TP8=1 or /tmp/page4_tp8_mode); the Triton arm "
+            "(SM70_PAGE4_TP8=1); the Triton arm "
             "cannot compile fp8e4nv on this architecture"
         )
 
