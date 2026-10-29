@@ -179,7 +179,15 @@ Policy v2 (2026-10-19, user-directed: 解除全部限制, 持续迭代优化):
      **旧锚已作废**(勿再引用): `5875–5923 / 60.9 / ≈295`(旧模型) 与 `6055–6066 / 66.0–66.9 / 312–317`(旧 wire 时代) —
      权威出处 `sm70/19_two_layer_ar_protocol.md` §8/§10。
      只有两种情况需要恢复基线并过 canary: ①要做"干净基线对照"的一次测量 ②要交给人/对外服务。
-     注意: 服务端配置改动(如 chunk/EP/HC_TP)会让 ipc 缓存键不匹配 ⇒ loader 会**自动回落磁盘加载**(已实测) ⇒ 不必重建 daemon。
+     注意: **ipc 权重指纹**(`WeightCacheKey`, `weight_cache/protocol.py:306`)只含
+     `checkpoint/model_arch/tp_size/tp_rank/dtype/quantization/quant_config_hash/rope_parameters_hash/
+     revision/vllm_version/pp/dp/is_draft/ple_quant_dir`。
+     ⇒ **服务侧开关不需要动 daemon**: `num_speculative_tokens`(MTP k)、`--kv-cache-dtype`、`indexer_kv_dtype`、
+     `max-num-seqs`/`max-num-batched-tokens`/chunk、各 `VLLM_SM70_*` 阀、per-layer skip list(KV dtype 与 skip list
+     于 2026-10-22 被**明确剔除**，见 protocol.py:321 注释)。只重启 serve 即可(~1.5 min)。
+     ⇒ **权重侧改动必须重建 daemon**: 模型路径/revision、dtype、quantization/quant_config、TP/PP/DP size、PLE sidecar 路径。
+     ⚠️ 若权重侧改动后不重建 daemon, **不会**"静默回落磁盘成功": `_fallback_load` 未清 `static_forward_context`
+     ⇒ 二次构建模型撞 `Duplicate layer name` 崩溃(补丁 `/tmp/opencode/fix_ipc_fallback.py` 未合入)。
   ⑩ **纪律: 脚本一律后台跑, 定时短命令查** (用户指令 2026-10-25, 违反过两次):
      长任务必须 `setsid nohup <script> ><log> 2>&1 &` **脱离会话**启动 —— 前台长跑时工具调用一旦被中断,
      整个进程组被带走(实测两次把 TP4 双实例杀成全卡 0 MiB)。等待用 goal_wait, 不要在同一命令里 `sleep` 长等。
