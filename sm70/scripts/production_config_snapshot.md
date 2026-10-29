@@ -52,7 +52,7 @@ VLLM_SM70_QWEN38_FP16_GEMV=1
 VLLM_SM70_QWEN38_FUSED_HC_UP_GATE=1 / FUSED_HC_DOWN_SILU=1
 VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16=0   # =1 会 boot 失败（z.shape != x_shape_og）
 VLLM_SM70_STEP_SPLIT=1                # 写 /tmp/sm70_step_split_<pid>.jsonl 的 target/draft 毫秒
-VLLM_SM70_QSA_SCORE_DIAG=1            # 一次性打印 indexer 打分的 rows/columns/字节
+VLLM_SM70_QSA_SCORE_DIAG=1            # 一次性打印 indexer 打分（prefill）与 decode scan 的真实几何
 VLLM_SM70_TRITON_TOPK=1
 VLLM_SM70_ALLOW_DUP_LAYER=1
 ```
@@ -65,6 +65,7 @@ VLLM_SM70_ALLOW_DUP_LAYER=1
 |---|---|---|
 | prefill busy（65K，8 chunk） | **6.707 s** | `sm70_tests/profile_prefill.py` + 按 98 次 qpn2 分段 |
 | decode1（65K） | **~110** | `qsa_conc_tput.py --mode decode --len 65536 --conc 1 --salt-seed 9503 --rounds 6` |
+| conc16（65K） | **723.5 agg**（n=6） | 同上 `--conc 16` |
 | conc40（65K） | **1107–1115 agg** | 同上 `--conc 40` |
 | canary | **9/9** | `sm70_tests/correctness.py` |
 | 新 Xid | **0** | `journalctl -k --since today \| grep -c "NVRM: Xid"` |
@@ -88,3 +89,14 @@ aeec96dd03 perf(gdn): compute the K3 decay matrix once per (chunk, v-head)
 - `VLLM_SM70_QSA_VERIFY_PAGE_BUDGET` > 0 → planner 快 19% 但 attention 慢 4.1×（散页破坏 locality），prefill +6.1%
 - `AR_IMPL=hier` → 23.6 µs/次（flat 13.79）
 - 任何 capture 表未覆盖的 M → 整批 eager（3.1–3.5× 损失）；M 被补齐到下一档时只是浪费（~5%）
+
+## 2026-10-29 追加：decode indexer scan 的调优表
+
+`_SM70_DECODE_SCAN`（`qsa_indexer.py:170`）里 **int8 从 `(32,2,1,1)` 改为 `(32,4,1,1)`**
+（tpp 2→4，离线 237.8→210.0 µs，服务内 conc16 +1.8%、decode1 不变、canary 9/9，commit 4589f1c6fd）。
+
+读这张表前先记住两件事（都是今天踩过的）：
+- 该 kernel 在 conc16 是 **1 warp/CTA + 20 KB smem ⇒ 6% 占用**；`warps` 加大反而更慢
+  （4 warp 时 BLOCK_N=32 被四分，每 warp 只剩 8 列，dot 的 N 方向塌掉，实测 conc16 −5.8%）。
+- 真实几何只能以 `[QSA-SCAN]` 日志为准：**page=200、pt_width=656、cols=131200、dql=1**（16 并发时）。
+  从 trace 反推 grid 三次都错。
