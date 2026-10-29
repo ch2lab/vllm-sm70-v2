@@ -172,7 +172,7 @@ _SM70_DECODE_SCAN = {
     "fp8": (32, 2, 1, 1),
     "e4m3": (64, 2, 1, 2),
     "nvfp4": (64, 2, 2, 2),
-    "int8": (32, 2, 1, 1),
+    "int8": (32, 4, 1, 1),  # 2026-10-29: tpp 2->4 (offline: 237.8 -> 210.0 us/launch)
 }
 
 
@@ -436,6 +436,7 @@ def _qsa_gather_single_request_keys(
 
 _SCORE_DIAG = os.environ.get("VLLM_SM70_QSA_SCORE_DIAG", "") in ("1", "true", "True")
 _SCORE_DIAG_SEEN: set[tuple[int, int, int]] = set()
+_SCAN_DIAG_SEEN: set[tuple[int, ...]] = set()
 
 
 def _score_diag(rows: int, columns: int, tile_columns: int, heads: int) -> None:
@@ -1241,6 +1242,17 @@ def qsa_select_paged_decode(
         num_requests,
         triton.cdiv(columns, block_n * tiles_per_program),
     )
+    if _SCORE_DIAG:
+        _k = (num_requests, columns, block_n, tiles_per_program, stages, warps)
+        if _k not in _SCAN_DIAG_SEEN:
+            _SCAN_DIAG_SEEN.add(_k)
+            init_logger(__name__).info(
+                "[QSA-SCAN] reqs=%d cols=%d block_n=%d tpp=%d stages=%d warps=%d "
+                "grid=%s heads=%d dql=%d head_dim=%d page=%d pt_width=%d cache=%s",
+                num_requests, columns, block_n, tiles_per_program, stages, warps,
+                grid, q.shape[1], decode_query_len, q.shape[2],
+                k_cache.shape[1], page_table.shape[1], k_cache.dtype,
+            )
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
         cache,
