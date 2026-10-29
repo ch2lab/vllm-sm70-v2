@@ -524,7 +524,7 @@ __global__ void gdn_output_k3_kernel(
     const float* __restrict__ h_ws,   // [NB,N*Hv,V,K]
     __half* __restrict__ out,         // [1,T,Hv,V]
     float scale, int q_heads, int v_heads, int nb, int n) {
-  const int vt = blockIdx.x;
+  constexpr int VT_N = V_DIM / BV3;  // value tiles served by one CTA (v5)
   const int gc = blockIdx.y;
   const int nh = blockIdx.z;
   const int hv = nh % v_heads;
@@ -551,7 +551,6 @@ __global__ void gdn_output_k3_kernel(
   const int t0 = (gc - chunk_offsets[seq]) * C;
   if (t0 >= seq_len) return;
   const int len = min(C, seq_len - t0);
-  const int v0 = vt * BV3;
 
   // v4: pad-2 on the 256B-stride rows (hS/kS/qS 128-half = 256B ≡ 0 mod 32
   // banks; P 64-float = 256B) — NCU showed 36% excessive shared wavefronts
@@ -567,27 +566,14 @@ __global__ void gdn_output_k3_kernel(
 
   const int t = threadIdx.x;
   {
-    const float* hs =
-        h_ws + ((int64_t)gc * v_heads + hv) * V_DIM * K_DIM;
     const __half* ks = k + ((int64_t)(bos + t0) * q_heads + hq) * K_DIM;
     const __half* qs = q + ((int64_t)(bos + t0) * q_heads + hq) * K_DIM;
-    const __half* vns = vnew + ((int64_t)(bos + t0) * v_heads + hv) * V_DIM;
-    for (int i = t; i < BV3 * K_DIM; i += 256) {
-      const int r = i / K_DIM, c = i % K_DIM;
-      hS[r][c] = __float2half(hs[(int64_t)(v0 + r) * K_DIM + c]);
-    }
     for (int i = t; i < C * K_DIM; i += 256) {
       const int r = i / K_DIM, c = i % K_DIM;
       const bool live = r < len;
       const int64_t gidx = (int64_t)r * q_heads * K_DIM + c;
       kS[r][c] = live ? ks[gidx] : __float2half(0.0f);
       qS[r][c] = live ? qs[gidx] : __float2half(0.0f);
-    }
-    for (int i = t; i < C * BV3; i += 256) {
-      const int r = i / BV3, c = i % BV3;
-      vnS[r][c] = (r < len)
-                      ? vns[(int64_t)r * v_heads * V_DIM + v0 + c]
-                      : __float2half(0.0f);
     }
     if (t < C)
       gcs_s[t] = (t < len)
@@ -628,6 +614,29 @@ __global__ void gdn_output_k3_kernel(
     }
   }
   __syncthreads();
+
+  // v5 (2026-10-28): one CTA serves every value tile, so P (the 64x64x128
+  // q.k^T + pairwise-decay matrix above) is computed once per (chunk, v-head)
+  // instead of once per value tile. Grid.x = 1; the tile loop reuses P.
+  const __half* vns_base =
+      vnew + ((int64_t)(bos + t0) * v_heads + hv) * V_DIM;
+  for (int vt = 0; vt < VT_N; ++vt) {
+    const int v0 = vt * BV3;
+    {
+      const float* hs =
+          h_ws + ((int64_t)gc * v_heads + hv) * V_DIM * K_DIM;
+      for (int i = t; i < BV3 * K_DIM; i += 256) {
+        const int r = i / K_DIM, c = i % K_DIM;
+        hS[r][c] = __float2half(hs[(int64_t)(v0 + r) * K_DIM + c]);
+      }
+      for (int i = t; i < C * BV3; i += 256) {
+        const int r = i / BV3, c = i % BV3;
+        vnS[r][c] = (r < len)
+                        ? vns_base[(int64_t)r * v_heads * V_DIM + v0 + c]
+                        : __float2half(0.0f);
+      }
+    }
+    __syncthreads();
 
   // o[r][c] = scale * ( sum_k q[r,k] h[c,k] * exp(gcs_r)
   //                    + sum_j P[r][j] * vnew[j][c] )
@@ -671,6 +680,8 @@ __global__ void gdn_output_k3_kernel(
             (state_acc[dc2 * 2 + 1] + intra_acc[dc2 * 2 + 1]) * scale);
     }
   }
+    __syncthreads();  // hS/vnS are rewritten by the next value tile
+  }                   // vt
 }
 
 }  // namespace
@@ -797,7 +808,7 @@ std::vector<torch::Tensor> gdn_chunked_forward(
     chk("K2_state");
   }
   {
-    dim3 grid(V_DIM / BV3, (unsigned)(nb * N), (unsigned)(N * v_heads));
+    dim3 grid(1, (unsigned)(nb * N), (unsigned)(N * v_heads));  // v5: P once
     if (_prof) cudaEventRecord(_e3, stream);
     if (run_k3) gdn_output_k3_kernel<<<grid, 256, C * (C + 2) * 4, stream>>>(
         qp, kp, vnp, gcp, cus, cos, hwp, outp, (float)scale, q_heads,
@@ -910,7 +921,7 @@ std::vector<torch::Tensor> gdn_chunked_forward_dbg(
         nb, (int)N);
   }
   {
-    dim3 grid(V_DIM / BV3, (unsigned)(nb * N), (unsigned)(N * v_heads));
+    dim3 grid(1, (unsigned)(nb * N), (unsigned)(N * v_heads));  // v5: P once
     if (_prof2) cudaEventRecord(_f3, stream);
     if (run2_k3) gdn_output_k3_kernel<<<grid, 256, C * (C + 2) * 4, stream>>>(
         qp, kp, vnp, gcp, cus, cos, hwp, outp, (float)scale, q_heads,
