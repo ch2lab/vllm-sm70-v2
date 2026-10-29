@@ -95,6 +95,23 @@ def _load_chunked_ext():
         raise RuntimeError(
             "SM70 GDN chunked extension previously failed to load."
         ) from _CHUNKED_EXT_LOAD_ERROR
+    # Prebuilt override (mirrors VLLM_SM70_GDN_PREBUILT_SO for the fwd kernel):
+    # a container image ships the .so and has no nvcc, so the JIT path is not
+    # available there. Unset = unchanged behaviour (JIT from source).
+    prebuilt = os.environ.get("VLLM_SM70_GDN_CHUNKED_PREBUILT_SO")
+    if prebuilt:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "vllm_sm70_gdn_chunked_fwd", Path(prebuilt).expanduser()
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load spec from {prebuilt}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _CHUNKED_EXT = mod
+        return _CHUNKED_EXT
+
     src = _CHUNKED_SRC.resolve()
     if not src.is_file():
         raise FileNotFoundError(f"GDN SM70 chunked CUDA source not found: {src}")
