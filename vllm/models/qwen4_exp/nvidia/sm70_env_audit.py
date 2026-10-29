@@ -62,6 +62,19 @@ def audit_once(*, strict: bool = True) -> None:
         len(seen),
         ", ".join(f"{k}={seen[k]}" for k in sorted(seen)),
     )
+    # NCCL reads its algorithm/protocol at communicator init, which happens
+    # before any model code runs. The values are static, so auditing them here
+    # is still a faithful check of what the communicators saw. Names only for
+    # everything else (the environment can hold secrets).
+    nccl = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+    sm70 = sorted(k for k in os.environ if k.startswith("SM70_"))
+    logger.info(
+        "[SM70-ENV] pid=%d sees %d NCCL vars: %s | SM70_* names: %s",
+        os.getpid(),
+        len(nccl),
+        ", ".join(f"{k}={nccl[k]}" for k in sorted(nccl)) or "(none)",
+        ",".join(sm70) or "(none)",
+    )
     if missing:
         msg = (
             "[SM70-ENV] MISSING valves in the process that runs the model "
