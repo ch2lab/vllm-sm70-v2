@@ -332,7 +332,8 @@ __global__ void gdn_state_k2_kernel(
       (float (*)[BV2 + 2])(dyn_s + K_DIM * (BV2 + 2));
   __shared__ __half kST[K_DIM][C + 2];   // 16KB + pad — k staged K-major
   __shared__ __half wS[C][K_DIM + 2];    // 16KB + pad — full K (dot over all K)
-  __shared__ __half uS[C][BV2 + 2];       // 4KB + pad
+  // 2026-10-29: no uS — this chunk's `u` slice is register-prefetched below
+  // (each element is consumed exactly once), freeing 4 KB of the 64 KB cap.
   __shared__ float gcs_s[C];
   __shared__ float g_last_s;
   // v3 (blade 3b): precomputed exp(g_last - gcs) per row — blade-2's step-4
@@ -361,6 +362,23 @@ __global__ void gdn_state_k2_kernel(
     const int row0 = cch * C;
     const int len = min(C, cu_seqlens[nidx + 1] - bos - row0);
 
+    // Register-prefetch this chunk's `u` slice (2 halves per thread, the same
+    // (r0, c0) pairs the v_new step below will use). Issue it before the h_ws
+    // store and the wS/kST staging so the latency overlaps them: ncu showed
+    // long_scoreboard (waiting on global loads) as K2's dominant stall.
+    const int u_c0 = t % BV2;
+    const int u_rg = t / BV2;
+    const int u_r0 = u_rg * (C / (K2_NT / BV2));
+    const __half* usrc_p =
+        u + ((int64_t)(bos + row0) * v_heads + hv) * V_DIM;
+    float u_reg[2];
+    u_reg[0] = (u_r0 < len)
+                   ? h2f(usrc_p[(int64_t)u_r0 * v_heads * V_DIM + v0 + u_c0])
+                   : 0.0f;
+    u_reg[1] = (u_r0 + 1 < len)
+                   ? h2f(usrc_p[(int64_t)(u_r0 + 1) * v_heads * V_DIM + v0 + u_c0])
+                   : 0.0f;
+
     // 1. store h_c to h_ws (row-major [V,K]; transposed read of hT —
     // conflict-free: for fixed r, bank = (34*cc + r) mod 32 = 2cc + r)
     __syncthreads();  // hT finalized by the previous step's h-update
@@ -380,12 +398,6 @@ __global__ void gdn_state_k2_kernel(
           u + ((int64_t)(bos + row0) * v_heads + hv) * V_DIM;
       const __half* ksrc =
           k + ((int64_t)(bos + row0) * q_heads + hq) * K_DIM;
-      for (int i = t; i < C * BV2; i += K2_NT) {
-        const int r = i / BV2, cc = i % BV2;
-        uS[r][cc] = (r < len)
-                        ? usrc[(int64_t)r * v_heads * V_DIM + v0 + cc]
-                        : __float2half(0.0f);
-      }
       for (int i = t; i < C * K_DIM; i += K2_NT) {
         const int r = i / K_DIM, cc = i % K_DIM;
         wS[r][cc] = (r < len)
@@ -429,7 +441,7 @@ __global__ void gdn_state_k2_kernel(
             acc += h2f(wS[r0][kk]) * hT[kk][c0] +
                    h2f(wS[r0][kk + 1]) * hT[kk + 1][c0];
         }
-        vnewS[r0][c0] = (r0 < len) ? h2f(uS[r0][c0]) - acc : 0.0f;
+        vnewS[r0][c0] = (r0 < len) ? u_reg[dt] - acc : 0.0f;
       }
     }
     __syncthreads();
