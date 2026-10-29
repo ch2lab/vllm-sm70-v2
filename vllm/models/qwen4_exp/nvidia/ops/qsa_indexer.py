@@ -216,6 +216,8 @@ _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = int(
 # a top-k element instead of the whole row.
 _SM70_INDEXER_PREFILTER = os.getenv("VLLM_SM70_QSA_PREFILTER", "1") == "1"
 _SM70_INDEXER_PREFILTER_TILE = 16
+_QSA_HEADSUM_BLOCK_N = 512
+_QSA_HEADSUM_WARPS = 4
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
@@ -432,6 +434,35 @@ def _qsa_gather_single_request_keys(
     return keys, valid
 
 
+_SCORE_DIAG = os.environ.get("VLLM_SM70_QSA_SCORE_DIAG", "") in ("1", "true", "True")
+_SCORE_DIAG_SEEN: set[tuple[int, int, int]] = set()
+
+
+def _score_diag(rows: int, columns: int, tile_columns: int, heads: int) -> None:
+    """One-shot shape/byte census of the indexer score pass (VLLM_SM70_QSA_SCORE_DIAG=1).
+
+    The tiled torch.mm materialises an fp32 score tile through HBM and a second
+    kernel reads it back to relu+sum over the query heads; the HBM round trip is
+    what any epilogue fusion would remove, so its exact size has to be measured,
+    not inferred from the tiling formula.
+    """
+    if not _SCORE_DIAG:
+        return
+    key = (rows, columns, tile_columns)
+    if key in _SCORE_DIAG_SEEN:
+        return
+    _SCORE_DIAG_SEEN.add(key)
+    n_tiles = math.ceil(columns / tile_columns)
+    tile_mib = rows * heads * tile_columns * 4 / 2**20
+    total_mib = rows * heads * columns * 4 / 2**20
+    init_logger(__name__).info(
+        "[QSA-SCORE] rows=%d columns=%d heads=%d tile_columns=%d n_tiles=%d "
+        "tile=%.1f MiB round_trip=%.1f MiB write+read=%.1f MiB",
+        rows, columns, heads, tile_columns, n_tiles,
+        tile_mib, total_mib, 2 * total_mib,
+    )
+
+
 def _qsa_mqa_cublas(
     q: torch.Tensor,
     keys: torch.Tensor,
@@ -454,6 +485,7 @@ def _qsa_mqa_cublas(
         min(columns, _SM70_INDEXER_SCORE_TILE_BYTES // bytes_per_column),
     )
     tile_columns = max(256, tile_columns // 256 * 256)
+    _score_diag(rows, columns, tile_columns, num_heads)
     for column_start in range(0, columns, tile_columns):
         column_stop = min(column_start + tile_columns, columns)
         width = column_stop - column_start
@@ -462,10 +494,18 @@ def _qsa_mqa_cublas(
         scores = torch.mm(
             q2,
             keys[column_start:column_stop].t(),
-            out_dtype=torch.float32,
+            # 2026-10-29: fp16 score tile (halves the HBM write here and the
+            # read in _qsa_relu_headsum_visible, which is bandwidth-bound).
+            # Gate: sm70_tests/gate_indexer_fp16_scores.py -> top-2048 set
+            # overlap 99.98%, score-mass ratio 0.999999 (>= 0.999).
+            out_dtype=torch.float16,
         )
+        # 2026-10-29: BLOCK_N 256 -> 512 (offline sweep, sm70_tests/
+        # bench_qsa_relu_headsum.py: 59.9 -> 35.4 us/launch on the in-service
+        # shape; 512/4 beats 256/8 and 512/8). One CTA now covers 512 columns,
+        # halving the CTA count; the last tile is masked when width < 512.
         _qsa_relu_headsum_visible_kernel[
-            (rows, triton.cdiv(width, 256))
+            (rows, triton.cdiv(width, _QSA_HEADSUM_BLOCK_N))
         ](
             scores,
             visible,
@@ -480,9 +520,9 @@ def _qsa_mqa_cublas(
             column_start,
             math.sqrt(head_dim),
             NUM_HEADS=num_heads,
-            BLOCK_N=256,
+            BLOCK_N=_QSA_HEADSUM_BLOCK_N,
             TILE=_SM70_INDEXER_PREFILTER_TILE,
-            num_warps=4,
+            num_warps=_QSA_HEADSUM_WARPS,
         )
     return logits, tile_max
 
