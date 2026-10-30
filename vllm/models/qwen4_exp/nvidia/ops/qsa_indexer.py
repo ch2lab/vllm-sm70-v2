@@ -1142,6 +1142,42 @@ def expand_qsa_block_indices(
     )
 
 
+def _qsa_position_calib(logits: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+    """Remove the monotone positional (recency) trend from the indexer scores.
+
+    Diagnosis 2026-10-30: the pages that carry the answer ranked 73 / 142 / 287
+    (of 512) for evidence at 20% / 50% / 80% of a 16K document -- the indexer
+    scores carry a strong recency trend, which is the well-documented
+    endpoint/positional bias (Lost in the Middle; Found in the Middle, 2406.16008;
+    the 52-74% endpoint share measured in 2609.08450).
+
+    Found-in-the-Middle removes it by subtracting an attention baseline measured
+    at the same position. Here we approximate that baseline with the row's own
+    linear trend in position (slope fitted on a strided subsample to keep the
+    temporary memory bounded), i.e. `score' = score - slope * (pos - mean_pos)`.
+
+    Env: VLLM_SM70_QSA_POS_CALIB=1 (0 = off, byte-identical to today).
+    """
+    if int(os.getenv("VLLM_SM70_QSA_POS_CALIB", "0")) <= 0:
+        return logits
+    rows, cols = logits.shape
+    if cols < 2:
+        return logits
+    dev = logits.device
+    step = max(1, cols // 2048)  # <=2048 sample columns per row
+    pos = torch.arange(cols, device=dev, dtype=torch.float32)
+    ps = pos[::step]
+    ls = logits[:, ::step]
+    ws = (ps[None, :] < visible.to(torch.float32)[:, None]).to(torch.float32)
+    n = ws.sum(1, keepdim=True).clamp(min=1.0)
+    mx = (ps[None, :] * ws).sum(1, keepdim=True) / n
+    my = (ls * ws).sum(1, keepdim=True) / n
+    cov = ((ps[None, :] - mx) * (ls - my) * ws).sum(1, keepdim=True) / n
+    var = (((ps[None, :] - mx) ** 2) * ws).sum(1, keepdim=True).clamp(min=1.0)
+    slope = (cov / var).to(torch.float32)
+    return logits - slope * (pos[None, :] - mx)
+
+
 def _topk(
     logits: torch.Tensor,
     visible_blocks: torch.Tensor,
@@ -1425,6 +1461,7 @@ def qsa_select_paged_prefill(
                     visible_blocks[query_slice],
                     tile_max[:chunk],
                 )
+                logits = _qsa_position_calib(logits, visible_blocks[query_slice])
                 if prefilter:
                     torch.ops._C.qsa_prefilter_topk(
                         logits,
@@ -1483,6 +1520,7 @@ def qsa_select_paged_prefill(
             query_offset=query_start,
             num_queries=query_end - query_start,
         )
+        logits = _qsa_position_calib(logits, visible_blocks[query_slice])
         _topk(
             logits,
             visible_blocks[query_slice],
