@@ -940,6 +940,52 @@ def _qsa_verify_page_budget(prefill: bool = False) -> tuple[int, int]:
     return 0, 0
 
 
+def _qsa_inject_cover(
+    idx_p4: torch.Tensor,
+    page_budget: int,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_to_req: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Append evenly spaced coverage pages to the score-ordered candidates.
+
+    Only the first `page_budget` candidate pages are ever planned, so the top-k
+    keeps the highest-scoring pages and drops the rest. Distributed evidence
+    (a fact in the middle of a long document, multi-key recall) is exactly what
+    score ranking misses: 2026-10-30 the quality suite collapsed from 1.000 to
+    0.678 when the budget went 512 -> 256. Coverage slots buy back the recall at
+    a fraction of the cost: `cover` pages spaced across the visible range are
+    appended after the top-k, so total reads = (page_budget + cover) * 4 tokens.
+
+    `VLLM_SM70_QSA_PREFILL_COVER=<pages/query>`; 0 = off (default).
+    """
+    cover = int(os.getenv("VLLM_SM70_QSA_PREFILL_COVER", "0"))
+    if cover <= 0 or page_budget <= 0:
+        return idx_p4, page_budget
+    # The planner walks 4-token pages out of a 2050-column buffer.
+    max_pages = min(idx_p4.shape[1] // 4, 512)
+    cover = min(cover, max(0, max_pages - page_budget))
+    if cover <= 0:
+        return idx_p4, page_budget
+
+    rows = idx_p4.shape[0]
+    device = idx_p4.device
+    req = token_to_req.clamp(min=0)
+    vis = torch.minimum(
+        (query_positions + 1).clamp(min=0).to(torch.int64),
+        sequence_lengths[req].to(torch.int64),
+    )
+    frac = (torch.arange(cover, device=device, dtype=torch.float32) + 0.5) / cover
+    start = ((vis.to(torch.float32)[:, None] * frac[None, :]).to(torch.int64)) & ~3
+    quad = start[:, :, None] + torch.arange(4, device=device, dtype=torch.int64)
+    quad = torch.where(quad < vis[:, None, None], quad, torch.full_like(quad, -1))
+
+    out = idx_p4.clone()
+    lo, hi = page_budget * 4, (page_budget + cover) * 4
+    out[:, lo:hi] = quad.reshape(rows, cover * 4).to(out.dtype)
+    return out, page_budget + cover
+
+
 def _qsa_page4_route(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1057,6 +1103,9 @@ def _qsa_page4_route(
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
     _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
+    idx_p4, _page_budget = _qsa_inject_cover(
+        idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
+    )
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
         block_table,
@@ -1317,6 +1366,9 @@ def _qsa_page4_tp8_route(
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
     _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
+    idx_p4, _page_budget = _qsa_inject_cover(
+        idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
+    )
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
         block_table,
