@@ -629,6 +629,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             output_gate=output_gate[:num_tokens],
             query_positions=query_positions,
             sequence_lengths=_sequence_lengths,
+            layer_idx=self.layer_idx,
         )
         return output
 
@@ -790,6 +791,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
 
         self.layer_name = f"{prefix}.attn"
+
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = qsa_kv_cache_dtype(cache_config, prefix)
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
@@ -822,6 +824,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             None,
         )
         self.impl.layer_name = self.layer_name
+        # QSA layer index for the per-layer page-budget hot valve.
+        self.impl.layer_idx = extract_layer_index(prefix)
         self.indexer = QSAIndexer(
             vllm_config=vllm_config,
             config=config,
