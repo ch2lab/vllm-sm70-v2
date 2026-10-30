@@ -1070,6 +1070,54 @@ def _layer_budget(layer_idx: int, base: int) -> int:
     return v if v > 0 else base
 
 
+def _qsa_layer_rotate(
+    idx_p4: torch.Tensor,
+    page_budget: int,
+    layer_idx: int,
+) -> torch.Tensor:
+    """Give each QSA layer a rotated window of the candidate pages.
+
+    The 12 QSA layers all consume the same indexer list, so today each of them
+    reads the same 512 pages twelve times. With a per-layer budget of 256 the
+    upper half (ranks 257-512) would be dropped *everywhere*, which is exactly
+    what the quality suite rejects (0.678) -- that half is still load-bearing.
+
+    Rotating the window per layer keeps each layer at half the reads while the
+    union across layers still spans the whole candidate list:
+        layer i -> ranks [i*step, i*step + budget) mod candidates
+    Env: VLLM_SM70_QSA_LAYER_ROTATE=1 (0 = off).
+    """
+    if int(os.getenv("VLLM_SM70_QSA_LAYER_ROTATE", "0")) <= 0:
+        return idx_p4
+    if layer_idx < 0 or page_budget <= 0:
+        return idx_p4
+    cand = min(idx_p4.shape[1] // 4, 512)
+    if page_budget >= cand:
+        return idx_p4
+    rows = idx_p4.shape[0]
+    device = idx_p4.device
+    # Rotation stride: hot file > env > 50%-overlap default. A stride smaller
+    # than the window gives neighbouring layers a shared overlap (sliding
+    # windows across the rank axis); stride == window gives disjoint windows.
+    step = 0
+    try:
+        with open("/data/sm70_results/qsa_rotate_step") as f:
+            step = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        step = 0
+    if step <= 0:
+        step = int(os.getenv("VLLM_SM70_QSA_LAYER_ROTATE_STEP", "0"))
+    if step <= 0:
+        step = max(1, (cand - page_budget) // 2) if cand > page_budget else 1
+    off = (layer_idx * step) % cand
+    pages = idx_p4[:, : cand * 4].view(rows, cand, 4)
+    idxs = (torch.arange(page_budget, device=device) + off) % cand
+    sel = pages.index_select(1, idxs)
+    out = idx_p4.clone()
+    out[:, : page_budget * 4] = sel.reshape(rows, page_budget * 4)
+    return out
+
+
 def _qsa_band_select(
     idx_p4: torch.Tensor,
     page_budget: int,
@@ -1271,6 +1319,7 @@ def _qsa_page4_route(
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
     _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
     _page_budget = _layer_budget(layer_idx, _page_budget)
+    idx_p4 = _qsa_layer_rotate(idx_p4, _page_budget, layer_idx)
     idx_p4, _page_budget = _qsa_band_select(
         idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
     )
@@ -1540,6 +1589,7 @@ def _qsa_page4_tp8_route(
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
     _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
     _page_budget = _layer_budget(layer_idx, _page_budget)
+    idx_p4 = _qsa_layer_rotate(idx_p4, _page_budget, layer_idx)
     idx_p4, _page_budget = _qsa_band_select(
         idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
     )
