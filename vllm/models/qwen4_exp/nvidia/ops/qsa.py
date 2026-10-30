@@ -921,7 +921,9 @@ def _qsa_verify_page_budget() -> tuple[int, int]:
         return budget, 0
     legacy = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_CAP", "0"))
     if legacy > 0:
-        logger.warning(
+        # Once per worker, not per decode step: this used to spam ~180k lines a
+        # day, which is how the defect went unnoticed for nine days.
+        logger.warning_once(
             "VLLM_SM70_QSA_VERIFY_PAGE_CAP=%d is the legacy post-plan token "
             "cap (position-ordered, not top-N). Keeping its old behaviour; "
             "set VLLM_SM70_QSA_VERIFY_PAGE_BUDGET=<pages/query> (e.g. %d for "
