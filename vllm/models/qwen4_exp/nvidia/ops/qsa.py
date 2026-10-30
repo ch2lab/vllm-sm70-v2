@@ -885,7 +885,7 @@ _page4_logged = False
 
 
 
-def _qsa_verify_page_budget() -> tuple[int, int]:
+def _qsa_verify_page_budget(prefill: bool = False) -> tuple[int, int]:
     """Return (per_query_page_budget, legacy_postplan_token_cap).
 
     Per-query page budget (new, opt-in): the planner walks each query's
@@ -909,6 +909,11 @@ def _qsa_verify_page_budget() -> tuple[int, int]:
             budget = int(f.read().strip() or "0")
     except (OSError, ValueError):
         budget = 0
+    if budget <= 0 and prefill:
+        # Prefill only seeds the first hidden state; every generated token
+        # re-plans with the decode budget, so a tighter prefill budget buys
+        # throughput without shrinking what generation can read.
+        budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET_PREFILL", "0"))
     if budget <= 0:
         budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET", "0"))
     if budget > 0:
@@ -948,6 +953,7 @@ def _qsa_page4_route(
     output_gate_view: torch.Tensor,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    prefill: bool = False,
 ) -> None:
     """Run the Flash-V100 grouped page4 planner + fwd into out."""
     global _page4_audit_done, _page4_logged
@@ -1050,7 +1056,7 @@ def _qsa_page4_route(
             dim=1,
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
-    _page_budget, _legacy_cap = _qsa_verify_page_budget()
+    _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
         block_table,
@@ -1236,6 +1242,7 @@ def _qsa_page4_tp8_route(
     output_gate_view: torch.Tensor,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    prefill: bool = False,
 ) -> None:
     """TP8 page4: pad q to the M1a 4-head geometry (head 3 zero), run
     planner + fwd, copy the 3 real heads into out, apply the gate."""
@@ -1309,7 +1316,7 @@ def _qsa_page4_tp8_route(
             dim=1,
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
-    _page_budget, _legacy_cap = _qsa_verify_page_budget()
+    _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
         block_table,
@@ -2333,6 +2340,7 @@ def qsa_sparse_paged_attention(
             output_gate_view,
             k_scale or 1.0,
             v_scale or 1.0,
+            prefill=use_prefill_config,
         )
         return out
 
@@ -2366,6 +2374,7 @@ def qsa_sparse_paged_attention(
             output_gate_view,
             k_scale=k_scale or 1.0,
             v_scale=v_scale or 1.0,
+            prefill=use_prefill_config,
         )
         return out
 
