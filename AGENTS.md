@@ -243,6 +243,8 @@ loadable `sm70/` docs (this section is only an index):
   (config), corrected AR=NVLink; GPU/offline-bench cells marked TBD.
 - **sm70/08_fp4_local_nvfp4_adopt.md** — 采纳新模型 FP4-Local-NVFP4 设计
   (PLE NVFP4 直通 + 视觉), 状态/WBS/回滚阀见文档; 2026-10-18 设计完成待执行.
+- **sm70/25_sparse_selection_survey.md** — 稀疏选页文献调研（位置偏置/校准、DSA indexer 训练、
+  MMR/UNIQUE/PRKV/IndexCache 等）+ 与我们实测的对账 + 推荐路线。做 QSA/稀疏预算前必读。
 - **sm70/24_quality_suite.md** — 质量门单一入口: 三层（L1 长文分布式埋点 / L2 EvalScope 公开基准 /
   L3 服务层）、预登记阈值、负向对照要求。改稀疏预算/量化/路由前先读。
 - **sm70/23_release_and_images.md** — 发布/镜像单一入口（交付线）: 版本号
