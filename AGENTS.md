@@ -243,6 +243,9 @@ loadable `sm70/` docs (this section is only an index):
   (config), corrected AR=NVLink; GPU/offline-bench cells marked TBD.
 - **sm70/08_fp4_local_nvfp4_adopt.md** — 采纳新模型 FP4-Local-NVFP4 设计
   (PLE NVFP4 直通 + 视觉), 状态/WBS/回滚阀见文档; 2026-10-18 设计完成待执行.
+- **sm70/23_release_and_images.md** — 发布/镜像单一入口（交付线）: 版本号
+  `0.32.1+sm70`、wheel 与两层运行镜像、`config/sm70-serve.args` 为唯一参数源、
+  构建/推送命令、6 条换机才暴露的坑、containerd root 磁盘纪律.
 
 ---
 
