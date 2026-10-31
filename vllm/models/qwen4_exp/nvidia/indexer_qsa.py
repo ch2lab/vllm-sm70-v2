@@ -502,17 +502,6 @@ class QSAIndexer(nn.Module):
         decode_query_len = compressed_metadata.decode_query_len
         visible_blocks = compressed_metadata.visible_blocks[:num_tokens]
 
-        # D4a shadow (spec d4a-spec.md §2.2, S2): on a PURE-DECODE step
-        # (every row is a decode row), the 3-op pre-attn chain (uniform
-        # score + persistent_topk + expand) runs as ONE fused Triton launch
-        # writing the packed buffer directly — the expand launch below is
-        # skipped and forward_qsa's output.zero_() is gated off. Gated by
-        # VLLM_SM70_QSA_DECODE_FUSE (==1; 2 is reserved for the rung-2
-        # form). Off path (env 0) and mixed decode+prefill batches run the
-        # exact existing chain — byte-identical (rule 11670). MTP-on decode
-        # (decode_query_len > 1) also falls back to the old chain: the fused
-        # kernel reads page_table rows per query row, but the table has one
-        # row per request, so rows beyond num_decodes would read OOB.
         block_indices = torch.empty(
             num_tokens,
             self.token_topk // self.compress_ratio,

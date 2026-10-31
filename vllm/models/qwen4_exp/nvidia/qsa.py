@@ -440,15 +440,6 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        # D4a shadow (spec d4a-spec.md §2.2 S3): when
-        # VLLM_SM70_QSA_DECODE_FUSE == 1 (matching the fused dispatch in
-        # indexer_qsa.py — every other value, incl. reserved 2, is today)
-        # and the batch is non-empty, the sparse attention chain
-        # (splitk + merge) fully overwrites `output` (empty rows written 0
-        # by both kernels — spec §1.2 proof), so the fill is skipped.
-        # env != 1 (default 0) keeps the fill on every path — byte-identical
-        # off path (rule 11670); an empty batch also keeps it (the chain
-        # below early-returns without writing `output`).
         output.zero_()
         if num_tokens == 0:
             return output
