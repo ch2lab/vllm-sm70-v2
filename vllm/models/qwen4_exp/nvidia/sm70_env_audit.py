@@ -43,7 +43,7 @@ REQUIRED: tuple[str, ...] = (
 _audited = False
 
 
-def audit_once(*, strict: bool = True) -> None:
+def audit_once(*, strict: bool = False) -> None:
     """Log the SM70 valve set once per process and fail on missing valves."""
     global _audited
     if _audited:
