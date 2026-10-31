@@ -606,7 +606,9 @@ int qpn2_moe_wide_cols() {
                 std::strcmp(env, "160") == 0 || std::strcmp(env, "256") == 0)) {
       v = std::atoi(env);
     } else {
-      v = 0;
+      // Defaults to the tuned 256-col wide path; shapes it cannot divide fall
+      // back to the historical kernel below.
+      v = 256;
     }
   }
   return v;
@@ -637,7 +639,8 @@ int qpn2_moe_ns() {
   static int v = -1;
   if (v < 0) {
     const char* env = std::getenv("VLLM_SM70_MOE_QPN2_NS");
-    v = (env != nullptr && std::strcmp(env, "1") == 0) ? 1 : 0;
+    // NS is the tuned default; VLLM_SM70_MOE_QPN2_NS=0 remains the opt-out.
+    v = (env != nullptr && std::strcmp(env, "0") == 0) ? 0 : 1;
   }
   return v;
 }
