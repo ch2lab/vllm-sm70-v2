@@ -175,9 +175,25 @@ _SM70_DECODE_SCAN = {
     "int8": (32, 4, 1, 1),  # 2026-10-29: tpp 2->4 (offline: 237.8 -> 210.0 us/launch)
 }
 
+# One or two requests scan few enough columns that the whole matrix is L2
+# resident, so the tile loop is latency bound, not bandwidth bound: the generic
+# shape runs 4 tiles per CTA with a single pipeline stage and holds ~20%
+# occupancy. One tile per CTA with a 4-deep pipeline measures 28.8 -> 11.5 us
+# for a 2K-context scan (visible=2200 columns) and 70.3 -> 64.8 us at 65K, with
+# bit-identical logits. It is kept off larger batches, where the 4x CTA count
+# would only add scheduling.
+_SM70_DECODE_SCAN_SMALL_BATCH = {
+    "int8": (32, 1, 4, 1),
+}
+
 
 def _sm70_decode_scan_config(
-    cache: torch.Tensor, block_n: int, tpp: int, stages: int, warps: int
+    cache: torch.Tensor,
+    block_n: int,
+    tpp: int,
+    stages: int,
+    warps: int,
+    num_requests: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Launch shape for the decode scan, or the defaults off Volta."""
     if not current_platform.is_device_capability(70):
@@ -192,6 +208,10 @@ def _sm70_decode_scan_config(
         key = "int8"
     else:
         key = "bf16"
+    if num_requests is not None and num_requests <= 2:
+        small = _SM70_DECODE_SCAN_SMALL_BATCH.get(key)
+        if small is not None:
+            return small
     return _SM70_DECODE_SCAN[key]
 
 # SM70 cuBLAS indexer path (ported from 1Cat-vLLM's production SM70 stack,
@@ -1272,7 +1292,7 @@ def qsa_select_paged_decode(
     fp8_lut = _fp8_needs_table(k_cache)
     cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
     block_n, tiles_per_program, stages, warps = _sm70_decode_scan_config(
-        k_cache, block_n, tiles_per_program, stages, warps
+        k_cache, block_n, tiles_per_program, stages, warps, num_requests
     )
     grid = (
         num_requests,
