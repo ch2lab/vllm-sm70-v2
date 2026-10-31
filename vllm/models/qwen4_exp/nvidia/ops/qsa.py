@@ -925,6 +925,9 @@ def _qsa_verify_page_budget(prefill: bool = False) -> tuple[int, int]:
     return 0, 0
 
 
+_rank_diag_state = {"probe": None, "mtime": 0.0}
+
+
 def _rank_diag_page_ranks(idx_p4: torch.Tensor) -> None:
     """Log where each probe token's page sits in the score-ordered candidates.
 
