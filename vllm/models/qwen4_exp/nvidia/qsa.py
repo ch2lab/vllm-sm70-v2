@@ -449,8 +449,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # env != 1 (default 0) keeps the fill on every path — byte-identical
         # off path (rule 11670); an empty batch also keeps it (the chain
         # below early-returns without writing `output`).
-        if not (envs.VLLM_SM70_QSA_DECODE_FUSE == 1 and num_tokens > 0):
-            output.zero_()
+        output.zero_()
         if num_tokens == 0:
             return output
 

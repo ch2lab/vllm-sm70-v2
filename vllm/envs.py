@@ -223,19 +223,6 @@ if TYPE_CHECKING:
     VLLM_SM70_DECODE_HOSTOPT: bool = False
     VLLM_SM70_TRITON_TOPK: bool = False
     # SM70 round-4 D4a shadow: fused QSA decode pre-attn prelude (spec:
-    # .superpowers/sdd/2026-10-13-sm70-round4-d4a-launch-fusion/d4a-spec.md
-    # S2.3). 0 (default) = today, byte-identical off path (rule 11670):
-    # the 3-op pre-attn chain (uniform-score + persistent_topk + expand)
-    # plus the attention output.zero_(). 1 = D4a v2: for pure-decode
-    # steps (every row a decode row) the prelude runs as ONE Triton
-    # launch (ops/qsa_select_fused.py — deterministic lexicographic
-    # top-512, score-desc/index-asc) writing the packed buffer directly,
-    # and the zero_() is skipped (the attention chain fully overwrites
-    # out — spec §1.2 proof; empty batches still zero). 2 = reserved for
-    # ladder rung 2 (topk+expand fused, score separate — not wired).
-    # Static env only: the dispatch bakes in at FULL-graph capture, so no
-    # control file (spec §2.3 — REJECTED for this candidate).
-    VLLM_SM70_QSA_DECODE_FUSE: int = 0
     # Page4 block-table ordering: "torch" = torch.sort(encoded_pages) (baseline),
     # "check" = sort + verify the kernel emit order is already ascending (log-only),
     # "skip" = use the emit order directly (drops 12 radixSort launches/step).
@@ -1832,9 +1819,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SM70 round-4 D4a decode pre-attn fusion shadow (0 off / 1 fused v2 /
     # 2 reserved rung-2; see annotation block — d4a-spec.md §2.3).
-    "VLLM_SM70_QSA_DECODE_FUSE": lambda: int(
-        os.getenv("VLLM_SM70_QSA_DECODE_FUSE", "0")
-    ),
     "VLLM_SM70_QSA_PAGE4_SORT": lambda: os.getenv(
         "VLLM_SM70_QSA_PAGE4_SORT", "inline32"
     ),

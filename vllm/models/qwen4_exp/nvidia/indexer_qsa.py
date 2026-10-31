@@ -513,33 +513,6 @@ class QSAIndexer(nn.Module):
         # (decode_query_len > 1) also falls back to the old chain: the fused
         # kernel reads page_table rows per query row, but the table has one
         # row per request, so rows beyond num_decodes would read OOB.
-        if (
-            envs.VLLM_SM70_QSA_DECODE_FUSE == 1
-            and num_decode_tokens > 0
-            and num_decode_tokens == num_tokens
-            and decode_query_len == 1
-            # The fused selector reads the cache directly; an e4m3 cache on
-            # Volta can only be read through the byte table.
-            and not _fp8_needs_table(compressed_key_cache)
-        ):
-            num_decodes = compressed_metadata.num_decodes
-            if num_decodes * decode_query_len != num_decode_tokens:
-                raise ValueError("QSA decode rows must form a uniform request batch")
-            from .ops.qsa_select_fused import qsa_select_fused_decode
-
-            qsa_select_fused_decode(
-                q,
-                compressed_key_cache,
-                compressed_metadata.block_table[:num_decodes],
-                visible_blocks,
-                self.token_topk,
-                self.compress_ratio,
-                decode_query_len,
-                compressed_metadata.logical_positions[:num_tokens],
-                out,
-            )
-            return out, main_outputs
-
         block_indices = torch.empty(
             num_tokens,
             self.token_topk // self.compress_ratio,
