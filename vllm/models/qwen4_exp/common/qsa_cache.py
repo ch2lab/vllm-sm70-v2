@@ -618,7 +618,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         import os as _os
 
         self.supports_draft_decode_metadata_update = (
-            _os.environ.get("VLLM_SM70_QSA_DRAFT_META_UPDATE") == "1"
+            _os.environ.get("VLLM_SM70_QSA_DRAFT_META_UPDATE", "1") == "1"
         )
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             compress_ratio = kv_cache_spec.tokens_per_state

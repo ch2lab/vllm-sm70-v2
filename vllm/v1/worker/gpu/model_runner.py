@@ -239,7 +239,7 @@ def _sm70_split_end(key: str, ev) -> None:
 
 logger = init_logger(__name__)
 
-_SM70_GREEDY_VERIFY = os.environ.get("VLLM_SM70_GREEDY_VERIFY") == "1"
+_SM70_GREEDY_VERIFY = os.environ.get("VLLM_SM70_GREEDY_VERIFY", "1") == "1"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):

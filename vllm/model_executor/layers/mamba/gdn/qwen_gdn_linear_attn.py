@@ -840,7 +840,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # A SECOND model construction (expert-parallel setup, dummy build)
             # re-registers the same prefix. Default keeps the strict check;
             # VLLM_SM70_ALLOW_DUP_LAYER=1 replaces the stale entry instead.
-            if os.getenv("VLLM_SM70_ALLOW_DUP_LAYER", "0") != "1":
+            if os.getenv("VLLM_SM70_ALLOW_DUP_LAYER", "1") != "1":
                 raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
@@ -1276,16 +1276,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        # SM70 Qwen3.8: one merged qkvz+ba GEMV launch (set by
-        # enable_qwen38_sm70_fp16_gemv on the exact-model contract); the op
-        # falls back to the two standard projections outside M=1 decode.
-        if getattr(self, "sm70_qwen38_fp16_fused_input", False):
-            mixed_qkvz, ba = torch.ops.vllm.qwen38_sm70_fp16_gdn_input_packed(
-                hidden_states, self.in_proj_qkvz.weight, self.in_proj_ba.weight
-            )
-        else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode

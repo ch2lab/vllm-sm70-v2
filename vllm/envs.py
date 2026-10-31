@@ -221,7 +221,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DRAFT_DENSE_ATTN: bool = False
     VLLM_SM70_FULL_CUDAGRAPH: bool = False
     VLLM_SM70_DECODE_HOSTOPT: bool = False
-    VLLM_SM70_TRITON_TOPK: bool = False
+    VLLM_SM70_TRITON_TOPK: bool = True
     # SM70 round-4 D4a shadow: fused QSA decode pre-attn prelude (spec:
     # Page4 block-table ordering: "torch" = torch.sort(encoded_pages) (baseline),
     # "check" = sort + verify the kernel emit order is already ascending (log-only),
@@ -249,7 +249,6 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_WARPS_MIN: int = 0
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_GEMV_SHAPES: bool = False
-    VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = False
     # SM70 topology-aware hierarchical all-reduce shadow route (round-3 AR,
     # decode/verify only; spec: .superpowers/sdd/2026-10-13-sm70-round3-ar/
@@ -1776,7 +1775,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM70 selector: Triton topk-softmax implementation (False, default) vs
     # the C++ topk_softmax kernel. Inert off exact-SM70 hardware.
     "VLLM_SM70_TRITON_TOPK": lambda: bool(
-        int(os.getenv("VLLM_SM70_TRITON_TOPK", "0"))
+        int(os.getenv("VLLM_SM70_TRITON_TOPK", "1"))
     ),
     # SM70 selector: decode-shape GDN piecewise cudagraph descs (False,
     # default) -- the GDN decode ops are absorbed into captured pieces and a
@@ -1845,9 +1844,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM70 selector: fold the HC down-projection and its SiLU into one launch.
     # SM70 selector: fused checkpoint-fp16 GDN input preparation (False,
     # default). Inert off exact-SM70 hardware.
-    "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))
-    ),
     # SM70 selector: batched split copy for the fused GDN projection (False,
     # default). Inert off exact-SM70 hardware.
     "VLLM_SM70_GDN_BATCH_SPLIT_COPY": lambda: bool(

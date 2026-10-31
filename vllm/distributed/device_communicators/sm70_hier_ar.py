@@ -75,7 +75,7 @@ _AR_CALLS = 0
 #     route (AR_RING_PREFILL) stays behind its own valve and is not licensed yet.
 # The table exists so the per-call decision is explicit and auditable; with the
 # currently licensed routes it resolves to today's production behaviour.
-_AR_ADAPTIVE = os.environ.get("VLLM_SM70_AR_ADAPTIVE", "0") == "1"
+_AR_ADAPTIVE = os.environ.get("VLLM_SM70_AR_ADAPTIVE", "1") == "1"
 # Diagnostic bypass (2026-10-22): return the local partial (numerically wrong,
 # structurally identical) to measure AR's *marginal* cost by A/B. Default off.
 _AR_BYPASS = os.environ.get("VLLM_SM70_AR_BYPASS", "0") == "1"

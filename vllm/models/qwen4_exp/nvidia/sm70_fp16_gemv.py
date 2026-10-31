@@ -486,105 +486,6 @@ def _qwen38_sm70_fp16_gdn_input(
     return qkv, z, b, a
 
 
-@triton.jit
-def _qwen38_fp16_gdn_input_packed_kernel(
-    x_ptr,
-    qkvz_weight_ptr,
-    ba_weight_ptr,
-    qkvz_out_ptr,
-    ba_out_ptr,
-    N_QKVZ: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    # Same merged qkvz+ba GEMV as _qwen38_fp16_gdn_input_kernel but stores
-    # the packed (N_QKVZ, N_BA) layout our GDN forward consumes directly.
-    row = tl.program_id(0)
-    is_qkvz = row < N_QKVZ
-    ba_row = row - N_QKVZ
-    offsets = tl.arange(0, BLOCK_K)
-    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
-    for block_start in tl.static_range(0, K, BLOCK_K):
-        indices = block_start + offsets
-        mask = indices < K
-        x = tl.load(x_ptr + indices, mask=mask, other=0.0)
-        qkvz_weight = tl.load(
-            qkvz_weight_ptr + row * K + indices,
-            mask=is_qkvz & mask,
-            other=0.0,
-        )
-        ba_weight = tl.load(
-            ba_weight_ptr + ba_row * K + indices,
-            mask=(~is_qkvz) & mask,
-            other=0.0,
-        )
-        weight = tl.where(is_qkvz, qkvz_weight, ba_weight)
-        acc += x.to(tl.float32) * weight.to(tl.float32)
-
-    value = tl.sum(acc, axis=0)
-    if is_qkvz:
-        tl.store(qkvz_out_ptr + row, value)
-    else:
-        tl.store(ba_out_ptr + ba_row, value)
-
-
-def _qwen38_sm70_fp16_gdn_input_packed(
-    x: torch.Tensor,
-    qkvz_weight: torch.Tensor,
-    ba_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    n_qkvz, n_ba = qkvz_weight.shape[0], ba_weight.shape[0]
-    if not (
-        qkvz_weight.shape[1] == 2560
-        and ba_weight.shape[1] == 2560
-        and (n_qkvz, n_ba) in ((4096, 24), (2048, 12))
-        and _runtime_ok(x, qkvz_weight)
-        and _runtime_ok(x, ba_weight)
-    ):
-        return (
-            torch.nn.functional.linear(x, qkvz_weight),
-            torch.nn.functional.linear(x, ba_weight),
-        )
-
-    qkvz = x.new_empty((1, n_qkvz))
-    ba = x.new_empty((1, n_ba))
-    # 512/2 wins on both layouts (TP4 4096+24 and TP8 2048+12): the extra warps
-    # buy no latency here and only cost occupancy.
-    _qwen38_fp16_gdn_input_packed_kernel[(n_qkvz + n_ba,)](
-        x,
-        qkvz_weight,
-        ba_weight,
-        qkvz,
-        ba,
-        N_QKVZ=n_qkvz,
-        K=2560,
-        BLOCK_K=512,
-        num_warps=2,
-    )
-    logger.info_once(
-        "SM70 Qwen3.8 checkpoint-FP16 fused GDN input (packed) route enabled."
-    )
-    return qkvz, ba
-
-
-def _qwen38_sm70_fp16_gdn_input_packed_fake(
-    x: torch.Tensor,
-    qkvz_weight: torch.Tensor,
-    ba_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        x.new_empty((*x.shape[:-1], qkvz_weight.shape[0])),
-        x.new_empty((*x.shape[:-1], ba_weight.shape[0])),
-    )
-
-
-direct_register_custom_op(
-    op_name="qwen38_sm70_fp16_gdn_input_packed",
-    op_func=_qwen38_sm70_fp16_gdn_input_packed,
-    fake_impl=_qwen38_sm70_fp16_gdn_input_packed_fake,
-)
-
-
 def _qwen38_sm70_fp16_gdn_input_fake(
     x: torch.Tensor,
     qkvz_weight: torch.Tensor,
@@ -711,41 +612,6 @@ def enable_qwen38_sm70_fp16_gemv(
         child.quant_method = Qwen38SM70FP16LinearMethod()
         replaced += 1
 
-    fused_gdn_inputs = 0
-    if envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16:
-        for child in module.modules():
-            qkvz = getattr(child, "in_proj_qkvz", None)
-            ba = getattr(child, "in_proj_ba", None)
-            qkvz_weight = getattr(qkvz, "weight", None)
-            ba_weight = getattr(ba, "weight", None)
-            tp_size = int(getattr(child, "tp_size", 0) or 0)
-            key_dim = int(getattr(child, "key_dim", 0) or 0)
-            value_dim = int(getattr(child, "value_dim", 0) or 0)
-            num_v_heads = int(getattr(child, "num_v_heads", 0) or 0)
-            if tp_size <= 0 or key_dim <= 0 or value_dim <= 0 or num_v_heads <= 0:
-                continue
-            expected_qkvz = (2 * key_dim + 2 * value_dim) // tp_size
-            expected_ba = 2 * (num_v_heads // tp_size)
-            if not (
-                isinstance(qkvz_weight, torch.Tensor)
-                and tuple(qkvz_weight.shape) == (expected_qkvz, 2560)
-                and isinstance(ba_weight, torch.Tensor)
-                and tuple(ba_weight.shape) == (expected_ba, 2560)
-                and isinstance(
-                    getattr(qkvz, "quant_method", None),
-                    Qwen38SM70FP16LinearMethod,
-                )
-                and isinstance(
-                    getattr(ba, "quant_method", None),
-                    (Qwen38SM70FP16LinearMethod, UnquantizedLinearMethod),
-                )
-                and not bool(getattr(child, "gqa_interleaved_layout", True))
-                and not bool(getattr(child, "disable_tp_for_ba_proj", True))
-            ):
-                continue
-            child.sm70_qwen38_fp16_fused_input = True
-            fused_gdn_inputs += 1
-
     if replaced:
         logger.info_once(
             "Prepared %d Qwen3.8 checkpoint-FP16 SM70 M=1 GEMV projections.",
@@ -755,15 +621,6 @@ def enable_qwen38_sm70_fp16_gemv(
         logger.warning_once(
             "Qwen3.8 checkpoint-FP16 GEMV opt-in matched the runtime but no "
             "target projections were found."
-        )
-    if fused_gdn_inputs:
-        logger.info_once(
-            "Prepared %d Qwen3.8 fused checkpoint-FP16 GDN inputs.",
-            fused_gdn_inputs,
-        )
-    elif envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16:
-        logger.warning_once(
-            "Qwen3.8 fused checkpoint-FP16 GDN input opt-in found no targets."
         )
 
 

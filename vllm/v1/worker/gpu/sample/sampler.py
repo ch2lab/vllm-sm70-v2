@@ -65,7 +65,7 @@ class Sampler:
         # SM70: TP-local argmax fast path (see sm70_greedy_verify). Off until
         # the model-side get_top_tokens lands; only a capability predicate so far.
         self.greedy_token_fastpath = (
-            os.environ.get("VLLM_SM70_GREEDY_VERIFY") == "1"
+            os.environ.get("VLLM_SM70_GREEDY_VERIFY", "1") == "1"
         )
         self.use_fp64_gumbel = use_fp64_gumbel
 

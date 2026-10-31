@@ -130,7 +130,7 @@ def _load_chunked_ext():
 
 
 def _chunked_enabled() -> bool:
-    return os.environ.get("VLLM_SM70_GDN_CHUNKED", "0") == "1"
+    return os.environ.get("VLLM_SM70_GDN_CHUNKED", "1") == "1"
 
 
 def chunk_gated_delta_rule_sm70(
