@@ -156,37 +156,6 @@ else:
         return topk_ids
 
 
-def _sm70_prune_routes(topk_weights, topk_ids):
-    """Drop low-gate routes so a decode step activates fewer experts.
-
-    MoE decode cost tracks the *union* of experts the batch touches, not the
-    token count (ELDR 2607.00466, XShare 2602.07265). With top-10 over 512
-    experts a 16-token batch already touches ~17/64 local experts and a 32-token
-    one ~30/64, so pruning the weakest routes shrinks the per-step weight
-    traffic. Dropped routes get id -1: moe_align skips them and the qpn2 kernel
-    early-returns on `expert < 0`, while every grid/buffer size stays static
-    (CUDA-graph safe).
-
-    Env: VLLM_SM70_MOE_ROUTE_PRUNE=<tau> in (0,1]: keep routes whose weight is
-    at least tau * the row's max weight (always keeping the best one), then
-    renormalise. 0 = off.
-    """
-    import os
-
-    tau = float(os.getenv("VLLM_SM70_MOE_ROUTE_PRUNE", "0") or 0)
-    if tau <= 0.0 or tau > 1.0:
-        return topk_weights, topk_ids
-    wmax = topk_weights.max(dim=-1, keepdim=True).values
-    keep = topk_weights >= (wmax * tau)
-    # Always keep the strongest route, even if it is the only one above zero.
-    best = topk_weights.argmax(dim=-1, keepdim=True)
-    keep = keep.scatter(1, best, True)
-    w = torch.where(keep, topk_weights, torch.zeros_like(topk_weights))
-    ids = torch.where(keep, topk_ids, torch.full_like(topk_ids, -1))
-    w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-    return w, ids
-
-
 class BaseRouter(FusedMoERouter):
     """Base class providing common functionality for all router implementations.
 
@@ -332,8 +301,5 @@ class BaseRouter(FusedMoERouter):
 
         # Step 4: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, topk_indices_dtype)
-
-        # Step 5 (SM70): optional batch-union pruning of the weakest routes.
-        topk_weights, topk_ids = _sm70_prune_routes(topk_weights, topk_ids)
 
         return topk_weights, topk_ids
