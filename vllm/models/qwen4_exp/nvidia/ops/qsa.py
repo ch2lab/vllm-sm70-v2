@@ -900,7 +900,7 @@ def _qsa_verify_page_budget(prefill: bool = False) -> tuple[int, int]:
     existing deployment does not change semantics silently; setting
     ``VLLM_SM70_QSA_VERIFY_PAGE_BUDGET`` switches to the score-ordered budget.
     """
-    budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET", "0"))
+    budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET", "512"))
     if budget > 0:
         # Proof-of-effect line (04_standards: prove the change took effect
         # before trusting any number).
@@ -1078,7 +1078,7 @@ def _qsa_page4_route(
     # buffer is one index column wider, so hand the planner the first 2050
     # columns with the count clamped to what they hold — bit-identical to
     # 1Cat's production buffer (their indexer fits 2050 columns).
-    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "0") == "1":
+    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "1") == "1":
         # Candidate I: one launch instead of clamp + cat, same integers
         # (gated, default 0 = byte-identical main path; the module is only
         # imported when the valve is on).
@@ -1340,7 +1340,7 @@ def _qsa_page4_tp8_route(
     out_p4 = cap_outp4[:rows]
     q_p4[:, :3].copy_(q)
     q_p4[:, 3].zero_()
-    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "0") == "1":
+    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "1") == "1":
         # Candidate I: one launch instead of clamp + cat, same integers
         # (gated, default 0 = byte-identical main path; the module is only
         # imported when the valve is on).
