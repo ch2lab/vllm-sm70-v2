@@ -233,8 +233,14 @@ class IpcModelLoader(BaseModelLoader):
             # being loaded: a draft load that lost its flag (or a target load
             # that got one) would hit the wrong daemon group and
             # fingerprint-mismatch.
+            #
+            # Methods with no daemon draft role (ngram, suffix, custom_class)
+            # alias `draft_model_config` to `target_model_config`, so identity
+            # alone would report the target load as a draft.
             spec = vllm_config.speculative_config
-            inferred = spec is not None and model_config is spec.draft_model_config
+            inferred = is_draft_model_cacheable(spec) and model_config is (
+                spec.draft_model_config
+            )
             if inferred != self.is_draft:
                 raise CacheConfigMismatchError(
                     f"Weight cache role mismatch: loading "
