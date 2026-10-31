@@ -900,22 +900,7 @@ def _qsa_verify_page_budget(prefill: bool = False) -> tuple[int, int]:
     existing deployment does not change semantics silently; setting
     ``VLLM_SM70_QSA_VERIFY_PAGE_BUDGET`` switches to the score-ordered budget.
     """
-    # Hot valve for budget sweeps: a file beats the environment so a single
-    # boot can measure several points without a restart. Persisted under
-    # /data (not /tmp, which is tmpfs).
-    budget = 0
-    try:
-        with open("/data/sm70_results/qsa_verify_budget") as f:
-            budget = int(f.read().strip() or "0")
-    except (OSError, ValueError):
-        budget = 0
-    if budget <= 0 and prefill:
-        # Prefill only seeds the first hidden state; every generated token
-        # re-plans with the decode budget, so a tighter prefill budget buys
-        # throughput without shrinking what generation can read.
-        budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET_PREFILL", "0"))
-    if budget <= 0:
-        budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET", "0"))
+    budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET", "0"))
     if budget > 0:
         # Proof-of-effect line (04_standards: prove the change took effect
         # before trusting any number).
@@ -938,55 +923,6 @@ def _qsa_verify_page_budget(prefill: bool = False) -> tuple[int, int]:
         )
         return 0, legacy
     return 0, 0
-
-
-def _qsa_inject_cover(
-    idx_p4: torch.Tensor,
-    page_budget: int,
-    query_positions: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    token_to_req: torch.Tensor,
-) -> tuple[torch.Tensor, int]:
-    """Append evenly spaced coverage pages to the score-ordered candidates.
-
-    Only the first `page_budget` candidate pages are ever planned, so the top-k
-    keeps the highest-scoring pages and drops the rest. Distributed evidence
-    (a fact in the middle of a long document, multi-key recall) is exactly what
-    score ranking misses: 2026-10-30 the quality suite collapsed from 1.000 to
-    0.678 when the budget went 512 -> 256. Coverage slots buy back the recall at
-    a fraction of the cost: `cover` pages spaced across the visible range are
-    appended after the top-k, so total reads = (page_budget + cover) * 4 tokens.
-
-    `VLLM_SM70_QSA_PREFILL_COVER=<pages/query>`; 0 = off (default).
-    """
-    cover = int(os.getenv("VLLM_SM70_QSA_PREFILL_COVER", "0"))
-    if cover <= 0 or page_budget <= 0:
-        return idx_p4, page_budget
-    # The planner walks 4-token pages out of a 2050-column buffer.
-    max_pages = min(idx_p4.shape[1] // 4, 512)
-    cover = min(cover, max(0, max_pages - page_budget))
-    if cover <= 0:
-        return idx_p4, page_budget
-
-    rows = idx_p4.shape[0]
-    device = idx_p4.device
-    req = token_to_req.clamp(min=0)
-    vis = torch.minimum(
-        (query_positions + 1).clamp(min=0).to(torch.int64),
-        sequence_lengths[req].to(torch.int64),
-    )
-    frac = (torch.arange(cover, device=device, dtype=torch.float32) + 0.5) / cover
-    start = ((vis.to(torch.float32)[:, None] * frac[None, :]).to(torch.int64)) & ~3
-    quad = start[:, :, None] + torch.arange(4, device=device, dtype=torch.int64)
-    quad = torch.where(quad < vis[:, None, None], quad, torch.full_like(quad, -1))
-
-    out = idx_p4.clone()
-    lo, hi = page_budget * 4, (page_budget + cover) * 4
-    out[:, lo:hi] = quad.reshape(rows, cover * 4).to(out.dtype)
-    return out, page_budget + cover
-
-
-_rank_diag_state = {"probe": None, "mtime": 0.0}
 
 
 def _rank_diag_page_ranks(idx_p4: torch.Tensor) -> None:
@@ -1039,165 +975,6 @@ def _rank_diag_page_ranks(idx_p4: torch.Tensor) -> None:
             pass
 
 
-_layer_budget_cache: dict = {"mtime": 0.0, "vals": []}
-
-
-def _layer_budget(layer_idx: int, base: int) -> int:
-    """Per-QSA-layer page budget override (hot file, 0 = use the global one).
-
-    The 12 QSA layers are interleaved with 36 GDN layers, so a layer's exact
-    retrieval role may differ (2026-10-30 survey §8 hypothesis 1). File:
-    /data/sm70_results/qsa_layer_budget with one integer per layer index.
-    """
-    if layer_idx < 0 or base <= 0:
-        return base
-    path = "/data/sm70_results/qsa_layer_budget"
-    try:
-        mtime = os.stat(path).st_mtime
-    except OSError:
-        return base
-    if mtime != _layer_budget_cache["mtime"]:
-        try:
-            with open(path) as f:
-                _layer_budget_cache["vals"] = [int(x) for x in f.read().split()]
-            _layer_budget_cache["mtime"] = mtime
-        except (OSError, ValueError):
-            return base
-    vals = _layer_budget_cache["vals"]
-    if layer_idx >= len(vals):
-        return base
-    v = vals[layer_idx]
-    return v if v > 0 else base
-
-
-def _qsa_layer_rotate(
-    idx_p4: torch.Tensor,
-    page_budget: int,
-    layer_idx: int,
-) -> torch.Tensor:
-    """Give each QSA layer a rotated window of the candidate pages.
-
-    The 12 QSA layers all consume the same indexer list, so today each of them
-    reads the same 512 pages twelve times. With a per-layer budget of 256 the
-    upper half (ranks 257-512) would be dropped *everywhere*, which is exactly
-    what the quality suite rejects (0.678) -- that half is still load-bearing.
-
-    Rotating the window per layer keeps each layer at half the reads while the
-    union across layers still spans the whole candidate list:
-        layer i -> ranks [i*step, i*step + budget) mod candidates
-    Env: VLLM_SM70_QSA_LAYER_ROTATE=1 (0 = off).
-    """
-    if int(os.getenv("VLLM_SM70_QSA_LAYER_ROTATE", "0")) <= 0:
-        return idx_p4
-    if layer_idx < 0 or page_budget <= 0:
-        return idx_p4
-    cand = min(idx_p4.shape[1] // 4, 512)
-    if page_budget >= cand:
-        return idx_p4
-    rows = idx_p4.shape[0]
-    device = idx_p4.device
-    # Rotation stride: hot file > env > 50%-overlap default. A stride smaller
-    # than the window gives neighbouring layers a shared overlap (sliding
-    # windows across the rank axis); stride == window gives disjoint windows.
-    step = 0
-    try:
-        with open("/data/sm70_results/qsa_rotate_step") as f:
-            step = int(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        step = 0
-    if step <= 0:
-        step = int(os.getenv("VLLM_SM70_QSA_LAYER_ROTATE_STEP", "0"))
-    if step <= 0:
-        step = max(1, (cand - page_budget) // 2) if cand > page_budget else 1
-    off = (layer_idx * step) % cand
-    pages = idx_p4[:, : cand * 4].view(rows, cand, 4)
-    idxs = (torch.arange(page_budget, device=device) + off) % cand
-    sel = pages.index_select(1, idxs)
-    out = idx_p4.clone()
-    out[:, : page_budget * 4] = sel.reshape(rows, page_budget * 4)
-    return out
-
-
-def _qsa_band_select(
-    idx_p4: torch.Tensor,
-    page_budget: int,
-    query_positions: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    token_to_req: torch.Tensor,
-) -> tuple[torch.Tensor, int]:
-    """Position-stratified page selection (deterministic).
-
-    Diagnosis 2026-10-30: the indexer's candidate order carries a strong
-    recency bias -- for a 16K document the pages holding the three answer keys
-    ranked 73 / 142 / 287 out of 512, i.e. later evidence is pushed deep, so a
-    global top-k of 256 drops it and quality collapses (0.5 multikey recall).
-
-    Fix: bucket the candidate pages by their position in the visible range and
-    keep the best `q` of EVERY band (q = budget / bands). Same number of pages
-    read, but the budget is spread over the whole document instead of being
-    eaten by the recent tail.
-
-    Env: VLLM_SM70_QSA_BAND_BUDGET=<pages> (0 = off), VLLM_SM70_QSA_BANDS=<n>
-    (default 8). Only the first `page_budget` candidates are considered.
-    """
-    # Hot valve (file beats env) so one boot can sweep the curve.
-    band_budget = 0
-    bands = 8
-    try:
-        with open("/data/sm70_results/qsa_band_budget") as f:
-            raw = f.read().split()
-        if raw:
-            band_budget = int(raw[0])
-            if len(raw) > 1:
-                bands = int(raw[1])
-    except (OSError, ValueError):
-        band_budget = 0
-    if band_budget <= 0:
-        band_budget = int(os.getenv("VLLM_SM70_QSA_BAND_BUDGET", "0"))
-        bands = max(1, int(os.getenv("VLLM_SM70_QSA_BANDS", "8")))
-    bands = max(1, bands)
-    if band_budget <= 0 or page_budget <= 0:
-        return idx_p4, page_budget
-
-    rows = idx_p4.shape[0]
-    cand = idx_p4[:, : page_budget * 4].view(rows, page_budget, 4)
-    pages = cand[:, :, 0]
-    device = pages.device
-    req = token_to_req.clamp(min=0)
-    vis = torch.minimum(
-        (query_positions + 1).clamp(min=0).to(torch.int64),
-        sequence_lengths[req].to(torch.int64),
-    ).clamp(min=1)
-
-    pos = pages.to(torch.int64).clamp(min=0)
-    band = (pos * bands // vis[:, None]).clamp(0, bands - 1)
-    bad = pages < 0
-    if bad.any():
-        band = torch.where(bad, torch.full_like(band, bands - 1), band)
-
-    # Stable sort by band: within a band the original (score) order is kept.
-    order = torch.argsort(band, dim=1, stable=True)
-    band_sorted = band.gather(1, order)
-    idx = torch.arange(page_budget, device=device).expand(rows, page_budget)
-    first = torch.ones_like(band_sorted, dtype=torch.bool)
-    first[:, 1:] = band_sorted[:, 1:] != band_sorted[:, :-1]
-    group_start = torch.cummax(torch.where(first, idx, torch.zeros_like(idx)), dim=1).values
-    occ = idx - group_start
-    q = max(1, band_budget // bands)
-    keep = (occ < q) & (~bad.gather(1, order))
-
-    # Keeps first (deterministic), then the rest as filler.
-    rank = torch.argsort((~keep).to(torch.int8), dim=1, stable=True)
-    k = min(band_budget, page_budget)
-    take = rank[:, :k]
-    sel = order.gather(1, take)
-    new_pages = pages.gather(1, sel)
-
-    quad = new_pages[:, :, None] + torch.arange(4, device=device, dtype=new_pages.dtype)[None, None, :]
-    quad = torch.where(new_pages[:, :, None] >= 0, quad, torch.full_like(quad, -1))
-    out = idx_p4.clone()
-    out[:, : k * 4] = quad.reshape(rows, k * 4).to(out.dtype)
-    return out, k
 
 
 def _qsa_page4_route(
@@ -1318,14 +1095,6 @@ def _qsa_page4_route(
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
     _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
-    _page_budget = _layer_budget(layer_idx, _page_budget)
-    idx_p4 = _qsa_layer_rotate(idx_p4, _page_budget, layer_idx)
-    idx_p4, _page_budget = _qsa_band_select(
-        idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
-    )
-    idx_p4, _page_budget = _qsa_inject_cover(
-        idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
-    )
     _rank_diag_page_ranks(idx_p4)
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
@@ -1588,14 +1357,6 @@ def _qsa_page4_tp8_route(
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
     _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
-    _page_budget = _layer_budget(layer_idx, _page_budget)
-    idx_p4 = _qsa_layer_rotate(idx_p4, _page_budget, layer_idx)
-    idx_p4, _page_budget = _qsa_band_select(
-        idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
-    )
-    idx_p4, _page_budget = _qsa_inject_cover(
-        idx_p4, _page_budget, query_positions, sequence_lengths, token_to_req
-    )
     _rank_diag_page_ranks(idx_p4)
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
