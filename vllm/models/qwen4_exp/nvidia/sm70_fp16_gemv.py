@@ -750,8 +750,6 @@ def enable_qwen38_sm70_fp16_gemv(
                 shape,
                 _plan_for(prefix, shape),
             )
-    if not envs.VLLM_SM70_QWEN38_FP16_GEMV:
-        return
     capability_ok = current_platform.is_device_capability((7, 0))
     contract_ok = _exact_runtime_contract(vllm_config)
     if dtype != torch.float16 or not capability_ok or not contract_ok:

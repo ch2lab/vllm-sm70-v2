@@ -261,10 +261,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_STAGES: int = 2
     VLLM_SM70_QSA_WARPS_MIN: int = 0
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
-    VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_GEMV_SHAPES: bool = False
-    VLLM_SM70_QWEN38_FUSED_HC_UP_GATE: bool = False
-    VLLM_SM70_QWEN38_FUSED_HC_DOWN_SILU: bool = False
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = False
     # SM70 topology-aware hierarchical all-reduce shadow route (round-3 AR,
@@ -1827,11 +1824,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SM70 QSA Triton launch tuning: software pipeline stages (2, default,
     # GB300-tuned; Volta wants deeper stages to hide paged K/V loads).
-    "VLLM_SM70_QSA_STAGES": lambda: int(os.getenv("VLLM_SM70_QSA_STAGES", "2")),
+    "VLLM_SM70_QSA_STAGES": lambda: int(os.getenv("VLLM_SM70_QSA_STAGES", "3")),
     # SM70 QSA A/B knob: 0 (default) keeps the GB300-tuned warp counts for the
     # decode rows; N>=8 forces at least N warps per program.
     "VLLM_SM70_QSA_WARPS_MIN": lambda: int(
-        int(os.getenv("VLLM_SM70_QSA_WARPS_MIN", "0"))
+        int(os.getenv("VLLM_SM70_QSA_WARPS_MIN", "4"))
     ),
     # SM70 round-4 D4a decode pre-attn fusion shadow (0 off / 1 fused v2 /
     # 2 reserved rung-2; see annotation block — d4a-spec.md §2.3).
@@ -1839,10 +1836,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM70_QSA_DECODE_FUSE", "0")
     ),
     "VLLM_SM70_QSA_PAGE4_SORT": lambda: os.getenv(
-        "VLLM_SM70_QSA_PAGE4_SORT", "torch"
+        "VLLM_SM70_QSA_PAGE4_SORT", "inline32"
     ),
     "VLLM_SM70_QSA_POS_FUSE": lambda: int(
-        os.getenv("VLLM_SM70_QSA_POS_FUSE", "0")
+        os.getenv("VLLM_SM70_QSA_POS_FUSE", "1")
     ),
     "VLLM_SM70_QSA_DECODE_LEX_TOPK": lambda: bool(
         int(os.getenv("VLLM_SM70_QSA_DECODE_LEX_TOPK", "0"))
@@ -1854,9 +1851,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SM70 selector: SM70 fp16 decode-GEMV method replacement (False,
     # default) vs the stock linear GEMM. Inert off exact-SM70 hardware.
-    "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
-    ),
     # Diagnostic: log every unquantized linear (prefix, shape) that the fp16
     # M=1 GEMV route inspects, plus whether a tuned plan matches it.
     "VLLM_SM70_GEMV_SHAPES": lambda: bool(
@@ -1864,13 +1858,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SM70 selector: fold the HC up-projection into the gate mix (one launch
     # instead of up GEMV + gate-mix). TP-agnostic; inert off exact SM70 fp16.
-    "VLLM_SM70_QWEN38_FUSED_HC_UP_GATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_UP_GATE", "0"))
-    ),
     # SM70 selector: fold the HC down-projection and its SiLU into one launch.
-    "VLLM_SM70_QWEN38_FUSED_HC_DOWN_SILU": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_DOWN_SILU", "0"))
-    ),
     # SM70 selector: fused checkpoint-fp16 GDN input preparation (False,
     # default). Inert off exact-SM70 hardware.
     "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
@@ -1883,7 +1871,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SM70 hierarchical AR shadow route mode (0 off / 1 decode-verify /
     # 2 +prefill; spec: ar-direction-spec.md §3).
-    "VLLM_SM70_AR_HIER": lambda: int(os.getenv("VLLM_SM70_AR_HIER", "0")),
+    "VLLM_SM70_AR_HIER": lambda: int(os.getenv("VLLM_SM70_AR_HIER", "1")),
     # Control file for per-launch mode flips ("" = static mode, zero file
     # I/O — the default-off off path stays byte-identical, rule 11670).
     "VLLM_SM70_AR_HIER_FILE": lambda: os.getenv(
@@ -1893,17 +1881,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM70_AR_HIER_MAX_BYTES", "262144")
     ),
     # Wire codec on the hierarchical legs (0/1/2; L1 layer knob).
-    "VLLM_SM70_AR_WIRE": lambda: int(os.getenv("VLLM_SM70_AR_WIRE", "0")),
+    "VLLM_SM70_AR_WIRE": lambda: int(os.getenv("VLLM_SM70_AR_WIRE", "3")),
     # Legacy alias (consulted only when VLLM_SM70_AR_WIRE is 0).
     "VLLM_SM70_AR_FP8_WIRE": lambda: int(os.getenv("VLLM_SM70_AR_FP8_WIRE", "0")),
     # Sidecar .so override (bench-only).
     "VLLM_SM70_AR_LIB": lambda: os.getenv("VLLM_SM70_AR_LIB", ""),
     # AR implementation selector: "hier" (default) or "replica".
-    "VLLM_SM70_AR_IMPL": lambda: os.getenv("VLLM_SM70_AR_IMPL", "hier"),
+    "VLLM_SM70_AR_IMPL": lambda: os.getenv("VLLM_SM70_AR_IMPL", "flat"),
     "VLLM_SM70_AR_FLAT_MAX_BYTES": lambda: int(
         os.getenv("VLLM_SM70_AR_FLAT_MAX_BYTES", "1048576")
     ),
-    "VLLM_SM70_AR_FLAT_S": lambda: int(os.getenv("VLLM_SM70_AR_FLAT_S", "4")),
+    "VLLM_SM70_AR_FLAT_S": lambda: int(os.getenv("VLLM_SM70_AR_FLAT_S", "8")),
     "VLLM_SM70_AR_FLAT_LIB": lambda: os.getenv("VLLM_SM70_AR_FLAT_LIB", ""),
     "VLLM_SM70_AR_REPLICA_LIB": lambda: os.getenv(
         "VLLM_SM70_AR_REPLICA_LIB", ""
