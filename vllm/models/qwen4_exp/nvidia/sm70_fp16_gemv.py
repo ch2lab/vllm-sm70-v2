@@ -269,6 +269,49 @@ def _qwen38_fp16_row_gemv2_kernel(
 
 
 @triton.jit
+def _qwen38_fp16_row_gemv2_splitk_kernel(
+    x_ptr,
+    weight_ptr,
+    part_ptr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    S: tl.constexpr,
+):
+    """Split-K variant of the two-row verify GEMV (one weight read, S CTAs/row).
+
+    The plain variant launches one CTA per output row and walks the whole K
+    reduction serially, so 160 CTAs read 0.82 MB at only ~100 GB/s (V100 floor
+    900): the projection is latency/occupancy bound, not bandwidth bound
+    (2026-10-31 profile: 57 calls/step x 8.2 us). Splitting K over S CTAs
+    multiplies the resident warps and lets the loads overlap; a tiny fp32
+    partial buffer is reduced afterwards.
+    """
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_K)
+    acc0 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    CHUNK: tl.constexpr = tl.cdiv(K, S * BLOCK_K) * BLOCK_K
+    start = split * CHUNK
+    for b in tl.static_range(0, CHUNK, BLOCK_K):
+        indices = start + b + offs
+        mask = indices < K
+        weight = tl.load(
+            weight_ptr + row * K + indices,
+            mask=mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        x0 = tl.load(x_ptr + indices, mask=mask, other=0.0).to(tl.float32)
+        x1 = tl.load(x_ptr + K + indices, mask=mask, other=0.0).to(tl.float32)
+        acc0 += x0 * weight
+        acc1 += x1 * weight
+    n_rows = tl.num_programs(0)
+    tl.store(part_ptr + split * n_rows + row, tl.sum(acc0, axis=0))
+    tl.store(part_ptr + (S + split) * n_rows + row, tl.sum(acc1, axis=0))
+
+
+@triton.jit
 def _qwen38_fp16_row_gemv3_kernel(
     x_ptr,
     weight_ptr,
@@ -364,6 +407,18 @@ def _qwen38_fp16_gdn_input_kernel(
     tl.store(a_out_ptr + ba_row - 12, value, mask=is_a)
 
 
+_SPLITK_BUFFERS: dict = {}
+
+
+def _splitk_buffer(splits: int, n: int, device) -> torch.Tensor:
+    key = (splits, n, str(device))
+    buf = _SPLITK_BUFFERS.get(key)
+    if buf is None:
+        buf = torch.zeros((2 * splits, n), dtype=torch.float32, device=device)
+        _SPLITK_BUFFERS[key] = buf
+    return buf
+
+
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
     return tensor.ndim == 2 and tensor.stride() == (tensor.shape[1], 1)
 
@@ -407,13 +462,28 @@ def _qwen38_sm70_fp16_gemv(
             num_warps=plan.num_warps,
         )
     elif rows == 2:
-        _qwen38_fp16_row_gemv2_kernel[(weight.shape[0],)](
-            x, weight, out,
-            K=weight.shape[1],
-            BLOCK_K=plan.block_k,
-            LOAD_POLICY=plan.load_policy,
-            num_warps=plan.num_warps,
-        )
+        splits = int(os.environ.get("VLLM_SM70_GEMV_SPLIT_K", "0") or 0)
+        if splits > 1:
+            n = weight.shape[0]
+            part = _splitk_buffer(splits, n, x.device)
+            _qwen38_fp16_row_gemv2_splitk_kernel[(n, splits)](
+                x, weight, part,
+                K=weight.shape[1],
+                BLOCK_K=plan.block_k,
+                S=splits,
+                num_warps=plan.num_warps,
+            )
+            out.copy_(
+                torch.stack([part[:splits].sum(0), part[splits:].sum(0)], 0).to(out.dtype)
+            )
+        else:
+            _qwen38_fp16_row_gemv2_kernel[(weight.shape[0],)](
+                x, weight, out,
+                K=weight.shape[1],
+                BLOCK_K=plan.block_k,
+                LOAD_POLICY=plan.load_policy,
+                num_warps=plan.num_warps,
+            )
     else:
         _qwen38_fp16_row_gemv3_kernel[(weight.shape[0],)](
             x, weight, out,
