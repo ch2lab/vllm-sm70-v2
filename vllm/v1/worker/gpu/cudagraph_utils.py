@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
-import uuid
 import itertools
 import os
 import numpy as np
@@ -11,40 +10,6 @@ from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
-
-_PROBE = os.environ.get("VLLM_SM70_MTP_PATH_DIAG") == "1"
-
-
-class _ProbeGraphs(dict):
-    """dict that reports every mutation of CudaGraphManager.graphs.
-
-    graphs is mutated in place (subscript assign / clear), so an
-    __setattr__ hook would never fire; this catches the actual writes and
-    prints a stack for the destructive ones.
-    """
-
-    _owner_uuid = "?"
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        if _PROBE:
-            print(
-                "[MTP SET] pid=%d uuid=%s add n=%d"
-                % (os.getpid(), self._owner_uuid, len(self)),
-                flush=True,
-            )
-
-    def clear(self):
-        if _PROBE and len(self):
-            import traceback as _tb
-            print(
-                "[MTP SET] pid=%d uuid=%s CLEAR from n=%d"
-                % (os.getpid(), self._owner_uuid, len(self)),
-                flush=True,
-            )
-            _tb.print_stack(limit=10)
-        super().clear()
-
 
 import torch
 import torch.nn as nn
@@ -221,11 +186,7 @@ class CudaGraphManager:
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
-        self._probe_uuid = uuid.uuid4().hex[:8]
-        self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = (
-            _ProbeGraphs()
-        )
-        self.graphs._owner_uuid = self._probe_uuid
+        self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
