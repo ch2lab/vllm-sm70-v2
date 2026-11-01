@@ -4,6 +4,9 @@
 因为 `sm70/*.md` 与 `sm70_tests/*` 都被 .gitignore，一旦换机或误改，调好的配置就会丢。
 **改这里之前先确认服务脚本，改服务脚本之后同步回来。**
 
+> 2026-11-01：**生产是 `/root/run/run_chat2.sh`**（独立服务、无 ipc daemon、`--load-format auto`）。
+> 参数与本快照的测试台一致，差异只有加载方式和 API 侧参数，见 `sm70/23_release_and_images.md` §3。
+
 ## 启动参数（逐字）
 
 ```
