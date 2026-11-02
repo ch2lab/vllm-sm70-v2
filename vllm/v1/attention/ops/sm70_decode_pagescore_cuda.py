@@ -297,11 +297,57 @@ void select_pages(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
       sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
 }
 
+
+// Mean mode: exact page-mean K over ALL tokens of every page, then one GEMV per
+// kv head. No sampling, so a short needle cannot be skipped by the sampler; the
+// cost is one linear pass over K (0.8 ms at 250K), amortised across layers.
+void select_pages_mean(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
+                       torch::Tensor kv_lens, torch::Tensor sel_bt,
+                       torch::Tensor sel_len, torch::Tensor kmean,
+                       int64_t npg, int64_t super_, int64_t n_pick_pages,
+                       int64_t sink, int64_t win) {
+  const int HQ = q.size(0), D = q.size(1);
+  const int H = kv.size(1) / 2;
+  const int NP = kv.size(2);
+  const int DD = D / 2, SD = D / 16;
+  const int page_bytes = 2 * (H * NP * DD + H * NP * SD);
+  const int G = HQ / H;
+  const int cols = (int)bt_row.numel();
+  const int nsuper = (int)((cols + super_ / npg - 1) / (super_ / npg));
+  const int per_sb = (int)(super_ / npg);
+  const int npages_max = cols;
+  auto opts = q.options();
+  // 1) page-mean K over every token: [H, cols, D]
+  dim3 g1(H, (cols + 15) / 16);
+  page_mean_k_kernel<<<g1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
+      kv_lens.data_ptr<int>(),
+      reinterpret_cast<__half*>(kmean.data_ptr<at::Half>()), D, NP, DD, SD,
+      page_bytes, cols, cols, 0, 16);
+  // 2) score = mean of the superblock's page means, per (kv head, superblock)
+  auto qf = q.to(torch::kFloat);                       // [HQ, D]
+  auto km = kmean.to(torch::kFloat);                   // [H, cols, D]
+  auto page_sc = at::bmm(km, qf.view({H, G, D}).mean(1).unsqueeze(-1))
+                     .squeeze(-1);                     // [H, cols]
+  // average the per-page scores inside each superblock
+  auto pad = per_sb - (cols % per_sb);
+  auto sc = page_sc;
+  if (pad != per_sb) sc = at::constant_pad_nd(sc, {0, pad}, 0);
+  auto scores = sc.view({H, -1, per_sb}).mean(2);       // [H, nsuper]
+  // 3) same rank/table kernel as the sampled path
+  dim3 g2(1, H);
+  build_table_kernel<<<g2, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
+      scores.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
+      kv_lens.data_ptr<int>(), (int)npg, (int)std::max<int64_t>(1, n_pick_pages / per_sb),
+      (int)sink, (int)win, sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("page_scores", &page_scores);
   m.def("page_mean_k", &page_mean_k);
   m.def("super_scores", &super_scores);
   m.def("select_pages", &select_pages);
+  m.def("select_pages_mean", &select_pages_mean);
 }
 """
 
@@ -333,6 +379,14 @@ def select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg=16, super_=256,
     """One call: score superblocks, exact top-k, build the compacted table."""
     _mod().select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg, super_,
                         samples, n_pick_pages, sink, win)
+    return sel_bt, sel_len
+
+
+def select_pages_mean(q, kv, bt_row, kvlens, sel_bt, sel_len, kmean, npg=16,
+                      super_=256, n_pick_pages=2048, sink=0, win=0):
+    """Page-mean selector: exact mean over all tokens of every page."""
+    _mod().select_pages_mean(q, kv, bt_row, kvlens, sel_bt, sel_len, kmean,
+                             npg, super_, n_pick_pages, sink, win)
     return sel_bt, sel_len
 
 
