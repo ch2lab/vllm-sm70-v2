@@ -299,11 +299,17 @@ def sm70_nvfp4_paged_decode(
     window_left: int,
     splits: int,
     workspace: torch.Tensor,
+    nqt: int = 1,
+    q0: int = 0,
+    _single: bool = False,
 ) -> None:
-    """In-kernel-dequant NVFP4 paged decode (q_len = 1 per request).
+    """In-kernel-dequant NVFP4 paged decode.
+
+    ``nqt`` consecutive query rows per request = spec-decode verify (k+1);
+    ``nqt == 1`` is the plain decode path.
 
     Args:
-        q: fp16 ``[num_reqs, num_qo_heads, D]`` queries (contiguous).
+        q: fp16 ``[num_reqs * nqt, num_qo_heads, D]`` queries (contiguous).
         kv_cache: raw uint8 layer cache ``[B, 2*H_kv, N, F]`` (LBHNC).
         block_table: int32 ``[num_reqs, max_blocks]`` (device).
         kv_lens: int32 ``[num_reqs]`` **device** per-request KV lengths.
@@ -319,6 +325,32 @@ def sm70_nvfp4_paged_decode(
             elements; the per-(request, kv head, split) partial state,
             reused across layers/steps.
     """
+    if nqt > 1 and not _single:
+        # Spec-decode verify: nqt consecutive query rows per request; position
+        # p attends causally up to its own token (the drafts are in the cache).
+        # Regular batches use row offsets (no copies); padded capture batches
+        # fall back to the per-position copy so shapes always line up.
+        from .sm70_nvfp4_decode_cuda import _rows_ok
+
+        base = kv_lens - (nqt - 1)
+        if _rows_ok(q, nqt, block_table):
+            for p in range(nqt):
+                sm70_nvfp4_paged_decode(
+                    q, kv_cache, block_table, base + p, out,
+                    k_scale, v_scale, sm_scale, window_left, splits, workspace,
+                    q0=p, nqt=nqt, _single=True,
+                )
+            return
+        R = q.shape[0] // nqt
+        for p in range(nqt):
+            out_p = torch.empty(R, q.shape[1], q.shape[2], dtype=out.dtype,
+                                device=out.device)
+            sm70_nvfp4_paged_decode(
+                q[p::nqt].contiguous(), kv_cache, block_table, base + p, out_p,
+                k_scale, v_scale, sm_scale, window_left, splits, workspace,
+            )
+            out[p::nqt] = out_p
+        return
     assert q.dtype == torch.float16 and out.dtype == torch.float16
     assert kv_cache.dtype == torch.uint8 and block_table.dtype == torch.int32
     _, two_h, N, F = kv_cache.shape
@@ -333,7 +365,7 @@ def sm70_nvfp4_paged_decode(
 
         if try_paged_decode_cuda(
             q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,
-            sm_scale, window_left, splits, workspace,
+            sm_scale, window_left, splits, workspace, nqt=nqt, q0=q0,
         ):
             return
     RP = triton.next_power_of_2(HQ // H)

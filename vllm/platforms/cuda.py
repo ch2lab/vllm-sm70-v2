@@ -93,6 +93,15 @@ def _get_backend_priorities(
     """Get backend priorities with lazy import to avoid circular dependency."""
     from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
+    # SM70/SM75 (Volta/Turing): FlashAttention's kernels require sm80+, so the
+    # auto-selection must not fall through to FlashAttention here (it fails at
+    # import time with "FlashAttention v2 not supported on this device" and
+    # kills the engine). FlashInfer is the only maintained path on these parts.
+    if not use_mla and device_capability.major == 7:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        return [AttentionBackendEnum.FLASHINFER]
+
     if use_mla:
         if device_capability.major == 10:
             # Sparse MLA backend priorities

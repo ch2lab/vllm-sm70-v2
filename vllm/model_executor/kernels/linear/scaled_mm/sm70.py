@@ -164,13 +164,24 @@ class Sm70Fp8DequantLinearKernel(FP8ScaledMMLinearKernel):
             in_f = (getattr(layer, "input_size_per_partition", None)
                     or getattr(layer, "embedding_dim", None)
                     or getattr(layer, "in_features", None))
+            # Orientation: this quant method stores the weight input-major
+            # ([in, out]) -- `_weight_deq = w * s` is fed straight to
+            # `a @ B` below -- so that branch must be tested first. Under TP a
+            # RowParallelLinear shard is square ([in/tp, in/tp]) and both
+            # predicates hold; testing the output-major one first would
+            # transpose the weight and silently corrupt every GDN/attention
+            # out_proj (TP1 hides it because its shard is never square).
             src = None
             if out_f is not None and in_f is not None:
-                if tuple(w.shape) == (int(out_f), int(in_f)):
-                    src = w.t()
-                elif tuple(w.shape) == (int(in_f), int(out_f)):
+                if tuple(w.shape) == (int(in_f), int(out_f)):
                     src = w
-            if src is not None and ws.numel() == int(out_f):
+                elif tuple(w.shape) == (int(out_f), int(in_f)):
+                    src = w.t()
+            if (
+                src is not None
+                and ws.numel() == int(out_f)
+                and int(src.shape[1]) == int(out_f)
+            ):
                 src = src.contiguous()
                 k, n = int(src.shape[0]), int(src.shape[1])
                 if n % 32 == 0 and k % 16 == 0:

@@ -18,7 +18,6 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
-import json
 import os
 import time
 from collections.abc import Iterable
@@ -194,48 +193,6 @@ from vllm.v1.worker.utils import (
     get_uniform_decode_token_count,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
-
-_SM70_STEP_SPLIT = os.environ.get("VLLM_SM70_STEP_SPLIT", "0") == "1"
-_sm70_split_buf: dict[str, list] = {}
-
-
-def _sm70_split_begin(key: str):
-    """Temporary diagnostic (default off): timestamp a decode-phase boundary."""
-    if not _SM70_STEP_SPLIT:
-        return None
-    ev = torch.cuda.Event(enable_timing=True)
-    ev.record()
-    return ev
-
-
-def _sm70_split_end(key: str, ev) -> None:
-    if ev is None:
-        return
-    end = torch.cuda.Event(enable_timing=True)
-    end.record()
-    buf = _sm70_split_buf.setdefault(key, [])
-    buf.append((ev, end))
-    if len(buf) >= 16:
-        torch.cuda.synchronize()
-        times = [a.elapsed_time(b) for a, b in buf]
-        del buf[:]
-        try:
-            with open(f"/tmp/sm70_step_split_{os.getpid()}.jsonl", "a") as fh:
-                fh.write(
-                    json.dumps(
-                        {
-                            "pid": os.getpid(),
-                            "key": key,
-                            "n": len(times),
-                            "mean_ms": sum(times) / len(times),
-                            "min_ms": min(times),
-                            "max_ms": max(times),
-                        }
-                    )
-                    + "\n"
-                )
-        except OSError:
-            pass
 
 logger = init_logger(__name__)
 
@@ -2162,7 +2119,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output, input_batch)
-                _sm70_t = _sm70_split_begin("target")
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
                     model_output = self.ubatch_runner.run(
@@ -2179,7 +2135,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
-                _sm70_split_end("target", _sm70_t)
 
         self.kv_connector.finish_forward()
 
@@ -2382,7 +2337,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
-            _sm70_d = _sm70_split_begin("draft")
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2400,7 +2354,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
-            _sm70_split_end("draft", _sm70_d)
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens

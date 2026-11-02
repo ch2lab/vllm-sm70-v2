@@ -620,23 +620,32 @@ def _sm70_fp8_dequant_kernel(
 _LUT_CACHE: dict = {}
 
 
-def _e4m3_lut(device: torch.device) -> torch.Tensor:
-    """256-entry E4M3 (float8_e4m3fn) code -> fp16 value table, per-device.
+def _fp8_lut(device: torch.device, dtype: str = "fp8_e4m3") -> torch.Tensor:
+    """256-entry FP8 code -> fp16 value table, per (device, fp8 flavour).
 
-    Built from torch's own fp8 dtype so the byte -> value mapping is exactly
-    the format the FP8 KV cache stores (no hard-coded e4m3fn table). torch maps
-    the reserved top codes (0x7F / 0xFF) to NaN; those are clamped to the
-    finite max (448) so a stray code cannot poison the shadow KV buffer.
+    Built from torch's own fp8 dtypes so the byte -> value mapping is exactly
+    the format the KV cache stores. e4m3 and e5m2 have different encodings, so
+    the table must follow ``--kv-cache-dtype`` (the cache itself is handed to
+    the kernel as raw uint8). Non-finite codes (reserved/NaN/inf) are clamped
+    to the format's finite max so a stray byte cannot poison the shadow buffer.
     """
-    key = str(device)
+    tor = torch.float8_e5m2 if "e5m2" in dtype else torch.float8_e4m3fn
+    finite_max = 57344.0 if tor is torch.float8_e5m2 else 448.0
+    key = (str(device), str(tor))
     lut = _LUT_CACHE.get(key)
     if lut is None:
         codes = torch.arange(256, dtype=torch.uint8, device=device)
-        vals = codes.view(torch.float8_e4m3fn).to(torch.float16)
-        vals = torch.where(torch.isfinite(vals), vals, torch.full_like(vals, 448.0))
+        vals = codes.view(tor).to(torch.float16)
+        vals = torch.where(torch.isfinite(vals), vals,
+                           torch.full_like(vals, finite_max))
         lut = vals.contiguous()
         _LUT_CACHE[key] = lut
     return lut
+
+
+def _e4m3_lut(device: torch.device) -> torch.Tensor:
+    """Back-compat shim: the e4m3 table."""
+    return _fp8_lut(device, "fp8_e4m3")
 
 
 def sm70_fp8_paged_dequant(
@@ -646,6 +655,10 @@ def sm70_fp8_paged_dequant(
     out: torch.Tensor,
     k_scale: float,
     v_scale: float,
+    sreq: torch.Tensor | None = None,
+    st0: torch.Tensor | None = None,
+    toks: torch.Tensor | None = None,
+    lut: torch.Tensor | None = None,
 ) -> None:
     """Dequantize paged FP8 KV into an fp16 shadow paged buffer.
 
@@ -699,20 +712,24 @@ def sm70_fp8_paged_dequant(
             file=sys.stderr,
             flush=True,
         )
-    sreq, st0 = _shadow_block_maps(B_s, kv_lens, PAGE, kv_cache.device)
     # Valid token count per shadow block: every block is a full page except
     # each request's last one (kv_len % PAGE tokens). Block-table columns
     # beyond the valid prefix are stale (ids left by earlier steps); the
     # kernel zero-fills the tail instead of dereferencing them.
-    toks = torch.full((B_s,), PAGE, dtype=torch.int32)
-    kv_cpu = kv_lens.tolist()
-    base = 0
-    for ln in kv_cpu:
-        nb = (ln + PAGE - 1) // PAGE
-        if nb:
-            toks[base + nb - 1] = ln % PAGE or PAGE
-        base += nb
-    toks = toks.to(kv_cache.device)
+    #
+    # The decode path runs inside CUDA graph capture, where a host sync or an
+    # H2D copy aborts the process, so the metadata builder precomputes
+    # (sreq, st0, toks) on the device and passes them in. Only the non-captured
+    # paths (prefill) fall back to building them here from the host kv_lens.
+    if toks is None or sreq is None or st0 is None:
+        nb = (kv_lens + (PAGE - 1)) // PAGE
+        base = torch.cumsum(nb, 0) - nb
+        sreq, st0 = _shadow_block_maps(B_s, kv_lens, PAGE, kv_cache.device)
+        last = torch.where(kv_lens % PAGE == 0, PAGE, kv_lens % PAGE)
+        toks = torch.full((B_s,), PAGE, dtype=torch.int32)
+        _has = nb > 0
+        toks[(base + nb - 1)[_has]] = last[_has]
+        toks = toks.to(kv_cache.device)
 
     if os.environ.get("VLLM_SM70_SHADOW_PTR") == "1":
         import sys as _psys
@@ -787,20 +804,22 @@ def sm70_fp8_paged_dequant(
             import sys as _dsys2
 
             print(f"[DQDUMP] dump failed: {_de}", file=_dsys2.stderr)
-    # IMA canary: expected plan tensors (tiny; always computed) so cross-op
-    # canary hooks (sm70_canary_check) can verify sreq/st0 at any point.
-    _exp_sreq = torch.zeros(B_s, dtype=torch.int32)
-    _exp_st0 = torch.zeros(B_s, dtype=torch.int32)
-    _base = 0
-    for _r in range(len(kv_cpu)):
-        _nb = (kv_cpu[_r] + PAGE - 1) // PAGE
-        if _nb:
-            _exp_sreq[_base : _base + _nb] = _r
-            _exp_st0[_base : _base + _nb] = torch.arange(
-                _nb, dtype=torch.int32
-            ) * PAGE
-        _base += _nb
+    # IMA canary: expected plan tensors, rebuilt from the host kv_lens. Only
+    # under the canary env: this is a host sync plus a Python loop, both
+    # illegal (and wasteful) inside CUDA graph capture.
     if os.environ.get("VLLM_SM70_SHADOW_CANARY") == "1":
+        kv_cpu = kv_lens.tolist()
+        _exp_sreq = torch.zeros(B_s, dtype=torch.int32)
+        _exp_st0 = torch.zeros(B_s, dtype=torch.int32)
+        _base = 0
+        for _r in range(len(kv_cpu)):
+            _nb = (kv_cpu[_r] + PAGE - 1) // PAGE
+            if _nb:
+                _exp_sreq[_base : _base + _nb] = _r
+                _exp_st0[_base : _base + _nb] = torch.arange(
+                    _nb, dtype=torch.int32
+                ) * PAGE
+            _base += _nb
         try:
             import sys as _csys
             import torch.distributed as _cdist
@@ -821,6 +840,14 @@ def sm70_fp8_paged_dequant(
             import sys as _csys2
 
             print(f"[SREQCORRUPT] canary check failed: {_ce}", file=_csys2.stderr)
+        sm70_fp8_paged_dequant._canary = (
+            sreq,
+            st0,
+            _exp_sreq,
+            _exp_st0,
+            f"kv_lens={kv_cpu}",
+        )
+
     # IMA bisection valve: full-device sync BEFORE the (driver-API, async)
     # Triton launch. Any still-unreported device error is raised HERE with a
     # clean torch.cuda.synchronize traceback, pinning the fault to the ops
@@ -838,17 +865,9 @@ def sm70_fp8_paged_dequant(
                 flush=True,
             )
             raise
-    # Always park the current plan tensors for the cross-op canary hooks.
-    sm70_fp8_paged_dequant._canary = (
-        sreq,
-        st0,
-        _exp_sreq,
-        _exp_st0,
-        f"kv_lens={kv_cpu}",
-    )
     _sm70_fp8_dequant_kernel[grid](
         kv_u8,
-        _e4m3_lut(kv_cache.device),
+        lut if lut is not None else _e4m3_lut(kv_cache.device),
         block_table,
         sreq,
         st0,

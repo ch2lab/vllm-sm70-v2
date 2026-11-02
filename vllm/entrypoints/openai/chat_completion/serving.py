@@ -3,6 +3,7 @@
 
 import asyncio
 import itertools
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -392,6 +393,21 @@ class OpenAIServingChat(GenerateBaseServing):
                     self.default_sampling_params,
                 )
 
+            # Lightweight sampling audit: lets a deployment confirm which
+            # sampling parameters a client actually sent (no prompt content).
+            if os.environ.get("VLLM_LOG_SAMPLING") == "1":
+                logger.info(
+                    "sampling[%s] temp=%s top_p=%s top_k=%s presence=%s "
+                    "frequency=%s repetition=%s max_tokens=%s",
+                    sub_request_id,
+                    getattr(sampling_params, "temperature", None),
+                    getattr(sampling_params, "top_p", None),
+                    getattr(sampling_params, "top_k", None),
+                    getattr(sampling_params, "presence_penalty", None),
+                    getattr(sampling_params, "frequency_penalty", None),
+                    getattr(sampling_params, "repetition_penalty", None),
+                    getattr(sampling_params, "max_tokens", None),
+                )
             self._log_inputs(
                 sub_request_id,
                 engine_input,

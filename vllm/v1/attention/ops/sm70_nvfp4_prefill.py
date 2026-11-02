@@ -220,6 +220,9 @@ def sm70_nvfp4_paged_prefill(
     window_left: int,
     max_q_len: int,
     bt: int = BT_Q,
+    kv_fp8: bool = False,
+    kv_fp16: bool = False,
+    lut: torch.Tensor | None = None,
 ) -> None:
     """In-kernel-dequant NVFP4 paged PREFILL (varlen, causal, GQA).
 
@@ -240,6 +243,12 @@ def sm70_nvfp4_paged_prefill(
         max_q_len: **host** largest per-request query length (grid sizing;
             avoids a device sync in the hot per-layer path).
         bt: q tile size (power of two, >= 16 required by tl.dot).
+        kv_fp8: the cache holds one fp8 byte per element ``[B, H_kv, N, 2D]``
+            instead of packed NVFP4 (``kv_cache`` must then be the uint8 view).
+        kv_fp16: same geometry with 2-byte elements; the cache must be the
+            uint8 view and ``k_scale``/``v_scale`` must be 1.0 (fp16 KV is
+            never scaled by the checkpoint's fp8 scheme).
+        lut: 256-entry fp8 code -> fp16 table (required when ``kv_fp8``).
     """
     assert q.dtype == torch.float16 and out.dtype == torch.float16
     assert kv_cache.dtype == torch.uint8 and block_table.dtype == torch.int32
@@ -247,6 +256,15 @@ def sm70_nvfp4_paged_prefill(
     assert bt >= 16 and (bt & (bt - 1)) == 0
     # Optional hand-written WMMA kernel (env-gated; default off -> unchanged).
     # Shape-gated + falls back to the Triton kernel below on any mismatch.
+    if os.environ.get("VLLM_SM70_PREFILL_TWOPASS") == "1":
+        from .sm70_nvfp4_prefill_twopass import try_paged_prefill_twopass
+
+        if try_paged_prefill_twopass(
+            q, kv_cache, block_table, qo_indptr, kv_lens, out, k_scale, v_scale,
+            sm_scale, window_left, max_q_len,
+            kv_fp8=kv_fp8, kv_fp16=kv_fp16, lut=lut,
+        ):
+            return
     if os.environ.get("VLLM_SM70_PREFILL_CUDA") == "1":
         from .sm70_nvfp4_prefill_cuda import try_paged_prefill_cuda
 
@@ -256,6 +274,11 @@ def sm70_nvfp4_paged_prefill(
         ):
             return
     _, two_h, N, F = kv_cache.shape
+    if kv_fp8 or kv_fp16:
+        raise RuntimeError(
+            "SM70 fp8/fp16 KV prefill needs the two-pass kernel; it declined "
+            "this shape (set VLLM_SM70_TWOPASS_DEBUG=1 for the reason)."
+        )
     H = two_h // 2
     D = 2 * (F * 8 // 9)
     R = block_table.shape[0]

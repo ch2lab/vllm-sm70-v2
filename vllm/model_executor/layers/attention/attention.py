@@ -215,8 +215,16 @@ def _init_kv_cache_quant(
                 cast(CompressedTensorsConfig, quant_method.quant_config).kv_cache_scheme
                 is not None
             ):
-                raise ValueError(
-                    "fp8_e5m2 kv-cache is not supported with fp8 checkpoints."
+                # The checkpoint's KV scales were calibrated for e4m3; e5m2 has
+                # a wider range and two mantissa bits, so the same per-tensor
+                # scale still maps values into range but with coarser
+                # resolution. Allowed (SM70 has no native fp8 attention and
+                # runs every fp8 KV dtype through the same shadow dequant), with
+                # a loud warning instead of a hard refusal.
+                logger.warning_once(
+                    "fp8_e5m2 kv-cache with a checkpoint that declares e4m3 KV "
+                    "scales: values are quantized to e5m2 using an e4m3 "
+                    "calibrated scale -- lower accuracy than e4m3 is expected."
                 )
         # If quantization is enabled, we make "k_scale" and "v_scale"
         # parameters so that it can be loaded from the model checkpoint.

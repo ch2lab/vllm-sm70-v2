@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
-import os
 import torch
 import torch.nn as nn
 
@@ -23,8 +22,6 @@ from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 logger = init_logger(__name__)
 
-_MTP_PATH_DIAG = os.environ.get("VLLM_SM70_MTP_PATH_DIAG") == "1"
-_MTP_PATH_N = 0
 
 
 class TargetDependentARSpeculator(DraftModelSpeculator):
@@ -529,10 +526,6 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         seq_lens_cpu_upper_bound: torch.Tensor,
         num_speculative_steps: int,
     ) -> None:
-        global _MTP_PATH_N
-        if _MTP_PATH_DIAG and _MTP_PATH_N < 3:
-            _MTP_PATH_N += 1
-            print(f"[MTP PATH] _multi_step_decode cg_mode={batch_desc.cg_mode} k={num_speculative_steps}", flush=True)
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
@@ -589,10 +582,6 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        global _MTP_PATH_N
-        if _MTP_PATH_DIAG and _MTP_PATH_N < 3:
-            _MTP_PATH_N += 1
-            print(f"[MTP PATH] _fused_multi_step_decode cg_mode={batch_desc.cg_mode} k={num_speculative_steps}", flush=True)
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             for groups in self.attn_groups:
                 for group in groups:

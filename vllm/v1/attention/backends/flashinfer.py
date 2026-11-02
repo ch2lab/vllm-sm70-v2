@@ -88,6 +88,8 @@ from vllm.v1.attention.ops.dcp import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.sm70_nvfp4_decode import sm70_nvfp4_paged_decode
+from vllm.v1.attention.ops.sm70_nvfp4_decode_cuda import paged_decode_fp8
+from vllm.v1.attention.ops.sm70_nvfp4_decode_cuda import paged_decode_fp16
 from vllm.v1.attention.ops.sm70_flashdecode import (
     sm70_flashdecode_op,
     sm70_grouped_verify_op,
@@ -96,6 +98,7 @@ from vllm.v1.attention.ops.sm70_nvfp4_dequant import (
     sm70_fp8_paged_dequant,
     sm70_nvfp4_paged_dequant,
     sm70_nvfp4_paged_stage_nhd,
+    _fp8_lut,
     sm70_shadow_plan_tensors,
 )
 from vllm.v1.attention.ops.sm70_nvfp4_prefill import sm70_nvfp4_paged_prefill
@@ -114,6 +117,10 @@ from vllm.v1.utils import CpuGpuBuffer
 # transient fp16 shadow prefill). Read once per process; builder and impl
 # in the same worker process agree on the value.
 _SM70_NATIVE_PREFILL = os.environ.get("VLLM_SM70_NATIVE_PREFILL", "0") == "1"
+# fp8 KV decode reads the cache directly (in-kernel LUT dequant) instead of
+# staging an fp16 shadow + FA2 plan: graph-safe and ~2x faster. Set
+# VLLM_SM70_FP8_NATIVE=0 to fall back to the shadow path.
+_SM70_FP8_NATIVE = os.environ.get("VLLM_SM70_FP8_NATIVE", "1") == "1"
 
 # FlashDecoding split-count multiplier (SM70 NVFP4 unified decode kernel).
 # The split-KV block is small (128 thr, ~12KB smem) so each SM hosts ~8 of
@@ -968,8 +975,16 @@ class FIDecode:
     """SM70 NVFP4: device block table slice for the shadow dequant."""
     shadow_kv_lens_dev: torch.Tensor | None = None
     """SM70 NVFP4 graph decode: device int32 [num_reqs] KV lengths."""
+    shadow_sreq: torch.Tensor | None = None
+    """SM70 FP8 graph decode: device int32 [B_s] shadow block -> request."""
+    shadow_st0: torch.Tensor | None = None
+    """SM70 FP8 graph decode: device int32 [B_s] shadow block -> first token."""
+    shadow_toks: torch.Tensor | None = None
+    """SM70 FP8 graph decode: device int32 [B_s] valid tokens per block."""
     shadow_num_reqs: int = 0
     """SM70 NVFP4: decode batch size (fixed per captured graph)."""
+    shadow_nqt: int = 1
+    """SM70: query positions per request (k+1 under spec decode)."""
     seq_lens_source: torch.Tensor | None = None
     """SM70 NVFP4: device seq_lens this step's kv-lens were built from."""
     shadow_splits: int = 0
@@ -1208,6 +1223,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
+            self.sm70_fp16_native = False
             self.cache_dtype = self.cache_config.cache_dtype
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
@@ -1289,6 +1305,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.sm70_fp8_shadow = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
+            # SM70 fp16 KV: no dequant is needed, but the stock flashinfer
+            # paged kernels mis-handle head_dim 256 on sm_70, so read the
+            # cache with the same XQA / two-pass kernels (KVFP16 builds).
+            self.sm70_fp16_native = (
+                self.kv_cache_dtype == torch.float16
+                and current_platform.is_device_capability(70)
+            )
 
         # SM70 splitd D256 paged prefill (1Cat port): exact-tile WMMA kernel
         # on an fp16 NHD KV stage, replacing the FA2 prefill run for steps
@@ -1421,6 +1444,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             1,
             supports_spec_as_decode=(
                 self.flashinfer_trtllm_api_decode_kernel is not None
+                # SM70 native decode (nvfp4 / fp8-native / fp16) takes a fixed
+                # query length per request and is spec-as-decode capable: the
+                # verify rows (q = k+1) must be classified as decode, otherwise
+                # they fall into the prefill kernels, which on sm_70 are both
+                # slower and wrong at head_dim 256.
+                or self.sm70_nvfp4_shadow
+                or (self.sm70_fp8_shadow and _SM70_FP8_NATIVE)
+                or self.sm70_fp16_native
             ),
             # trtllm-gen decode receives no cp_rank/global-seq-len information,
             # so its end-aligned causal mask is wrong for q_len > 1 over the
@@ -1496,7 +1527,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # split-KV partial-state workspace is the only persistent allocation
         # (~1 MB): the grid is (R, H_kv, splits) with
         # R*H_kv*splits <= SM_COUNT + R*H_kv, bounded below.
-        if self.sm70_nvfp4_shadow:
+        if (self.sm70_nvfp4_shadow
+                or (self.sm70_fp8_shadow and _SM70_FP8_NATIVE)
+                or self.sm70_fp16_native):
             self._sm70_sm_count = torch.cuda.get_device_properties(
                 self.device
             ).multi_processor_count
@@ -1596,6 +1629,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
         """Get the cudagraph support level for FlashInfer attention."""
+        # SM70 FP8 KV: the read side dequantizes the paged fp8 cache into a
+        # per-step fp16 shadow buffer, and that shadow's paged plan (block ->
+        # request / first token maps, per-block token counts) plus the launch
+        # grid all change with the KV lengths. A captured graph pins the
+        # capture-time plan, so replays decode from stale pointers (measured:
+        # first token correct, everything after it garbage). Refuse graphs here
+        # so vLLM falls back to eager instead of silently corrupting decode.
+        if (
+            current_platform.is_device_capability(70)
+            and vllm_config.cache_config.cache_dtype.startswith("fp8")
+            and not _SM70_FP8_NATIVE
+        ):
+            return AttentionCGSupport.NEVER
+        # SM70 native readers (nvfp4 / fp8-native / fp16) take a fixed number
+        # of query rows per request (nqt = k+1 under spec decode) and are
+        # graph-safe, so spec-decode can keep full (uniform-batch) graphs
+        # instead of being downgraded to PIECEWISE.
+        if current_platform.is_device_capability(70):
+            return AttentionCGSupport.UNIFORM_BATCH
         # XQA lacks LSE for DCP; DCP also cannot graph variable-length trtllm-gen.
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -2076,6 +2128,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_decode_tokens = 0
             num_prefill_tokens = num_actual_tokens
 
+        # SM70 native readers (nvfp4 / fp8-native / fp16) build their decode
+        # metadata from device tensors only, so a pure-decode step does not
+        # need the host seq_lens (which costs one device sync per attention
+        # layer). Platform+model condition, no env switch.
+        _sm70_native_decode = (
+            num_prefills == 0
+            and num_decodes > 0
+            and self.enable_cuda_graph  # needs the persistent kv-lens buffer
+            and (
+                self.sm70_nvfp4_shadow
+                or (self.sm70_fp8_shadow and _SM70_FP8_NATIVE)
+                or self.sm70_fp16_native
+            )
+        )
+
         page_size = self.page_size
         max_seq_len = common_attn_metadata.max_seq_len
         seq_lens = common_attn_metadata.seq_lens
@@ -2169,10 +2236,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         needs_seq_lens_cpu = self.use_dcp or not all_uses_trtllm
         if needs_seq_lens_cpu:
             if (
-                self._num_speculative_tokens == 0
+                (self._num_speculative_tokens == 0 or _sm70_native_decode)
                 and common_attn_metadata.seq_lens_cpu_upper_bound is not None
             ):
                 # No speculative token accounting, so the upper bound is exact.
+                # For the SM70 native decode path the host lengths only feed a
+                # paged plan this branch never reads, so the upper bound is
+                # fine and saves a per-layer device sync.
                 seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             else:
                 with gpu_sync_allowed():
@@ -2219,7 +2289,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         needs_native_paged_decode = (
             num_decodes > 0 and not decode_with_flashinfer_trtllm_api
         )
-        needs_paged_kv_indices = needs_native_paged_prefill or needs_native_paged_decode
+        needs_paged_kv_indices = (
+            needs_native_paged_prefill or needs_native_paged_decode
+        ) and not _sm70_native_decode
         if needs_paged_kv_indices:
             assert num_blocks_np is not None
             assert seq_lens_np is not None
@@ -2374,7 +2446,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # degenerate output, while prefill-only steps are exact).
                     # Falling back keeps the proven fp16-shadow path there.
                     native_prefill = (
-                        self.sm70_nvfp4_shadow
+                        (self.sm70_nvfp4_shadow
+                         or (self.sm70_fp8_shadow and _SM70_FP8_NATIVE)
+                         or self.sm70_fp16_native)
                         and _SM70_NATIVE_PREFILL
                         and prefill_start == 0
                     )
@@ -2409,7 +2483,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     plan_last = paged_kv_last_page_len_prefill_cpu
                     plan_kv_dtype = self.kv_cache_dtype
                     if (
-                        (self.sm70_nvfp4_shadow or self.sm70_fp8_shadow)
+                        (self.sm70_nvfp4_shadow or self.sm70_fp8_shadow
+                         or self.sm70_fp16_native)
                         and not _sm70_raw_verify
                     ):
                         if native_prefill:
@@ -2715,27 +2790,41 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 o_dtype = _nvfp4_o_dtype(
                     self.is_kvcache_nvfp4, self.model_config.dtype
                 )
-                paged_kv_indptr_cpu = self.paged_kv_indptr.cpu[: num_input_tokens + 1]
-                paged_kv_last_page_len_cpu = self.paged_kv_last_page_len.cpu[
-                    :num_input_tokens
-                ]
-                # plan() copies these to the GPU with non_blocking=True;
-                # stage them in pinned memory so the copies stay async
-                # (the reused buffers themselves are intentionally not pinned).
-                if PIN_MEMORY:
-                    paged_kv_indptr_cpu = paged_kv_indptr_cpu.pin_memory()
-                    paged_kv_last_page_len_cpu = paged_kv_last_page_len_cpu.pin_memory()
-                # plan() also copies kv_lens to the GPU with non_blocking=True
-                # (trtllm-gen/cute-dsl backends), deriving them via
-                # get_seq_lens() into unpinned memory when seq_lens is not
-                # passed; pass an explicit pinned copy of the same values
-                # so that copy stays async too.
-                kv_lens_decode_cpu = get_seq_lens(
-                    paged_kv_indptr_cpu, paged_kv_last_page_len_cpu, page_size
-                )
-                if PIN_MEMORY:
-                    kv_lens_decode_cpu = kv_lens_decode_cpu.pin_memory()
-                if self.sm70_fp8_shadow:
+                if _sm70_native_decode:
+                    # The native readers take only the device kv-lens buffer,
+                    # so skip the host paged plan entirely: two buffer slices,
+                    # three pinned allocations and get_seq_lens() per attention
+                    # layer per step.
+                    kv_lens_decode_cpu = None
+                else:
+                    paged_kv_indptr_cpu = self.paged_kv_indptr.cpu[
+                        : num_input_tokens + 1
+                    ]
+                    paged_kv_last_page_len_cpu = (
+                        self.paged_kv_last_page_len.cpu[:num_input_tokens]
+                    )
+                    # plan() copies these to the GPU with non_blocking=True;
+                    # stage them in pinned memory so the copies stay async
+                    # (the reused buffers themselves are intentionally not
+                    # pinned).
+                    if PIN_MEMORY:
+                        paged_kv_indptr_cpu = paged_kv_indptr_cpu.pin_memory()
+                        paged_kv_last_page_len_cpu = (
+                            paged_kv_last_page_len_cpu.pin_memory()
+                        )
+                    # plan() also copies kv_lens to the GPU with
+                    # non_blocking=True (trtllm-gen/cute-dsl backends),
+                    # deriving them via get_seq_lens() into unpinned memory
+                    # when seq_lens is not passed; pass an explicit pinned
+                    # copy of the same values so that copy stays async too.
+                    kv_lens_decode_cpu = get_seq_lens(
+                        paged_kv_indptr_cpu,
+                        paged_kv_last_page_len_cpu,
+                        page_size,
+                    )
+                    if PIN_MEMORY:
+                        kv_lens_decode_cpu = kv_lens_decode_cpu.pin_memory()
+                if self.sm70_fp8_shadow and not _SM70_FP8_NATIVE:
                     # SM70 FP8: the flashinfer fp8 paged decode kernel is not
                     # sm_70-safe (V100 has no FP8 hardware), so the read side
                     # dequants this layer's paged fp8 cache to an fp16 shadow
@@ -2775,48 +2864,82 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.decode_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
+                    # Precompute the shadow block maps / token counts here:
+                    # the forward runs inside CUDA graph capture, where the
+                    # host sync + H2D copy those need would abort the process.
+                    _cnt = (plan_indptr[1:] - plan_indptr[:-1]).to(torch.int64)
+                    _rep = torch.repeat_interleave(
+                        torch.arange(_cnt.numel(), dtype=torch.int64), _cnt)
+                    _base = torch.repeat_interleave(
+                        plan_indptr[:-1].to(torch.int64), _cnt)
+                    _dev = self.paged_kv_indptr.gpu.device
+                    shadow_sreq = _rep.to(torch.int32).to(_dev, non_blocking=True)
+                    shadow_st0 = (
+                        (torch.arange(shadow_blocks, dtype=torch.int64) - _base)
+                        * self.page_size
+                    ).to(torch.int32).to(_dev, non_blocking=True)
+                    _toks_cpu = torch.full(
+                        (shadow_blocks,), self.page_size, dtype=torch.int32)
+                    _last = shadow_kv_lens % self.page_size
+                    _last = torch.where(_last == 0, self.page_size, _last)
+                    _idx = plan_indptr[1:].to(torch.int64) - 1
+                    _valid = _cnt > 0
+                    _toks_cpu[_idx[_valid]] = _last[_valid]
+                    shadow_toks = _toks_cpu.to(_dev, non_blocking=True)
                     attn_metadata.decode = FIDecode(
                         wrapper=decode_wrapper,
                         shadow_kv=shadow_kv,
                         shadow_kv_lens=shadow_kv_lens,
                         block_tables=block_table_tensor[:num_input_tokens],
+                        shadow_sreq=shadow_sreq,
+                        shadow_st0=shadow_st0,
+                        shadow_toks=shadow_toks,
                     )
-                elif self.sm70_nvfp4_shadow:
+                elif (self.sm70_nvfp4_shadow
+                      or (self.sm70_fp8_shadow and _SM70_FP8_NATIVE)
+                      or self.sm70_fp16_native):
                     # SM70 NVFP4: the in-kernel-dequant split-KV paged decode
                     # (sm70_nvfp4_paged_decode) reads the packed NVFP4 cache
                     # directly — no fp16 shadow buffer and no FA2 decode plan.
                     # Per-step state is only the device kv-lens buffer; graph
                     # replays refresh it via the pinned copy.
-                    assert num_input_tokens == num_decodes
+                    # Spec decode: each request owns nqt consecutive query
+                    # rows (verified drafts); per-request state stays at
+                    # num_decodes entries.
+                    nqt = max(1, num_input_tokens // max(num_decodes, 1))
+                    assert nqt * num_decodes == num_input_tokens
+                    # ``copy_`` casts dtype in place: no per-layer temporary
+                    # (``.to(int32)`` here used to allocate one per attention
+                    # layer per step, which showed up as 12+ aten::_to_copy
+                    # calls in the CPU profile).
                     if use_cudagraph:
                         if kv_lens_decode_cpu is None:
-                            self._sm70_kvlens_dev[:num_input_tokens].copy_(
-                                common_attn_metadata.seq_lens[
-                                    :num_input_tokens
-                                ]
+                            self._sm70_kvlens_dev[:num_decodes].copy_(
+                                common_attn_metadata.seq_lens[:num_decodes]
                             )
                         else:
-                            self._sm70_kvlens_pinned[
-                                :num_input_tokens
-                            ].copy_(kv_lens_decode_cpu.to(torch.int32))
-                            self._sm70_kvlens_dev[:num_input_tokens].copy_(
-                                self._sm70_kvlens_pinned[:num_input_tokens],
+                            self._sm70_kvlens_pinned[:num_decodes].copy_(
+                                kv_lens_decode_cpu[:num_decodes]
+                            )
+                            self._sm70_kvlens_dev[:num_decodes].copy_(
+                                self._sm70_kvlens_pinned[:num_decodes],
                                 non_blocking=True,
                             )
-                        kvlens_dev = self._sm70_kvlens_dev[:num_input_tokens]
+                        kvlens_dev = self._sm70_kvlens_dev[:num_decodes]
                     else:
-                        kvlens_dev = (
-                            common_attn_metadata.seq_lens[
-                                :num_input_tokens
-                            ].to(torch.int32)
-                            if kv_lens_decode_cpu is None
-                            else kv_lens_decode_cpu.to(
-                                self.device, non_blocking=True
+                        if kv_lens_decode_cpu is None:
+                            self._sm70_kvlens_dev[:num_decodes].copy_(
+                                common_attn_metadata.seq_lens[:num_decodes]
                             )
-                        )
+                        else:
+                            self._sm70_kvlens_dev[:num_decodes].copy_(
+                                kv_lens_decode_cpu[:num_decodes],
+                                non_blocking=True,
+                            )
+                        kvlens_dev = self._sm70_kvlens_dev[:num_decodes]
                     # Fill the SMs: the split kernel's grid is
                     # (num_reqs, num_kv_heads, splits).
-                    rh = num_input_tokens * self.num_kv_heads
+                    rh = num_decodes * self.num_kv_heads
                     splits = (
                         self._sm70_sm_count * _SM70_FD_SPLIT_FACTOR
                         + rh - 1
@@ -2824,9 +2947,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     attn_metadata.decode = FIDecode(
                         wrapper=decode_wrapper,
                         shadow_kv_lens=kv_lens_decode_cpu,
-                        block_tables=block_table_tensor[:num_input_tokens],
+                        block_tables=block_table_tensor[:num_decodes],
                         shadow_kv_lens_dev=kvlens_dev,
-                        shadow_num_reqs=num_input_tokens,
+                        shadow_num_reqs=num_decodes,
+                        shadow_nqt=nqt,
                         shadow_splits=splits,
                         shadow_ws=self._sm70_ws,
                         seq_lens_source=common_attn_metadata.seq_lens,
@@ -2948,6 +3072,13 @@ class FlashInferImpl(AttentionImpl):
         # sm_70-safe). Parallel to sm70_nvfp4_shadow.
         self.sm70_fp8_shadow = (
             kv_cache_dtype.startswith("fp8") and sm70_flashinfer_attn_enabled()
+        )
+        # SM70 fp16 KV: read the cache with the XQA / two-pass kernels
+        # (stock paged kernels mis-handle head_dim 256 on sm_70).
+        self.sm70_fp16_native = (
+            kv_cache_dtype in ("auto", "float16", "fp16")
+            and current_platform.is_device_capability(70)
+            and head_size == 256
         )
         # SM70 splitd D256 paged prefill (1Cat port). The builder decides
         # per-step admission (sm70_splitd_admit); this only gates whether
@@ -3453,10 +3584,6 @@ class FlashInferImpl(AttentionImpl):
                     assert not use_dcp
                     assert self.sinks is None
                     assert not self.logits_soft_cap
-                    assert output.dtype == torch.float16
-                    assert prefill_query.dtype == torch.float16
-                    assert prefill_query.is_contiguous()
-                    assert kv_cache.dtype == torch.uint8
                     if (os.environ.get("VLLM_SM70_PREFILL_DEBUG") == "1"
                             and num_prefill_tokens >= 256):
                         global _SM70PF_DBG
@@ -3478,7 +3605,12 @@ class FlashInferImpl(AttentionImpl):
                             )
                     sm70_nvfp4_paged_prefill(
                         prefill_query,
-                        kv_cache,
+                        (
+                            kv_cache_permute.view(torch.uint8)
+                            if (self.sm70_fp8_shadow
+                                or self.sm70_fp16_native)
+                            else kv_cache
+                        ),
                         attn_metadata.prefill.block_tables,
                         attn_metadata.prefill.native_qo_indptr,
                         attn_metadata.prefill.native_kv_lens,
@@ -3487,11 +3619,18 @@ class FlashInferImpl(AttentionImpl):
                             prefill_query.shape[1],
                             prefill_query.shape[2],
                         ),
-                        layer._k_scale_float,
-                        layer._v_scale_float,
+                        1.0 if self.sm70_fp16_native else layer._k_scale_float,
+                        1.0 if self.sm70_fp16_native else layer._v_scale_float,
                         self.scale,
                         self.window_left,
                         max_q_len=attn_metadata.prefill.native_max_q_len,
+                        kv_fp8=self.sm70_fp8_shadow,
+                        kv_fp16=self.sm70_fp16_native,
+                        lut=(
+                            _fp8_lut(kv_cache.device, self.cache_dtype)
+                            if self.sm70_fp8_shadow
+                            else None
+                        ),
                     )
                     return output_padded
                 if (
@@ -3711,6 +3850,7 @@ class FlashInferImpl(AttentionImpl):
                             attn_metadata.prefill.shadow_kv,
                             layer._k_scale_float,
                             layer._v_scale_float,
+                            lut=_fp8_lut(kv_cache_permute.device, self.cache_dtype),
                         )
                         shadow_kv = attn_metadata.prefill.shadow_kv
                         kv_cache_for_fi = (
@@ -4060,7 +4200,7 @@ class FlashInferImpl(AttentionImpl):
                             self._sm70_fd_ws,
                         )
                         return output_padded
-                if self.sm70_fp8_shadow:
+                if self.sm70_fp8_shadow and not _SM70_FP8_NATIVE:
                     # SM70 FP8: dequant this layer's paged fp8 cache to the
                     # fp16 shadow buffer (built in the metadata) and run the
                     # mature fp16 paged decode (the flashinfer fp8 kernel is
@@ -4095,6 +4235,10 @@ class FlashInferImpl(AttentionImpl):
                         attn_metadata.decode.shadow_kv,
                         layer._k_scale_float,
                         layer._v_scale_float,
+                        sreq=attn_metadata.decode.shadow_sreq,
+                        st0=attn_metadata.decode.shadow_st0,
+                        toks=attn_metadata.decode.shadow_toks,
+                        lut=_fp8_lut(kv_cache_permute.device, self.cache_dtype),
                     )
                     shadow_kv = attn_metadata.decode.shadow_kv
                     kv_cache_for_fi = (
@@ -4394,7 +4538,9 @@ class FlashInferImpl(AttentionImpl):
                     if os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1":
                         torch.cuda.synchronize()
                     return output_padded
-                elif self.sm70_nvfp4_shadow:
+                elif (self.sm70_nvfp4_shadow
+                      or (self.sm70_fp8_shadow and _SM70_FP8_NATIVE)
+                      or self.sm70_fp16_native):
                     # SM70 NVFP4: native in-kernel-dequant split-KV paged
                     # decode (no fp16 shadow buffer, no FA2 run).
                     assert not use_dcp
@@ -4430,19 +4576,54 @@ class FlashInferImpl(AttentionImpl):
                             flush=True,
                         )
                     _qout = output[:num_decode_tokens]
-                    sm70_nvfp4_paged_decode(
-                        decode_query,
-                        kv_cache,
-                        attn_metadata.decode.block_tables,
-                        attn_metadata.decode.shadow_kv_lens_dev,
-                        output[:num_decode_tokens],
-                        layer._k_scale_float,
-                        layer._v_scale_float,
-                        self.scale,
-                        self.window_left,
-                        attn_metadata.decode.shadow_splits,
-                        attn_metadata.decode.shadow_ws,
-                    )
+                    if self.sm70_fp16_native:
+                        paged_decode_fp16(
+                            decode_query,
+                            kv_cache_permute.view(torch.uint8),
+                            attn_metadata.decode.block_tables,
+                            attn_metadata.decode.shadow_kv_lens_dev,
+                            output[:num_decode_tokens],
+                            # fp16 cache holds raw fp16: no KV scale on read
+                            # (the checkpoint scales are for its fp8 scheme).
+                            1.0,
+                            1.0,
+                            self.scale,
+                            self.window_left,
+                            attn_metadata.decode.shadow_splits,
+                            attn_metadata.decode.shadow_ws,
+                            nqt=attn_metadata.decode.shadow_nqt,
+                        )
+                    elif self.sm70_fp8_shadow:
+                        paged_decode_fp8(
+                            decode_query,
+                            kv_cache_permute,
+                            attn_metadata.decode.block_tables,
+                            attn_metadata.decode.shadow_kv_lens_dev,
+                            output[:num_decode_tokens],
+                            layer._k_scale_float,
+                            layer._v_scale_float,
+                            self.scale,
+                            self.window_left,
+                            attn_metadata.decode.shadow_splits,
+                            attn_metadata.decode.shadow_ws,
+                            kv_dtype=self.cache_dtype,
+                            nqt=attn_metadata.decode.shadow_nqt,
+                        )
+                    else:
+                        sm70_nvfp4_paged_decode(
+                            decode_query,
+                            kv_cache,
+                            attn_metadata.decode.block_tables,
+                            attn_metadata.decode.shadow_kv_lens_dev,
+                            output[:num_decode_tokens],
+                            layer._k_scale_float,
+                            layer._v_scale_float,
+                            self.scale,
+                            self.window_left,
+                            attn_metadata.decode.shadow_splits,
+                            attn_metadata.decode.shadow_ws,
+                            nqt=attn_metadata.decode.shadow_nqt,
+                        )
                     if (
                         os.environ.get("VLLM_SM70_QSA_DBG") == "1"
                         and not getattr(self, "_qdbg_out_done", False)

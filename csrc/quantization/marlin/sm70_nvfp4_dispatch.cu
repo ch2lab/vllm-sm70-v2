@@ -104,13 +104,30 @@ void sm70_nvfp4_gemm_dispatch(torch::stable::Tensor& out,
                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+
+// Python-visible wrapper around the no-allocation dequant (used to build the
+// per-expert fp16 scratch for the MoE tensor-core path).
+void sm70_dequant_from_qpn2_into_py(torch::stable::Tensor& codes,
+                                    torch::stable::Tensor& scales,
+                                    double global_scale,
+                                    torch::stable::Tensor& out) {
+  sm70_nvfp4_dequant_from_qpn2_into(
+      codes, scales, global_scale, out,
+      get_current_cuda_stream(out.get_device_index()));
+}
+
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, sm70_nvfp4_dispatch_ops) {
   sm70_nvfp4_dispatch_ops.def(
       "sm70_nvfp4_gemm_dispatch(Tensor(a!) out, Tensor input, Tensor qpn2_codes, "
       "Tensor qpn2_scales, float qpn2_global_scale, int split_k, "
       "int nacc) -> ()");
+  sm70_nvfp4_dispatch_ops.def(
+      "sm70_dequant_from_qpn2_into(Tensor qpn2_codes, Tensor qpn2_scales, "
+      "float qpn2_global_scale, Tensor(a!) out) -> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, sm70_nvfp4_dispatch_ops) {
   sm70_nvfp4_dispatch_ops.impl("sm70_nvfp4_gemm_dispatch",
                               TORCH_BOX(&sm70_nvfp4_gemm_dispatch));
+  sm70_nvfp4_dispatch_ops.impl("sm70_dequant_from_qpn2_into",
+                              TORCH_BOX(&sm70_dequant_from_qpn2_into_py));
 }
