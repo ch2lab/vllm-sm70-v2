@@ -21,7 +21,13 @@ if TYPE_CHECKING:
 
 # Speculative methods whose draft model the daemon caches in its own group.
 # Other drafts keep loading from disk in the engine.
-WEIGHT_CACHE_DRAFT_METHODS = frozenset({"mtp", "eagle", "eagle3"})
+# Methods whose draft is a real model the daemon can serve as its own role.
+# qwen3_5_mtp is the Qwen3.5/3.6 MTP head: it loads a separate draft model and
+# aliases draft_model_config with copy.copy(), so leaving it out makes the
+# daemon skip the draft group and makes the loader infer the wrong role.
+WEIGHT_CACHE_DRAFT_METHODS = frozenset(
+    {"mtp", "qwen3_5_mtp", "eagle", "eagle3"}
+)
 
 # Python-side flags that weight loading sets on EAGLE-style drafts; the engine
 # never runs load_weights for cached models, so the daemon ships them.
