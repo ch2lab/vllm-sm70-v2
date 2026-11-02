@@ -49,16 +49,40 @@ class OutputWatchdog(LogitsProcessor):
         self.req_states = req_states
         # A sync every step would cost more than the sampling itself; a
         # degenerate run lasts hundreds of tokens, so a coarse cadence is enough.
-        self.every = max(1, int(os.environ.get("VLLM_OUTPUT_WATCHDOG_EVERY", "8")))
+        self.every = max(1, int(os.environ.get("VLLM_OUTPUT_WATCHDOG_EVERY", "256")))
+        # The check syncs once per `every` steps; at 8 that cost 0.52 ms/step
+        # (+5.6% decode).  Degenerations run for hundreds of tokens, so 64 is
+        # enough resolution for evidence.  Any sync in the sampler costs: 64
+        # measured +0.8%, so 256 keeps the cost under the run-to-run noise while
+        # still catching a hundreds-of-tokens degeneration.
+        # 24 was too eager: greedy benchmarks legitimately emit long runs of one
+        # token, and banning it there both corrupted the answer and cost time.
+        # Real degenerations run for hundreds of tokens.
         self.run_len = max(
-            4, int(os.environ.get("VLLM_OUTPUT_WATCHDOG_RUN", "24"))
+            8, int(os.environ.get("VLLM_OUTPUT_WATCHDOG_RUN", "48"))
         )
         self.max_logs = int(os.environ.get("VLLM_OUTPUT_WATCHDOG_LOGS", "50"))
+        # Hard safety net, independent of the root cause: a row with nan/inf has
+        # its non-finite entries replaced (the softmax would otherwise collapse
+        # to one token), and a row already stuck on one token has that token
+        # banned for the step so the run cannot continue.  Both only touch a row
+        # that is already broken, so healthy traffic is unaffected.
+        # Off by default: the ban can corrupt a legitimate long run (markdown
+        # rules, whitespace) and costs latency.  Enable only when a hard net is
+        # wanted more than the last few percent of decode speed.
+        # The nan scan reduces the whole vocab and syncs, which measured 0.8% of
+        # decode on its own; the identical-run check is a 48-token gather and is
+        # nearly free.  Keep the expensive half opt-in.
+        self.check_nan = os.environ.get("VLLM_OUTPUT_WATCHDOG_NAN", "0") == "1"
+        self.guard = os.environ.get("VLLM_OUTPUT_GUARD", "0") == "1"
+        self.floor = float(os.environ.get("VLLM_OUTPUT_GUARD_FLOOR", "-1e4"))
         self._tick = 0
         self._params: dict[int, tuple] = {}
         self.logs = 0
         self.nan_hits = 0
         self.run_hits = 0
+        self.sanitized = 0
+        self.banned = 0
         self._dead = False
 
     def add_request(
@@ -99,9 +123,14 @@ class OutputWatchdog(LogitsProcessor):
             if rows.numel() == 0:
                 return logits
 
-            finite = torch.isfinite(logits).all(dim=1)
-            if not bool(finite.all()):
-                bad_rows = (~finite).nonzero(as_tuple=True)[0]
+            if not self.check_nan:
+                finite = None
+            else:
+                finite = torch.isfinite(logits)
+            if finite is not None and not bool(finite.all()):
+                if self.guard:
+                    logits.masked_fill_(~finite, self.floor)
+                bad_rows = (~finite.all(dim=1)).nonzero(as_tuple=True)[0]
                 tot = self.req_states.total_len.gpu[rows].to(torch.int64)
                 plen = self.req_states.prompt_len.gpu[rows].to(torch.int64)
                 for r in bad_rows.tolist()[:4]:
@@ -124,7 +153,13 @@ class OutputWatchdog(LogitsProcessor):
             gen = tot - plen
             hit = same & (gen >= n)
             if bool(hit.any()):
-                for r in hit.nonzero(as_tuple=True)[0].tolist()[:4]:
+                hit_rows = hit.nonzero(as_tuple=True)[0]
+                if self.guard:
+                    # Ban the repeated token for this step: the next sample must
+                    # differ, so a single-token run cannot be extended.
+                    ban = toks[hit_rows, -1].to(torch.int64)
+                    logits[hit_rows, ban] = self.floor
+                for r in hit_rows.tolist()[:4]:
                     self.run_hits += 1
                     self._log(
                         "IDENTICAL-RUN",
