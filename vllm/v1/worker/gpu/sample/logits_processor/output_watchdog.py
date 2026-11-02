@@ -152,7 +152,15 @@ class OutputWatchdog(LogitsProcessor):
             offs = torch.arange(n, 0, -1, device=tot.device, dtype=torch.int64)
             idx = (tot.unsqueeze(1) - offs).clamp_(min=0)
             toks = self.req_states.all_token_ids.gpu[rows.unsqueeze(1), idx]
+            # Period 1 is the "!!!!" case; "ductduct…" is a period-2/3 cycle in
+            # token space, which is what the first version missed.  Check every
+            # period up to 8: a degenerate run is periodic with a tiny period,
+            # normal text never is over 128 tokens.
             same = (toks == toks[:, :1]).all(dim=1)
+            per = torch.ones_like(same)
+            for p in range(2, 9):
+                per = (toks[:, p:] == toks[:, :-p]).all(dim=1)
+                same = same | per
             plen = self.req_states.prompt_len.gpu[rows].to(torch.int64)
             gen = tot - plen
             hit = same & (gen >= n)
@@ -166,7 +174,7 @@ class OutputWatchdog(LogitsProcessor):
                     self.banned += int(hit_rows.numel())
                     logger.warning(
                         "OUTPUT-GUARD banned token id=%s on slots=%s "
-                        "(run of %d identical tokens)",
+                        "(periodic run over %d tokens)",
                         ban.tolist()[:4], [int(rows[r]) for r in
                                            hit_rows.tolist()[:4]],
                         n)
@@ -177,7 +185,8 @@ class OutputWatchdog(LogitsProcessor):
                         int(rows[r].item()),
                         int(gen[r].item()),
                         int(plen[r].item()),
-                        f"last {n} tokens are all id={int(toks[r, -1].item())}",
+                        f"last {n} tokens repeat with period <=8 "
+                        f"(id={int(toks[r, -1].item())})",
                     )
         except Exception as e:  # noqa: BLE001 - a monitor must never break serving
             self._dead = True
