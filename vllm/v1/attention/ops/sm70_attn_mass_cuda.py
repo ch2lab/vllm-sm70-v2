@@ -163,6 +163,7 @@ def probe(qo, q, kv, block_table, kv_lens, sm_scale, sink_tok, win_tok) -> None:
         with open(st["path"], "w") as fh:
             fh.write("layer,qhead,kv_len,sink_frac,win_frac\n")
     ptr = kv.data_ptr()
+    layer = st["order"].get(ptr)
     HQ = int(q.shape[1])
     out = torch.empty(2 * HQ, dtype=torch.float32, device=q.device)
     for r in range(int(block_table.shape[0])):
