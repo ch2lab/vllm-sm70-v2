@@ -906,6 +906,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                     f"{int(block_table.shape[1]) * npg // super_} superblocks "
                     "> build_table_kernel's 1088", flush=True)
                 _use_prior = False
+            per_sb = super_ // npg
             cap = max(_topk_pages, _stream_pages if _stream else 0) + _sink + _win + 1
             if _SEL_BT is None or _SEL_BT.numel() < cap:
                 _SEL_BT = torch.zeros((cap,), dtype=block_table.dtype,
@@ -926,18 +927,24 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                 _SELC["layer"] = 0
             _li = _SELC["layer"]
             _SELC["layer"] = _li + 1
-            _budget = _stream_pages if _li in _stream else _topk_pages
+            # A classified streaming layer only needs sink + recent window, so it
+            # skips content selection and runs on the window instead.
+            if _li in _stream:
+                _budget, _win_eff = per_sb, _stream_pages
+            else:
+                _budget, _win_eff = _topk_pages, _win
             if new_step or _stream:
                 if _use_prior:
                     select_pages_prior(block_table[0], kv_lens, _SEL_BT,
                                        _SEL_LENS, npg=npg, super_=super_,
                                        n_pick_pages=_budget, sink=_sink,
-                                       win=_win)
+                                       win=_win_eff)
                 else:
                     select_pages(q[0], kv_cache, block_table[0], kv_lens,
                                  _SEL_BT, _SEL_LENS, npg=npg, super_=super_,
                                  samples=_samples,
-                                 n_pick_pages=_budget, sink=_sink, win=_win)
+                                 n_pick_pages=_budget, sink=_sink,
+                                 win=_win_eff)
                 _SELC["first_ptr"] = kv_ptr if _SELC["bt_ptr"] != bt_ptr else (
                     _SELC["first_ptr"] or kv_ptr)
                 _SELC["bt_ptr"] = bt_ptr
