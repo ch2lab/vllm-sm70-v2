@@ -219,10 +219,83 @@ void super_scores(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
       (int)r, G, (int)super_, (int)samples);
 }
 
+
+// One CTA per kv head: exact top-k by pairwise rank (nsuper <= 1088), then the
+// compacted table: [top-k superblocks' pages][sink pages][recent window][tail].
+__global__ void build_table_kernel(const float* __restrict__ scores,
+                                   int nsuper, int per_sb,
+                                   const int* __restrict__ bt_row, int cols,
+                                   const int* __restrict__ kv_lens, int npg,
+                                   int n_pick_sb, int sink, int win,
+                                   int* __restrict__ sel_bt,
+                                   int* __restrict__ sel_len) {
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int kv_len = kv_lens[0];
+  const int npages = (kv_len + npg - 1) / npg;
+  const float* sc = scores + (long)h * nsuper;
+  int* out = sel_bt;                      // shared table (all heads see the same)
+  for (int i = tid; i < nsuper; i += blockDim.x) {
+    const float s = sc[i];
+    if (s <= -1e29f) continue;
+    int rank = 0;
+    for (int j = 0; j < nsuper; ++j) {
+      const float t = sc[j];
+      if (t > s || (t == s && j < i)) ++rank;
+    }
+    if (rank < n_pick_sb) {
+      for (int j = 0; j < per_sb; ++j) {
+        const int pg = i * per_sb + j;
+        out[rank * per_sb + j] = (pg < cols) ? bt_row[pg] : 0;
+      }
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int pos = n_pick_sb * per_sb;
+    for (int i = 0; i < sink; ++i) out[pos++] = bt_row[min(i, cols - 1)];
+    const int w0 = max(npages - win, sink);
+    for (int i = 0; i < win; ++i) out[pos++] = bt_row[min(w0 + i, cols - 1)];
+    out[pos++] = bt_row[min(max(npages - 1, 0), cols - 1)];
+    const int tail = kv_len - (npages - 1) * npg;
+    sel_len[0] = (pos - 1) * npg + tail;
+  }
+}
+
+void select_pages(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
+                  torch::Tensor kv_lens, torch::Tensor sel_bt,
+                  torch::Tensor sel_len, int64_t npg, int64_t super_,
+                  int64_t samples, int64_t n_pick_pages, int64_t sink,
+                  int64_t win) {
+  const int HQ = q.size(0), D = q.size(1);
+  const int H = sel_bt.size(0) ? kv.size(1) / 2 : kv.size(1) / 2;
+  const int NP = kv.size(2);
+  const int DD = D / 2, SD = D / 16;
+  const int page_bytes = 2 * (H * NP * DD + H * NP * SD);
+  const int G = HQ / H;
+  const int cols = (int)bt_row.numel();
+  const int nsuper = (int)(((long)cols * NP + super_ - 1) / super_);
+  const int per_sb = (int)(super_ / NP);
+  const int n_pick_sb = (int)std::max<int64_t>(1, n_pick_pages / per_sb);
+  auto scores = torch::empty({H, nsuper},
+                             q.options().dtype(torch::kFloat));
+  dim3 g1(H, nsuper);
+  super_scores_kernel<<<g1, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
+      kv_lens.data_ptr<int>(), scores.data_ptr<float>(), HQ, D, NP, DD, SD,
+      page_bytes, cols, nsuper, 0, 0, G, (int)super_, (int)samples);
+  build_table_kernel<<<H, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
+      scores.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
+      kv_lens.data_ptr<int>(), (int)npg, n_pick_sb, (int)sink, (int)win,
+      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("page_scores", &page_scores);
   m.def("page_mean_k", &page_mean_k);
   m.def("super_scores", &super_scores);
+  m.def("select_pages", &select_pages);
 }
 """
 
@@ -247,6 +320,14 @@ def super_scores(q, kv, bt, kvlens, out, r=0, super_=256, samples=2):
     """Coarse per-(kv head, superblock) score; `out` is [H, nsuper] fp32."""
     _mod().super_scores(q, kv, bt, kvlens, out, r, super_, samples)
     return out
+
+
+def select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg=16, super_=256,
+                 samples=2, n_pick_pages=2048, sink=0, win=0):
+    """One call: score superblocks, exact top-k, build the compacted table."""
+    _mod().select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg, super_,
+                        samples, n_pick_pages, sink, win)
+    return sel_bt, sel_len
 
 
 def page_mean_k(kv, bt, kvlens, kmean, r=0, pp=16):

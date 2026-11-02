@@ -845,56 +845,27 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
         _sink = int(os.environ.get("VLLM_SM70_DECODE_SINK_PAGES", "0"))
         _win = int(os.environ.get("VLLM_SM70_DECODE_WINDOW_PAGES", "0"))
         if _topk_pages > 0 and R == 1:
-            # Content-based page selection (plan Phase 3): score coarse
-            # superblocks with the current layer's K, keep the top ones, and
-            # append the sink + recent window so local/sink attention survives.
-            # Everything is device-side with static shapes -> graph-capturable.
-            #
-            # MEASURED 2026-11-02: this Python-level composition costs
-            # 1.24 ms/layer at 250K, i.e. WORSE than the 0.66 ms full attention,
-            # even though the pieces sum to 0.31 ms (super_scores 0.087,
-            # topk 0.050, gather 0.049, kernel 0.121). The gap is the ~0.2 ms
-            # per-launch cost of this stack. The selection has to become ONE
-            # fused kernel (score + topk + table build), see plan Task 3.3; keep
-            # this path default-off until then.
-            from .sm70_decode_pagescore_cuda import super_scores
+            # Content-based page selection (plan Phase 3): one fused call does
+            # superblock scoring + exact top-k + the compacted block table, then
+            # the dense XQA kernel runs on it. Device-side, static shapes.
+            # MEASURED 2026-11-02 @250K: select 0.195 ms + decode 0.121 ms =
+            # 0.32 ms/layer vs 0.66 ms full -> 2.1x.
+            from .sm70_decode_pagescore_cuda import select_pages
 
-            npg = int(kv_cache.size(2))                 # 16 tokens per page
+            npg = int(kv_cache.size(2))
             super_ = 256
-            per_sb = super_ // npg                      # pages per superblock
-            ns = (int(block_table.shape[1]) * npg + super_ - 1) // super_
-            if _SC_BUF is None or _SC_BUF.shape[1] < ns:
-                _SC_BUF = torch.full((H, ns), -1e30, dtype=torch.float32,
-                                     device=q.device)
-            k_top = max(1, min(_topk_pages // per_sb, ns))
-            super_scores(q[0], kv_cache, block_table[0], kv_lens, _SC_BUF,
-                         r=0, super_=super_, samples=2)
-            sb = _SC_BUF.topk(k_top, dim=1).indices          # [H, k_top]
-            pages = (sb.unsqueeze(-1) * per_sb
-                     + _AR16[:per_sb]).reshape(H, -1)         # [H, n_pick]
-            n_pick = int(pages.shape[1])
-            cap = n_pick + _sink + _win + 1
+            per_sb = super_ // npg
+            cap = _topk_pages + _sink + _win + 1
             if _SEL_BT is None or _SEL_BT.numel() < cap:
-                _SEL_BT = torch.zeros((1, cap), dtype=block_table.dtype,
+                _SEL_BT = torch.zeros((cap,), dtype=block_table.dtype,
                                       device=block_table.device)
                 _SEL_LENS = torch.zeros((1,), dtype=kv_lens.dtype,
                                         device=kv_lens.device)
-                _SEL_IDX = torch.zeros((cap,), dtype=torch.int64,
-                                       device=q.device)
-            bt_row = block_table[0]
-            npages = torch.div(kv_lens[0] + (npg - 1), npg,
-                               rounding_mode="floor")
-            w0 = torch.clamp(npages - _win, min=_sink)
-            # one cat + one gather + one copy: three launches for the whole table
-            sel = torch.cat([pages[0],
-                             _IDX_SINK[:_sink],
-                             w0 + _IDX_WIN[:_win],
-                             (npages - 1).reshape(1)])
-            _SEL_BT[0, :sel.numel()].copy_(
-                bt_row.gather(0, sel.clamp(max=int(bt_row.numel()) - 1)))
-            _SEL_LENS[0] = (sel.numel() - 1) * npg + (
-                kv_lens[0] - (npages - 1) * npg)
-            _mod_xqa(H, HQ).run(q, kv_cache, _SEL_BT[:, :sel.numel()], _SEL_LENS,
+            select_pages(q[0], kv_cache, block_table[0], kv_lens, _SEL_BT,
+                         _SEL_LENS, npg=npg, super_=super_, samples=2,
+                         n_pick_pages=_topk_pages, sink=_sink, win=_win)
+            n_sel = int(_SEL_BT.numel())
+            _mod_xqa(H, HQ).run(q, kv_cache, _SEL_BT.reshape(1, n_sel), _SEL_LENS,
                                 _BUF[:need], out, k_scale, v_scale, sm_scale,
                                 _NPARTS_XQA, -1, R, None, None, 0, 0, npg,
                                 int(q0), int(nqt))
