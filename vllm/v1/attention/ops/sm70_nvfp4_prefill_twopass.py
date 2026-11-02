@@ -505,8 +505,9 @@ __device__ __forceinline__ void atomic_max_f(float* p, float v) {
 
 __global__ void blk_max_score(const __half* __restrict__ Kb,
                               const __half* __restrict__ qmean,
-                              float* __restrict__ sc, int bslot, int nb, int bn,
-                              int D, float sm, int nsplit) {
+                              float* __restrict__ sc, float* __restrict__ scsu,
+                              int bslot, int nb, int bn, int D, float sm,
+                              int nsplit, int parts) {
   const int t = blockIdx.x, part = blockIdx.y;
   const int per = (bn + nsplit - 1) / nsplit;
   const int lo = part * per;
@@ -532,8 +533,29 @@ __global__ void blk_max_score(const __half* __restrict__ Kb,
   if (threadIdx.x == 0) {
     float v = -1e30f;
     for (int w = 0; w < (int)(blockDim.x >> 5); w++) v = fmaxf(v, red[w]);
-    atomic_max_f(sc + (long)t * nb + bslot, v * sm);
+    v *= sm;
+    // sc: block-level (the prefill mask reads this on the host).
+    // scsu: split-level = one 256-token superblock, which is the granularity the
+    // decode selector ranks.  Split `part` of block `bslot` is superblock
+    // bslot * parts + part, so the store is race free.
+    atomic_max_f(sc + (long)t * nb + bslot, v);
+    if (part < parts) scsu[(long)t * nb * parts + (long)bslot * parts + part] = v;
   }
+}
+
+// Copy the deepest q tile's superblock scores into the page-keyed decode prior.
+// Pages of one superblock share a score, so the store is a plain one (the last
+// write wins: deepest layer, last kv head, last tile = closest to decode).
+__global__ void seed_prior(float* __restrict__ prior,
+                           const int* __restrict__ bt_row,
+                           const float* __restrict__ scsu_row, int nsuper,
+                           int pages_per_sb, int cols) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nsuper) return;
+  const float v = scsu_row[i];
+  const int p0 = i * pages_per_sb;
+  for (int j = 0; j < pages_per_sb; ++j)
+    prior[bt_row[min(p0 + j, cols - 1)]] = v;
 }
 
 // Same maths as run_tiles, but only the kept (q tile, k block) pairs run their
@@ -551,7 +573,8 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
                       int64_t r, int64_t kh, int64_t kv_len, int64_t page,
                       int64_t side_off, int64_t bt_cols, int64_t BN,
                       torch::Tensor lut, int64_t hstride, int64_t tstride,
-                      int64_t nsink, int64_t nrecent, double keep_frac) {
+                      int64_t nsink, int64_t nrecent, double keep_frac,
+                      torch::Tensor prior) {
   const int D = Qd.size(1);
   const int NP = kv.size(2), F = kv.size(3);
   const int SD = F / 9, DD = F - SD;
@@ -579,6 +602,8 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
   auto sc = torch::full({nt, nblk}, -1e30f, Qd.options().dtype(at::kFloat));
   const int threads = 256, per = threads / 8;
   const int nsplit = (int)std::max(1, std::min(32, (int)(BN / 256)));
+  auto scsu = torch::full({nt, nblk * nsplit}, -1e30f,
+                          Qd.options().dtype(at::kFloat));
   dim3 sgrid((unsigned)nt, (unsigned)nsplit);
   for (int b = 0; b < nblk; b++) {
     const int k0 = b * (int)BN;
@@ -594,7 +619,18 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
     blk_max_score<<<sgrid, 256, 0, stream.stream()>>>(
         reinterpret_cast<const __half*>(Kb.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(qmean.data_ptr<at::Half>()),
-        sc.data_ptr<float>(), b, nblk, bnb, D, (float)sm_scale, nsplit);
+        sc.data_ptr<float>(), scsu.data_ptr<float>(), b, nblk, bnb, D,
+        (float)sm_scale, nsplit, nsplit);
+  }
+  if (prior.numel() > 0) {
+    // Decode hot set: the deepest q tile sees exactly what the decode query
+    // will see, so its per-superblock Quest scores are the ranking to reuse.
+    const int nsuper = nblk * nsplit;
+    const int pages_per_sb = (int)std::max<int64_t>(1, 256 / kv.size(2));
+    seed_prior<<<(nsuper + 255) / 256, 256, 0, stream.stream()>>>(
+        prior.data_ptr<float>(), bt.data_ptr<int>(),
+        scsu.data_ptr<float>() + (long)(nt - 1) * nsuper, nsuper, pages_per_sb,
+        (int)bt_cols);
   }
   auto sch = sc.to(at::kCPU);
   const float* sp = sch.data_ptr<float>();
@@ -722,6 +758,7 @@ def enabled() -> bool:
 
 
 _BUF: dict = {}
+_EMPTY = torch.empty(0, dtype=torch.float32)
 
 
 def _num(name, dflt):
@@ -733,6 +770,19 @@ def _num(name, dflt):
 
 BM_DEF = _num("VLLM_SM70_TWOPASS_BM", 1024)
 BN_DEF = _num("VLLM_SM70_TWOPASS_BN", 4096)
+
+
+def _seed_prior_buf(kv_cache):
+    """Page-keyed Quest prior for the decode selector (empty = disabled).
+
+    The decode hot set can then be ranked by the real attention structure seen
+    during prefill instead of by a fresh sampled estimate, at zero extra reads.
+    """
+    if _num("VLLM_SM70_PREFILL_SEED_PRIOR", 0) != 1:
+        return _EMPTY
+    from .sm70_decode_pagescore_cuda import prior_buffer
+
+    return prior_buffer(int(kv_cache.shape[0]), kv_cache.device)
 
 
 def _bufs(dev, G, BM, BN, D, need_rows):
@@ -829,6 +879,7 @@ def try_paged_prefill_twopass(q, kv_cache, block_table, qo_indptr, kv_lens, out,
                 _fmt = "fp8" if kv_fp8 else ("fp16" if kv_fp16 else "nvfp4")
                 bs = _num("VLLM_SM70_PREFILL_BLKSPARSE", 0)
                 if bs > 0:
+                    prior = _seed_prior_buf(kv_cache)
                     _mod(_fmt).run_tiles_sparse(
                         Qd, kv_cache, block_table, qpos, b["Kb"], b["Vb"],
                         b["S"], b["PV"], O, mrow, lrow, alpha, out[q0:q1],
@@ -838,7 +889,7 @@ def try_paged_prefill_twopass(q, kv_cache, block_table, qo_indptr, kv_lens, out,
                         kv_cache.stride(2),
                         _num("VLLM_SM70_PREFILL_SINK_BLK", 1),
                         _num("VLLM_SM70_PREFILL_RECENT_BLK", 1),
-                        bs / 100.0)
+                        bs / 100.0, prior)
                 else:
                     _mod(_fmt).run_tiles(Qd, kv_cache, block_table, qpos, b["Kb"],
                                      b["Vb"], b["S"], b["PV"], O, mrow, lrow,

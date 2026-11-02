@@ -342,16 +342,88 @@ void select_pages_mean(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
       (int)sink, (int)win, sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
 }
 
+// Gather the prefill Quest prior into superblock scores: every page of a
+// superblock carries the same value, so a max over `per_sb` pages is enough.
+// Superblocks at or past kv_len stay -inf so they can never enter the top-k.
+__global__ void prior_scores_kernel(const float* __restrict__ prior,
+                                    const int* __restrict__ bt_row,
+                                    const int* __restrict__ kv_lens,
+                                    float* __restrict__ scores, int nsuper,
+                                    int per_sb, int cols, int npg) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nsuper) return;
+  const int kv_len = kv_lens[0];
+  float v = -1e30f;
+  if ((long)i * per_sb * npg < kv_len) {
+    for (int j = 0; j < per_sb; ++j) {
+      const int pg = min(i * per_sb + j, cols - 1);
+      if ((long)pg * npg >= kv_len) break;
+      v = fmaxf(v, prior[bt_row[pg]]);
+    }
+  }
+  scores[i] = v;
+}
+
+void select_pages_prior(torch::Tensor prior, torch::Tensor bt_row,
+                        torch::Tensor kv_lens, torch::Tensor sel_bt,
+                        torch::Tensor sel_len, int64_t npg, int64_t super_,
+                        int64_t n_pick_pages, int64_t sink, int64_t win) {
+  const int cols = (int)bt_row.numel();
+  const int per_sb = (int)(super_ / npg);
+  const int nsuper = (int)((cols + per_sb - 1) / per_sb);
+  auto scores = torch::empty({1, nsuper}, prior.options());
+  prior_scores_kernel<<<(nsuper + 255) / 256, 256, 0,
+                        at::cuda::getCurrentCUDAStream()>>>(
+      prior.data_ptr<float>(), bt_row.data_ptr<int>(), kv_lens.data_ptr<int>(),
+      scores.data_ptr<float>(), nsuper, per_sb, cols, (int)npg);
+  const int n_pick_sb = (int)std::max<int64_t>(1, n_pick_pages / per_sb);
+  dim3 g2(1, 1);
+  build_table_kernel<<<g2, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
+      scores.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
+      kv_lens.data_ptr<int>(), (int)npg, n_pick_sb, (int)sink, (int)win,
+      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("page_scores", &page_scores);
   m.def("page_mean_k", &page_mean_k);
   m.def("super_scores", &super_scores);
   m.def("select_pages", &select_pages);
   m.def("select_pages_mean", &select_pages_mean);
+  m.def("select_pages_prior", &select_pages_prior);
 }
 """
 
 _MOD = None
+
+# Page-keyed Quest prior written by the block-sparse prefill (see
+# sm70_nvfp4_prefill_twopass.run_tiles_sparse).  Pages of one 256-token
+# superblock share a score, so the decode selector only has to gather it.
+_PRIOR = None
+_PRIOR_N = 0
+
+
+def prior_buffer(num_pages: int, device):
+    """Persistent [num_pages] fp32 prior; created once per cache geometry."""
+    global _PRIOR, _PRIOR_N
+    if _PRIOR is None or _PRIOR.numel() < num_pages or _PRIOR.device != device:
+        _PRIOR = torch.full(
+            (num_pages,), -1e30, dtype=torch.float32, device=device
+        )
+    _PRIOR_N = num_pages
+    return _PRIOR
+
+
+def prior_ready() -> bool:
+    return _PRIOR is not None and _PRIOR_N > 0
+
+
+def select_pages_prior(bt_row, kvlens, sel_bt, sel_len, npg=16, super_=256,
+                       n_pick_pages=2048, sink=0, win=0):
+    """Rank pages by the prefill Quest prior instead of a sampled estimate."""
+    _mod().select_pages_prior(_PRIOR, bt_row, kvlens, sel_bt, sel_len, npg,
+                              super_, n_pick_pages, sink, win)
+    return sel_bt, sel_len
 
 
 def _mod():

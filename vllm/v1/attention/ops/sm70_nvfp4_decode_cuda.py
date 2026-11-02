@@ -853,9 +853,42 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             # the dense XQA kernel runs on it. Device-side, static shapes.
             # MEASURED 2026-11-02 @250K: select 0.195 ms + decode 0.121 ms =
             # 0.32 ms/layer vs 0.66 ms full -> 2.1x.
-            from .sm70_decode_pagescore_cuda import select_pages
+            from .sm70_decode_pagescore_cuda import (
+                prior_buffer,
+                select_pages,
+                select_pages_prior,
+            )
 
             _samples = int(os.environ.get("VLLM_SM70_DECODE_TOPK_SAMPLES", "2"))
+            # Must be a startup-constant decision: decode is CUDA-graph captured
+            # before the first prefill, so a state test here would freeze the
+            # sampled path into the graph.  Allocate the prior up front for the
+            # same reason -- the captured kernel reads this buffer, which prefill
+            # fills later.
+            _use_prior = os.environ.get("VLLM_SM70_DECODE_TOPK_PRIOR", "0") == "1"
+            if _use_prior:
+                prior_buffer(int(kv_cache.shape[0]), kv_cache.device)
+                if (os.environ.get("VLLM_SM70_PREFILL_SEED_PRIOR", "0") != "1"
+                        or int(os.environ.get("VLLM_SM70_PREFILL_BLKSPARSE",
+                                              "0")) <= 0):
+                    print(
+                        "[SM70] VLLM_SM70_DECODE_TOPK_PRIOR=1 but the prior is "
+                        "never seeded (needs VLLM_SM70_PREFILL_BLKSPARSE>0 and "
+                        "VLLM_SM70_PREFILL_SEED_PRIOR=1): every page scores "
+                        "-inf, so only the sink/window pages are attended.",
+                        flush=True)
+            npg = int(kv_cache.size(2))
+            super_ = 256
+            # build_table_kernel keeps the superblock scores in 1088 floats of
+            # shared memory, so a cache whose block table spans more superblocks
+            # must not take this branch.  Startup constant (block-table width is
+            # fixed), so it is safe to decide before graph capture.
+            if _use_prior and -(-int(block_table.shape[1]) * npg // super_) > 1088:
+                print(
+                    "[SM70] decode prior disabled: "
+                    f"{int(block_table.shape[1]) * npg // super_} superblocks "
+                    "> build_table_kernel's 1088", flush=True)
+                _use_prior = False
             npg = int(kv_cache.size(2))
             super_ = 256
             per_sb = super_ // npg
@@ -873,10 +906,16 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             bt_ptr = block_table.data_ptr()
             if (_SELC["first_ptr"] is None or kv_ptr == _SELC["first_ptr"]
                     or bt_ptr != _SELC["bt_ptr"]):
-                select_pages(q[0], kv_cache, block_table[0], kv_lens, _SEL_BT,
-                             _SEL_LENS, npg=npg, super_=super_,
-                             samples=_samples,
-                             n_pick_pages=_topk_pages, sink=_sink, win=_win)
+                if _use_prior:
+                    select_pages_prior(block_table[0], kv_lens, _SEL_BT,
+                                       _SEL_LENS, npg=npg, super_=super_,
+                                       n_pick_pages=_topk_pages, sink=_sink,
+                                       win=_win)
+                else:
+                    select_pages(q[0], kv_cache, block_table[0], kv_lens,
+                                 _SEL_BT, _SEL_LENS, npg=npg, super_=super_,
+                                 samples=_samples,
+                                 n_pick_pages=_topk_pages, sink=_sink, win=_win)
                 _SELC["first_ptr"] = kv_ptr if _SELC["bt_ptr"] != bt_ptr else (
                     _SELC["first_ptr"] or kv_ptr)
                 _SELC["bt_ptr"] = bt_ptr
