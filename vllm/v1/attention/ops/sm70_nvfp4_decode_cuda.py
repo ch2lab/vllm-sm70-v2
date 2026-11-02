@@ -855,6 +855,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             # 0.32 ms/layer vs 0.66 ms full -> 2.1x.
             from .sm70_decode_pagescore_cuda import select_pages
 
+            _samples = int(os.environ.get("VLLM_SM70_DECODE_TOPK_SAMPLES", "2"))
             npg = int(kv_cache.size(2))
             super_ = 256
             per_sb = super_ // npg
@@ -873,7 +874,8 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             if (_SELC["first_ptr"] is None or kv_ptr == _SELC["first_ptr"]
                     or bt_ptr != _SELC["bt_ptr"]):
                 select_pages(q[0], kv_cache, block_table[0], kv_lens, _SEL_BT,
-                             _SEL_LENS, npg=npg, super_=super_, samples=2,
+                             _SEL_LENS, npg=npg, super_=super_,
+                             samples=_samples,
                              n_pick_pages=_topk_pages, sink=_sink, win=_win)
                 _SELC["first_ptr"] = kv_ptr if _SELC["bt_ptr"] != bt_ptr else (
                     _SELC["first_ptr"] or kv_ptr)
