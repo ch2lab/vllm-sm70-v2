@@ -847,12 +847,18 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
         _topk_pages = int(os.environ.get("VLLM_SM70_DECODE_TOPK_PAGES", "0"))
         _sink = int(os.environ.get("VLLM_SM70_DECODE_SINK_PAGES", "0"))
         _win = int(os.environ.get("VLLM_SM70_DECODE_WINDOW_PAGES", "0"))
-        if _topk_pages > 0 and R == 1:
+        if _topk_pages > 0 and R == 1 and nqt == 1:
             # Content-based page selection (plan Phase 3): one fused call does
             # superblock scoring + exact top-k + the compacted block table, then
             # the dense XQA kernel runs on it. Device-side, static shapes.
             # MEASURED 2026-11-02 @250K: select 0.195 ms + decode 0.121 ms =
             # 0.32 ms/layer vs 0.66 ms full -> 2.1x.
+            #
+            # nqt > 1 is speculative-verify: those rows have to see the draft
+            # tokens, which a page table built from kv_lens does not cover.
+            # MEASURED 2026-11-02: MTP k=1 with this branch on gives canary 3/7
+            # and 131K retrieval 0/3, while the same MTP with the valves off is
+            # 7/7 and 3/3 -- so verify always takes the dense path below.
             from .sm70_decode_pagescore_cuda import (
                 prior_buffer,
                 select_pages,
