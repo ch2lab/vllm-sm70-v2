@@ -634,6 +634,9 @@ _PAGE_BUF = None
 _SEL_BT = None
 _SEL_LENS = None
 _SC_BUF = None
+# cross-layer selection reuse (TidalDecode): the top-k page set is computed on
+# the first attention layer of each step and reused by the rest.
+_SELC = {"first_ptr": None, "bt_ptr": None}
 _AR16 = torch.arange(16, dtype=torch.int32, device='cuda')
 _IDX_SINK = torch.arange(4096, dtype=torch.int64, device='cuda')
 _IDX_WIN = torch.arange(8192, dtype=torch.int64, device='cuda')
@@ -861,9 +864,20 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                                       device=block_table.device)
                 _SEL_LENS = torch.zeros((1,), dtype=kv_lens.dtype,
                                         device=kv_lens.device)
-            select_pages(q[0], kv_cache, block_table[0], kv_lens, _SEL_BT,
-                         _SEL_LENS, npg=npg, super_=super_, samples=2,
-                         n_pick_pages=_topk_pages, sink=_sink, win=_win)
+            # Cross-layer reuse: recompute only when this is the first attention
+            # layer of a new step (layer order is model-order and stable, so the
+            # first layer we saw wraps around once per step) or when the batch's
+            # block table changed.
+            kv_ptr = kv_cache.data_ptr()
+            bt_ptr = block_table.data_ptr()
+            if (_SELC["first_ptr"] is None or kv_ptr == _SELC["first_ptr"]
+                    or bt_ptr != _SELC["bt_ptr"]):
+                select_pages(q[0], kv_cache, block_table[0], kv_lens, _SEL_BT,
+                             _SEL_LENS, npg=npg, super_=super_, samples=2,
+                             n_pick_pages=_topk_pages, sink=_sink, win=_win)
+                _SELC["first_ptr"] = kv_ptr if _SELC["bt_ptr"] != bt_ptr else (
+                    _SELC["first_ptr"] or kv_ptr)
+                _SELC["bt_ptr"] = bt_ptr
             n_sel = int(_SEL_BT.numel())
             _mod_xqa(H, HQ).run(q, kv_cache, _SEL_BT.reshape(1, n_sel), _SEL_LENS,
                                 _BUF[:need], out, k_scale, v_scale, sm_scale,
