@@ -633,6 +633,10 @@ _PAGE_I = None
 _PAGE_BUF = None
 _SEL_BT = None
 _SEL_LENS = None
+_SC_BUF = None
+_AR16 = torch.arange(16, dtype=torch.int32, device='cuda')
+_IDX_SINK = torch.arange(4096, dtype=torch.int64, device='cuda')
+_IDX_WIN = torch.arange(8192, dtype=torch.int64, device='cuda')
 
 
 def _mod_xqa(H=2, HQ=16):
@@ -806,6 +810,7 @@ def paged_decode_fp16(q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,
 def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                           k_scale, v_scale, sm_scale, window_left, splits, workspace,
                           nqt=1, q0=0):
+    global _SC_BUF, _SEL_BT, _SEL_LENS
     if os.environ.get("VLLM_SM70_DECODE_CUDA") != "1":
         return False
     if q.dtype != torch.float16 or q.dim() != 3:
@@ -836,8 +841,64 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                   f"window={window_left}", flush=True)
     if os.environ.get("VLLM_SM70_DECODE_XQA") == "1":
         need = R * H * 8 * _NPARTS_XQA * 258
+        _topk_pages = int(os.environ.get("VLLM_SM70_DECODE_TOPK_PAGES", "0"))
         _sink = int(os.environ.get("VLLM_SM70_DECODE_SINK_PAGES", "0"))
         _win = int(os.environ.get("VLLM_SM70_DECODE_WINDOW_PAGES", "0"))
+        if _topk_pages > 0 and R == 1:
+            # Content-based page selection (plan Phase 3): score coarse
+            # superblocks with the current layer's K, keep the top ones, and
+            # append the sink + recent window so local/sink attention survives.
+            # Everything is device-side with static shapes -> graph-capturable.
+            #
+            # MEASURED 2026-11-02: this Python-level composition costs
+            # 1.24 ms/layer at 250K, i.e. WORSE than the 0.66 ms full attention,
+            # even though the pieces sum to 0.31 ms (super_scores 0.087,
+            # topk 0.050, gather 0.049, kernel 0.121). The gap is the ~0.2 ms
+            # per-launch cost of this stack. The selection has to become ONE
+            # fused kernel (score + topk + table build), see plan Task 3.3; keep
+            # this path default-off until then.
+            from .sm70_decode_pagescore_cuda import super_scores
+
+            npg = int(kv_cache.size(2))                 # 16 tokens per page
+            super_ = 256
+            per_sb = super_ // npg                      # pages per superblock
+            ns = (int(block_table.shape[1]) * npg + super_ - 1) // super_
+            if _SC_BUF is None or _SC_BUF.shape[1] < ns:
+                _SC_BUF = torch.full((H, ns), -1e30, dtype=torch.float32,
+                                     device=q.device)
+            k_top = max(1, min(_topk_pages // per_sb, ns))
+            super_scores(q[0], kv_cache, block_table[0], kv_lens, _SC_BUF,
+                         r=0, super_=super_, samples=2)
+            sb = _SC_BUF.topk(k_top, dim=1).indices          # [H, k_top]
+            pages = (sb.unsqueeze(-1) * per_sb
+                     + _AR16[:per_sb]).reshape(H, -1)         # [H, n_pick]
+            n_pick = int(pages.shape[1])
+            cap = n_pick + _sink + _win + 1
+            if _SEL_BT is None or _SEL_BT.numel() < cap:
+                _SEL_BT = torch.zeros((1, cap), dtype=block_table.dtype,
+                                      device=block_table.device)
+                _SEL_LENS = torch.zeros((1,), dtype=kv_lens.dtype,
+                                        device=kv_lens.device)
+                _SEL_IDX = torch.zeros((cap,), dtype=torch.int64,
+                                       device=q.device)
+            bt_row = block_table[0]
+            npages = torch.div(kv_lens[0] + (npg - 1), npg,
+                               rounding_mode="floor")
+            w0 = torch.clamp(npages - _win, min=_sink)
+            # one cat + one gather + one copy: three launches for the whole table
+            sel = torch.cat([pages[0],
+                             _IDX_SINK[:_sink],
+                             w0 + _IDX_WIN[:_win],
+                             (npages - 1).reshape(1)])
+            _SEL_BT[0, :sel.numel()].copy_(
+                bt_row.gather(0, sel.clamp(max=int(bt_row.numel()) - 1)))
+            _SEL_LENS[0] = (sel.numel() - 1) * npg + (
+                kv_lens[0] - (npages - 1) * npg)
+            _mod_xqa(H, HQ).run(q, kv_cache, _SEL_BT[:, :sel.numel()], _SEL_LENS,
+                                _BUF[:need], out, k_scale, v_scale, sm_scale,
+                                _NPARTS_XQA, -1, R, None, None, 0, 0, npg,
+                                int(q0), int(nqt))
+            return True
         if _sink or _win:
             # Flash-Next's approach, training-free: attend to a *bounded* set of
             # pages instead of the whole cache.  Rather than teaching the kernel
@@ -846,7 +907,6 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             # path runs over ~10% of the tokens with full efficiency.
             # Everything below is device-side and uses static buffers, so a FULL
             # cudagraph can hold it.
-            global _SEL_BT, _SEL_LENS
             npg = torch.div(kv_lens[:1] + 15, 16, rounding_mode="floor")      # [1]
             k_sink = torch.clamp(npg, max=_sink)
             w_start = torch.clamp(npg - _win, min=k_sink.to(torch.int32))
