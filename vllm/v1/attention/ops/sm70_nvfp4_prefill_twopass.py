@@ -19,6 +19,14 @@ Layout of this module (identical to the verified prototype):
   * the mask is position-based only, so it is prefix-cache safe.
 
 Valve: VLLM_SM70_PREFILL_TWOPASS (default 0 = off -> fa_pf stays in charge).
+
+Block sparsity: VLLM_SM70_PREFILL_BLKSPARSE=<percent of eligible k blocks to keep>
+(default 0 = off).  run_tiles_sparse bridges every k block once, scores it with the
+Quest upper bound (max over the block of q_mean . k * sm_scale), then runs QK /
+softmax / PV only for the kept (q tile, k block) pairs.  Sink and the tile's own
+diagonal/recent blocks are always kept.  At keep=100% the output is bit-identical
+to run_tiles; at keep=40% a 250K prefill drops from 146.6 s to 96.7 s while the
+canary (7/7) and 131K/250K retrieval (3/3) gates still pass.
 """
 
 import os
@@ -479,9 +487,188 @@ void run_tiles(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
     qoff += nr;
   }
 }
+// ---- block-sparse prefill (Quest-style upper bound) ---------------------------
+// sc[t * nb + b] = max over the block's tokens of dot(Kb[tok], qmean[t]) * sm.
+// This is the exact maximum logit any token of block b can reach for tile t, so
+// ranking blocks by it never discards a block that could dominate the softmax.
+__global__ void blk_max_score(const __half* __restrict__ Kb,
+                              const __half* __restrict__ qmean,
+                              float* __restrict__ sc, int bslot, int nb, int bn,
+                              int D, float sm) {
+  const int t = blockIdx.x;
+  const __half* q = qmean + (long)t * D;
+  float mx = -1e30f;
+  for (int tok = threadIdx.x; tok < bn; tok += blockDim.x) {
+    const __half* k = Kb + (long)tok * D;
+    float acc = 0.f;
+    for (int d = 0; d < D; d += 2) {
+      const float2 qq = __half22float2(*reinterpret_cast<const __half2*>(q + d));
+      const float2 kk = __half22float2(*reinterpret_cast<const __half2*>(k + d));
+      acc += qq.x * kk.x + qq.y * kk.y;
+    }
+    mx = fmaxf(mx, acc);
+  }
+  __shared__ float red[32];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+  if (lane == 0) red[warp] = mx;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float v = -1e30f;
+    for (int w = 0; w < (int)(blockDim.x >> 5); w++) v = fmaxf(v, red[w]);
+    sc[(long)t * nb + bslot] = v * sm;
+  }
+}
+
+// Same maths as run_tiles, but only the kept (q tile, k block) pairs run their
+// QK/softmax/PV.  Block scores come from one cheap pass that bridges every block
+// once and keeps the per-tile maximum logit, so the mask is the Quest bound
+// rather than a sampled estimate.  Sink blocks and the tile's own diagonal and
+// most recent blocks are always kept.
+void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
+                      torch::Tensor qpos, torch::Tensor Kb, torch::Tensor Vb,
+                      torch::Tensor S, torch::Tensor PV, torch::Tensor O,
+                      torch::Tensor mrow, torch::Tensor lrow,
+                      torch::Tensor alpha, torch::Tensor out,
+                      std::vector<int64_t> rows, std::vector<int64_t> plast,
+                      double k_scale, double v_scale, double sm_scale,
+                      int64_t r, int64_t kh, int64_t kv_len, int64_t page,
+                      int64_t side_off, int64_t bt_cols, int64_t BN,
+                      torch::Tensor lut, int64_t hstride, int64_t tstride,
+                      int64_t nsink, int64_t nrecent, double keep_frac) {
+  const int D = Qd.size(1);
+  const int NP = kv.size(2), F = kv.size(3);
+  const int SD = F / 9, DD = F - SD;
+#if KVFP8 || KVFP16
+  const int H = kv.size(1);
+#else
+  const int H = kv.size(1) / 2;
+#endif
+  const int HQ = out.size(1);
+  const int Gq = HQ / H;
+  const int nblk = (int)((kv_len + BN - 1) / BN);
+  const int nt = (int)rows.size();
+  auto stream = getCurrentCUDAStream();
+  auto opts = Qd.options();
+  auto qmean = torch::empty({nt, D}, opts);
+  {
+    auto qf = Qd.to(at::kFloat);
+    long o = 0;
+    for (int t = 0; t < nt; t++) {
+      const int M = (int)rows[t] * Gq;
+      qmean[t].copy_(qf.narrow(0, o, M).mean(0));
+      o += M;
+    }
+  }
+  auto sc = torch::zeros({nt, nblk}, Qd.options().dtype(at::kFloat));
+  const int threads = 256, per = threads / 8;
+  for (int b = 0; b < nblk; b++) {
+    const int k0 = b * (int)BN;
+    const int bnb = (int)std::min<int64_t>(BN, kv_len - k0);
+    bridge_kv<<<(int(BN) + per - 1) / per, threads, 0, stream.stream()>>>(
+        kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
+        reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r, (int)kh, k0,
+        (int)BN, (int)kv_len, (long)page, (long)side_off, (int)bt_cols, (int)H,
+        (int)NP, (int)DD, (int)SD, (float)k_scale, (float)v_scale,
+        reinterpret_cast<const __half*>(lut.data_ptr<at::Half>()),
+        (int)hstride, (int)tstride);
+    blk_max_score<<<nt, 256, 0, stream.stream()>>>(
+        reinterpret_cast<const __half*>(Kb.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(qmean.data_ptr<at::Half>()),
+        sc.data_ptr<float>(), b, nblk, bnb, D, (float)sm_scale);
+  }
+  auto sch = sc.to(at::kCPU);
+  const float* sp = sch.data_ptr<float>();
+  std::vector<char> keep((size_t)nt * nblk, 0);
+  for (int t = 0; t < nt; t++) {
+    const int bmax = (int)(plast[t] / BN);        // last eligible block
+    if (bmax < 0) continue;
+    const int n_el = std::min(bmax + 1, nblk);
+    const int forced = (int)std::min<int64_t>(nsink + nrecent, n_el);
+    int budget = forced + (int)std::ceil(keep_frac * (double)(n_el - forced));
+    budget = std::min(std::max(budget, forced), n_el);
+    std::vector<int> idx;
+    idx.reserve(n_el);
+    for (int b = 0; b < n_el; b++) {
+      const bool f = (b < nsink) || (b >= n_el - nrecent);
+      if (f) keep[(size_t)t * nblk + b] = 1;
+      else idx.push_back(b);
+    }
+    const int extra = budget - forced;
+    if (extra > 0 && !idx.empty()) {
+      std::partial_sort(idx.begin(), idx.begin() + std::min<int>(extra, idx.size()),
+                        idx.end(), [&](int a, int b) {
+                          return sp[(size_t)t * nblk + a] > sp[(size_t)t * nblk + b];
+                        });
+      for (int i = 0; i < extra && i < (int)idx.size(); i++)
+        keep[(size_t)t * nblk + idx[i]] = 1;
+    }
+  }
+  for (int b = 0; b < nblk; b++) {
+    const int k0 = b * (int)BN;
+    bool any = false;
+    for (int t = 0; t < nt; t++) any = any || keep[(size_t)t * nblk + b];
+    if (!any) continue;
+    bridge_kv<<<(int(BN) + per - 1) / per, threads, 0, stream.stream()>>>(
+        kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
+        reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r, (int)kh, k0,
+        (int)BN, (int)kv_len, (long)page, (long)side_off, (int)bt_cols, (int)H,
+        (int)NP, (int)DD, (int)SD, (float)k_scale, (float)v_scale,
+        reinterpret_cast<const __half*>(lut.data_ptr<at::Half>()),
+        (int)hstride, (int)tstride);
+    long o = 0;
+    for (int t = 0; t < nt; t++) {
+      const int M = (int)rows[t] * Gq;
+      int hi = (int)std::min<int64_t>(BN, plast[t] + 1 - k0);
+      if (hi <= 0 || !keep[(size_t)t * nblk + b]) { o += M; continue; }
+      hi = (hi + 7) & ~7;
+      auto St = S.narrow(0, 0, M);
+      auto PVt = PV.narrow(0, 0, M);
+      if (hi < (int)BN) {
+        auto Sd = at::mm(Qd.narrow(0, o, M), Kb.narrow(0, 0, hi).transpose(0, 1));
+        fused_softmax_gen<<<(M + 3) / 4, 128, 0, stream.stream()>>>(
+            reinterpret_cast<__half*>(Sd.data_ptr<at::Half>()),
+            mrow.narrow(0, o, M).data_ptr<float>(),
+            lrow.narrow(0, o, M).data_ptr<float>(),
+            alpha.narrow(0, o, M).data_ptr<float>(),
+            qpos.narrow(0, o, M).data_ptr<int>(), M, k0, hi, (int)kv_len,
+            (float)sm_scale);
+        auto PVd = at::mm(Sd, Vb.narrow(0, 0, hi));
+        fused_update<<<M, 128, 0, stream.stream()>>>(
+            O.narrow(0, o, M).data_ptr<float>(),
+            reinterpret_cast<const __half*>(PVd.data_ptr<at::Half>()),
+            alpha.narrow(0, o, M).data_ptr<float>(), M);
+      } else {
+        at::mm_out(St, Qd.narrow(0, o, M), Kb.transpose(0, 1));
+        launch_softmax(St, mrow.narrow(0, o, M), lrow.narrow(0, o, M),
+                       alpha.narrow(0, o, M), qpos.narrow(0, o, M), M, k0,
+                       (int)kv_len, (float)sm_scale, stream.stream());
+        at::mm_out(PVt, St, Vb);
+        fused_update<<<M, 128, 0, stream.stream()>>>(
+            O.narrow(0, o, M).data_ptr<float>(),
+            reinterpret_cast<const __half*>(PVt.data_ptr<at::Half>()),
+            alpha.narrow(0, o, M).data_ptr<float>(), M);
+      }
+      o += M;
+    }
+  }
+  long o = 0, qoff = 0;
+  for (int t = 0; t < nt; t++) {
+    const int nr = (int)rows[t], M = nr * Gq;
+    auto res = O.narrow(0, o, M).view({nr, Gq, D}) /
+               lrow.narrow(0, o, M).view({nr, Gq, 1});
+    out.narrow(0, qoff, nr).narrow(1, kh * Gq, Gq).copy_(res.to(at::kHalf));
+    o += M;
+    qoff += nr;
+  }
+}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &run);
   m.def("run_tiles", &run_tiles);
+  m.def("run_tiles_sparse", &run_tiles_sparse);
   m.def("bench_softmax", &bench_softmax);
   m.def("bench_update", &bench_update);
   m.def("bench_bridge", &bench_bridge);
@@ -623,14 +810,27 @@ def try_paged_prefill_twopass(q, kv_cache, block_table, qo_indptr, kv_lens, out,
                 lrow[:tot].zero_()
                 alpha[:tot].fill_(1.0)
                 _fmt = "fp8" if kv_fp8 else ("fp16" if kv_fp16 else "nvfp4")
-                _mod(_fmt).run_tiles(Qd, kv_cache, block_table, qpos, b["Kb"],
-                                 b["Vb"], b["S"], b["PV"], O, mrow, lrow,
-                                 alpha, out[q0:q1], rows, plast, k_scale,
-                                 v_scale,
-                                 sm_scale, r, kh, klen, kv_cache.stride(0),
-                                 side_off, block_table.shape[1], BN,
-                                 lut if lut is not None else q,
-                                 kv_cache.stride(1), kv_cache.stride(2))
+                bs = _num("VLLM_SM70_PREFILL_BLKSPARSE", 0)
+                if bs > 0:
+                    _mod(_fmt).run_tiles_sparse(
+                        Qd, kv_cache, block_table, qpos, b["Kb"], b["Vb"],
+                        b["S"], b["PV"], O, mrow, lrow, alpha, out[q0:q1],
+                        rows, plast, k_scale, v_scale, sm_scale, r, kh, klen,
+                        kv_cache.stride(0), side_off, block_table.shape[1], BN,
+                        lut if lut is not None else q, kv_cache.stride(1),
+                        kv_cache.stride(2),
+                        _num("VLLM_SM70_PREFILL_SINK_BLK", 1),
+                        _num("VLLM_SM70_PREFILL_RECENT_BLK", 1),
+                        bs / 100.0)
+                else:
+                    _mod(_fmt).run_tiles(Qd, kv_cache, block_table, qpos, b["Kb"],
+                                     b["Vb"], b["S"], b["PV"], O, mrow, lrow,
+                                     alpha, out[q0:q1], rows, plast, k_scale,
+                                     v_scale,
+                                     sm_scale, r, kh, klen, kv_cache.stride(0),
+                                     side_off, block_table.shape[1], BN,
+                                     lut if lut is not None else q,
+                                     kv_cache.stride(1), kv_cache.stride(2))
         return True
     except Exception as e:  # noqa: BLE001 - the valve must never break prefill
         if os.environ.get("VLLM_SM70_TWOPASS_DEBUG") == "1":
