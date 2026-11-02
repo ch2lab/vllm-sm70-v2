@@ -636,7 +636,7 @@ _SEL_LENS = None
 _SC_BUF = None
 # cross-layer selection reuse (TidalDecode): the top-k page set is computed on
 # the first attention layer of each step and reused by the rest.
-_SELC = {"first_ptr": None, "bt_ptr": None}
+_SELC = {"first_ptr": None, "bt_ptr": None, "layer": 0}
 _AR16 = torch.arange(16, dtype=torch.int32, device='cuda')
 _IDX_SINK = torch.arange(4096, dtype=torch.int64, device='cuda')
 _IDX_WIN = torch.arange(8192, dtype=torch.int64, device='cuda')
@@ -879,20 +879,34 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                         flush=True)
             npg = int(kv_cache.size(2))
             super_ = 256
+            # Task 2.5.1: layers whose attention mass sits in sink+recent window
+            # ("streaming" heads) do not need a content-selected budget.  Layer
+            # index is the position inside the current decode step, which is
+            # model order and therefore stable between graph capture and replay
+            # (the same assumption the cross-layer reuse below already makes).
+            _stream = {
+                int(x) for x in
+                os.environ.get("VLLM_SM70_DECODE_STREAM_LAYERS", "").split(",")
+                if x.strip()
+            }
+            _stream_pages = int(
+                os.environ.get("VLLM_SM70_DECODE_STREAM_PAGES", "512"))
+            if _stream and not _use_prior:
+                print(
+                    "[SM70] VLLM_SM70_DECODE_STREAM_LAYERS forces a per-layer "
+                    "re-selection; without VLLM_SM70_DECODE_TOPK_PRIOR that costs "
+                    "~0.19 ms per layer.", flush=True)
             # build_table_kernel keeps the superblock scores in 1088 floats of
             # shared memory, so a cache whose block table spans more superblocks
-            # must not take this branch.  Startup constant (block-table width is
-            # fixed), so it is safe to decide before graph capture.
-            if _use_prior and -(-int(block_table.shape[1]) * npg // super_) > 1088:
+            # must not take the prior branch.  Startup constant (the block-table
+            # width is fixed), so it is safe to decide before graph capture.
+            if _use_prior and int(block_table.shape[1]) * npg // super_ > 1088:
                 print(
                     "[SM70] decode prior disabled: "
                     f"{int(block_table.shape[1]) * npg // super_} superblocks "
                     "> build_table_kernel's 1088", flush=True)
                 _use_prior = False
-            npg = int(kv_cache.size(2))
-            super_ = 256
-            per_sb = super_ // npg
-            cap = _topk_pages + _sink + _win + 1
+            cap = max(_topk_pages, _stream_pages if _stream else 0) + _sink + _win + 1
             if _SEL_BT is None or _SEL_BT.numel() < cap:
                 _SEL_BT = torch.zeros((cap,), dtype=block_table.dtype,
                                       device=block_table.device)
@@ -901,21 +915,29 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             # Cross-layer reuse: recompute only when this is the first attention
             # layer of a new step (layer order is model-order and stable, so the
             # first layer we saw wraps around once per step) or when the batch's
-            # block table changed.
+            # block table changed.  A per-layer streaming budget needs its own
+            # selection every layer, so reuse is off in that mode.
             kv_ptr = kv_cache.data_ptr()
             bt_ptr = block_table.data_ptr()
-            if (_SELC["first_ptr"] is None or kv_ptr == _SELC["first_ptr"]
-                    or bt_ptr != _SELC["bt_ptr"]):
+            new_step = (_SELC["first_ptr"] is None
+                        or kv_ptr == _SELC["first_ptr"]
+                        or bt_ptr != _SELC["bt_ptr"])
+            if new_step:
+                _SELC["layer"] = 0
+            _li = _SELC["layer"]
+            _SELC["layer"] = _li + 1
+            _budget = _stream_pages if _li in _stream else _topk_pages
+            if new_step or _stream:
                 if _use_prior:
                     select_pages_prior(block_table[0], kv_lens, _SEL_BT,
                                        _SEL_LENS, npg=npg, super_=super_,
-                                       n_pick_pages=_topk_pages, sink=_sink,
+                                       n_pick_pages=_budget, sink=_sink,
                                        win=_win)
                 else:
                     select_pages(q[0], kv_cache, block_table[0], kv_lens,
                                  _SEL_BT, _SEL_LENS, npg=npg, super_=super_,
                                  samples=_samples,
-                                 n_pick_pages=_topk_pages, sink=_sink, win=_win)
+                                 n_pick_pages=_budget, sink=_sink, win=_win)
                 _SELC["first_ptr"] = kv_ptr if _SELC["bt_ptr"] != bt_ptr else (
                     _SELC["first_ptr"] or kv_ptr)
                 _SELC["bt_ptr"] = bt_ptr
