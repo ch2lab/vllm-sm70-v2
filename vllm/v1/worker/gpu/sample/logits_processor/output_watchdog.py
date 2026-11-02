@@ -59,7 +59,7 @@ class OutputWatchdog(LogitsProcessor):
         # token, and banning it there both corrupted the answer and cost time.
         # Real degenerations run for hundreds of tokens.
         self.run_len = max(
-            8, int(os.environ.get("VLLM_OUTPUT_WATCHDOG_RUN", "48"))
+            8, int(os.environ.get("VLLM_OUTPUT_WATCHDOG_RUN", "128"))
         )
         self.max_logs = int(os.environ.get("VLLM_OUTPUT_WATCHDOG_LOGS", "50"))
         # Hard safety net, independent of the root cause: a row with nan/inf has
@@ -74,7 +74,11 @@ class OutputWatchdog(LogitsProcessor):
         # decode on its own; the identical-run check is a 48-token gather and is
         # nearly free.  Keep the expensive half opt-in.
         self.check_nan = os.environ.get("VLLM_OUTPUT_WATCHDOG_NAN", "0") == "1"
-        self.guard = os.environ.get("VLLM_OUTPUT_GUARD", "0") == "1"
+        # Default ON: at 128 identical tokens the output is already pathological
+        # (a markdown rule or a blank-line run is a handful of tokens, not 128 of
+        # the same id), so banning that one token for a step cannot hurt normal
+        # text while it stops a degenerate run from being extended.
+        self.guard = os.environ.get("VLLM_OUTPUT_GUARD", "1") == "1"
         self.floor = float(os.environ.get("VLLM_OUTPUT_GUARD_FLOOR", "-1e4"))
         self._tick = 0
         self._params: dict[int, tuple] = {}
@@ -159,6 +163,13 @@ class OutputWatchdog(LogitsProcessor):
                     # differ, so a single-token run cannot be extended.
                     ban = toks[hit_rows, -1].to(torch.int64)
                     logits[hit_rows, ban] = self.floor
+                    self.banned += int(hit_rows.numel())
+                    logger.warning(
+                        "OUTPUT-GUARD banned token id=%s on slots=%s "
+                        "(run of %d identical tokens)",
+                        ban.tolist()[:4], [int(rows[r]) for r in
+                                           hit_rows.tolist()[:4]],
+                        n)
                 for r in hit_rows.tolist()[:4]:
                     self.run_hits += 1
                     self._log(
