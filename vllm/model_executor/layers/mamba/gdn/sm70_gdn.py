@@ -312,13 +312,19 @@ def chunk_gated_delta_rule_sm70_chunked(
 # known_answer[391/672/olleh] + needle -> "ductduct..."; measured 2026-10-18).
 #
 # Head counts are read from the tensors by the kernel (grid over v_heads, GQA
-# map hq = hv / (hv/hq)), so the gate only requires an integral GQA ratio.
-# Validated against the serial kernel and an fp64 reference with
-# sm70_tests/test_gdn_chunked_heads.py (rel_l2 ~4.1e-4, threshold 5e-3) for
-# Hq/Hv = 2/6 (Qwen3.8-Flash-Next TP8 per-rank), 8/16 (Qwen3.6-35B TP2) and
-# 16/32 (Qwen3.6-35B TP1), T = 1024..8192.
+# map hq = hv / (hv/hq)), so any integral ratio is numerically valid: all of
+# 2/6, 8/16 and 16/32 match the serial kernel to rel_l2 ~4.1e-4
+# (sm70_tests/test_gdn_chunked_heads.py, threshold 5e-3).
+#
+# Perf is geometry dependent, so only the geometries where the chunked chain is
+# actually faster are admitted (min of 20 runs, T=8192, TP2 box):
+#   (2, 6)  7.69 -> 3.48 ms  2.21x   Qwen3.8-Flash-Next TP8 per-rank
+#   (8, 16) 8.13 -> 7.57 ms  1.07x   Qwen3.6-35B TP2 per-rank
+#   (16, 32) 7.27 -> 14.93 ms 0.49x  Qwen3.6-35B TP1 -> keep the serial kernel
+# Adding a geometry here requires rerunning that bench.
 _CHUNKED_MIN_T = 1024
 _CHUNKED_K = 128
+_CHUNKED_FAST_GEOMETRIES = frozenset({(2, 6), (8, 16)})
 
 
 def _chunked_eligible(q: torch.Tensor, v: torch.Tensor) -> bool:
@@ -334,9 +340,7 @@ def _chunked_eligible(q: torch.Tensor, v: torch.Tensor) -> bool:
         q.shape[1] >= _CHUNKED_MIN_T
         and q.shape[-1] == _CHUNKED_K
         and v.shape[-1] == _CHUNKED_K
-        and hq > 0
-        and hv > 0
-        and hv % hq == 0
+        and (hq, hv) in _CHUNKED_FAST_GEOMETRIES
     )
 
 
