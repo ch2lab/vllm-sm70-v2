@@ -196,7 +196,7 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
-_SM70_GREEDY_VERIFY = os.environ.get("VLLM_SM70_GREEDY_VERIFY") == "1"
+_SM70_GREEDY_VERIFY = os.environ.get("VLLM_SM70_GREEDY_VERIFY", "1") == "1"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):

@@ -15,7 +15,7 @@ from transformers import Qwen4ExpTextConfig
 
 from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheConfig, CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -41,6 +41,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
     get_dtype_size,
     kv_cache_dtype_str_to_dtype,
@@ -69,6 +70,7 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+from .ops.qsa_indexer import _TOPK_WORKSPACE_BYTES
 
 _DIAG_SKIP_QSA_BODY = os.environ.get("VLLM_SM70_DIAG_SKIP_QSA_BODY", "0") == "1"
 _DIAG_SKIP_QSA_ATTN = (
@@ -440,17 +442,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        # D4a shadow (spec d4a-spec.md §2.2 S3): when
-        # VLLM_SM70_QSA_DECODE_FUSE == 1 (matching the fused dispatch in
-        # indexer_qsa.py — every other value, incl. reserved 2, is today)
-        # and the batch is non-empty, the sparse attention chain
-        # (splitk + merge) fully overwrites `output` (empty rows written 0
-        # by both kernels — spec §1.2 proof), so the fill is skipped.
-        # env != 1 (default 0) keeps the fill on every path — byte-identical
-        # off path (rule 11670); an empty batch also keeps it (the chain
-        # below early-returns without writing `output`).
-        if not (envs.VLLM_SM70_QSA_DECODE_FUSE == 1 and num_tokens > 0):
-            output.zero_()
+        output.zero_()
         if num_tokens == 0:
             return output
 
@@ -629,6 +621,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             output_gate=output_gate[:num_tokens],
             query_positions=query_positions,
             sequence_lengths=_sequence_lengths,
+            layer_idx=self.layer_idx,
         )
         return output
 
@@ -790,6 +783,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
 
         self.layer_name = f"{prefix}.attn"
+
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = qsa_kv_cache_dtype(cache_config, prefix)
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
@@ -822,6 +816,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             None,
         )
         self.impl.layer_name = self.layer_name
+        # QSA layer index for the per-layer page-budget hot valve.
+        self.impl.layer_idx = extract_layer_index(prefix)
         self.indexer = QSAIndexer(
             vllm_config=vllm_config,
             config=config,
@@ -839,13 +835,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.use_fused_qk_norm_rope_gate
             and self.indexer.use_fused_pre_indexer
         )
-        self.fuse_indexer_projection = vllm_config.lora_config is None
+        # Without a quant config here (BF16, or ModelOpt FP4, which keeps
+        # attention in BF16) the fused layer is unquantized. Otherwise the
+        # indexer shares the q/k/v GEMM only if it uses the same quant method.
+        fused_quant_config = model.without_modelopt_fp4(quant_config)
+        projection_method = type(self.qkv_proj.quant_method)
+        self.fuse_indexer_projection = vllm_config.lora_config is None and (
+            fused_quant_config is None
+            or projection_method is type(self.indexer.index_qk_proj.quant_method)
+        )
         if self.fuse_indexer_projection:
             self.index_qk_size = self.indexer.index_qk_proj.output_size
             self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(
                 self.qkv_proj,
                 self.index_qk_size,
-                model.without_modelopt_fp4(quant_config),
+                fused_quant_config,
             )
             del self.indexer.index_qk_proj
 
@@ -911,6 +915,30 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if isinstance(metadata, list):
             metadata = metadata[0]
         if not isinstance(metadata, dict):
+            # Profiling/dummy run: the indexer allocates its selection scratch
+            # on demand, so touch its peak here for the memory profiler (as
+            # sparse_attn_indexer does): the prefill logits budget or the
+            # worst-case decode logits [decode tokens, compressed columns],
+            # plus the top-k workspace.
+            logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            cfg = get_current_vllm_config_or_none()
+            if cfg is not None:
+                spec = cfg.speculative_config
+                num_spec = spec.num_speculative_tokens if spec is not None else 0
+                decode_tokens = min(
+                    cfg.scheduler_config.max_num_seqs * (num_spec + 1),
+                    cfg.scheduler_config.max_num_batched_tokens,
+                )
+                block_size = cfg.cache_config.block_size
+                columns = cdiv(cfg.model_config.max_model_len, block_size) * cdiv(
+                    block_size, self.indexer.compress_ratio
+                )
+                logits_bytes = max(logits_bytes, decode_tokens * columns * 4)
+            _ = torch.empty(
+                logits_bytes + _TOPK_WORKSPACE_BYTES,
+                dtype=torch.uint8,
+                device=output.device,
+            )
             output.zero_()
             return
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])

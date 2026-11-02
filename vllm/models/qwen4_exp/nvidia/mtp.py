@@ -443,30 +443,6 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
-        # DIAG (once): which quant method the draft MoE actually got, and
-        # whether the QPN2 layout packing ran (see marlin_utils_fp4:471).
-        try:
-            qms = {}
-            qpn2 = 0
-            for mod in self.model.modules():
-                qm = getattr(mod, "quant_method", None)
-                if qm is not None:
-                    name = type(qm).__name__
-                    qms[name] = qms.get(name, 0) + 1
-                if hasattr(mod, "w13_codes") or hasattr(mod, "w2_codes"):
-                    qpn2 += 1
-            print(
-                f"SM70 MTP draft quant methods: {qms} | qpn2-packed modules: {qpn2}",
-                flush=True,
-            )
-            shapes = []
-            for name, mod in self.model.named_modules():
-                w = getattr(mod, "weight", None)
-                if w is not None and getattr(w, "dtype", None) is not None:
-                    shapes.append(f"{name}:{tuple(w.shape)}:{w.dtype}")
-            print("SM70 MTP draft fp16-shaped weights: " + " | ".join(shapes[:20]), flush=True)
-        except Exception:
-            pass
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )

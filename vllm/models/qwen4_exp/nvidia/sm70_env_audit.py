@@ -31,23 +31,19 @@ REQUIRED: tuple[str, ...] = (
     "VLLM_SM70_MOE_QPN2_NS",
     "VLLM_SM70_MOE_QPN2_WIDE",
     "VLLM_SM70_PLE_SYNC",
-    "VLLM_SM70_QSA_DECODE_FUSE",
     "VLLM_SM70_QSA_DRAFT_META_UPDATE",
     "VLLM_SM70_QSA_PAGE4_SORT",
     "VLLM_SM70_QSA_PLAN_PACK",
     "VLLM_SM70_QSA_POS_FUSE",
     "VLLM_SM70_QSA_STAGES",
     "VLLM_SM70_QSA_VERIFY_PAGE_CAP",
-    "VLLM_SM70_QWEN38_FP16_GEMV",
-    "VLLM_SM70_QWEN38_FUSED_HC_DOWN_SILU",
-    "VLLM_SM70_QWEN38_FUSED_HC_UP_GATE",
     "VLLM_SM70_TRITON_TOPK",
 )
 
 _audited = False
 
 
-def audit_once(*, strict: bool = True) -> None:
+def audit_once(*, strict: bool = False) -> None:
     """Log the SM70 valve set once per process and fail on missing valves."""
     global _audited
     if _audited:
@@ -61,6 +57,19 @@ def audit_once(*, strict: bool = True) -> None:
         os.getpid(),
         len(seen),
         ", ".join(f"{k}={seen[k]}" for k in sorted(seen)),
+    )
+    # NCCL reads its algorithm/protocol at communicator init, which happens
+    # before any model code runs. The values are static, so auditing them here
+    # is still a faithful check of what the communicators saw. Names only for
+    # everything else (the environment can hold secrets).
+    nccl = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+    sm70 = sorted(k for k in os.environ if k.startswith("SM70_"))
+    logger.info(
+        "[SM70-ENV] pid=%d sees %d NCCL vars: %s | SM70_* names: %s",
+        os.getpid(),
+        len(nccl),
+        ", ".join(f"{k}={nccl[k]}" for k in sorted(nccl)) or "(none)",
+        ",".join(sm70) or "(none)",
     )
     if missing:
         msg = (

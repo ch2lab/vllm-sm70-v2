@@ -800,8 +800,6 @@ def enable_qwen38_sm70_fp16_hc_up_gate(
     module: nn.Module, dtype: torch.dtype, vllm_config=None
 ) -> None:
     """Mark HC modules whose up-projection can use the fused up+gate kernel."""
-    if not envs.VLLM_SM70_QWEN38_FUSED_HC_UP_GATE:
-        return
     if dtype != torch.float16 or not current_platform.is_device_capability((7, 0)):
         return
     _rebind_hc_dims(module)
@@ -966,8 +964,6 @@ def enable_qwen38_sm70_fp16_hc_down_silu(
 ) -> None:
     """Mark HC modules whose down-projection can use the fused down+SiLU kernel."""
     del vllm_config
-    if not envs.VLLM_SM70_QWEN38_FUSED_HC_DOWN_SILU:
-        return
     if dtype != torch.float16 or not current_platform.is_device_capability((7, 0)):
         return
     _rebind_hc_dims(module)

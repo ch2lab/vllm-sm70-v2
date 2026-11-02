@@ -66,7 +66,7 @@ constexpr int kGroupedVerifyWorkspaceRows =
 constexpr int kGroupedVerifyMinTokensPerSplit = 64;
 constexpr int kGroupedVerifySingleQueryMinTokensPerSplit = 128;
 constexpr int kGroupedVerifyShortContextMaxTokens = 128;
-constexpr int kGroupedVerifyThreads = 512;
+constexpr int kGroupedVerifyThreads = 256;  // A/B 2026-10-31: 512 -> 256 for 2 CTA/SM
 constexpr int kGroupedVerifyWarps = kGroupedVerifyThreads / kWarpSize;
 constexpr int kGroupedVerifyQKWarps =
     (kGroupedVerifyRows / 16) * (kGroupedVerifyBlockN / 16);

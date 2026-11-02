@@ -450,21 +450,6 @@ class DraftModelSpeculator(BaseSpeculator):
                 if not attn_group.supports_draft_decode_metadata_update
             }
         )
-        try:
-            _diag = [
-                f"{g.backend.get_name()}={g.supports_draft_decode_metadata_update}"
-                f"({type(g.get_metadata_builder()).__name__})"
-                for gs in self.attn_groups
-                for g in gs
-            ]
-            print(
-                f"[QSA UPD] unsupported={sorted(unsupported_backends)} "
-                f"groups={len([g for gs in self.attn_groups for g in gs])} "
-                + " | ".join(_diag),
-                flush=True,
-            )
-        except Exception as _exc:  # pragma: no cover - diagnostic only
-            print(f"[QSA UPD] diag failed: {_exc}", flush=True)
         self.supports_decode_metadata_update = not unsupported_backends
         if unsupported_backends:
             logger.info_once(

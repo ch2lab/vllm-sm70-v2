@@ -47,7 +47,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     MROPE_SECTION_H: tl.constexpr,
     MROPE_SECTION_W: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)

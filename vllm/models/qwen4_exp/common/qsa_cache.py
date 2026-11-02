@@ -617,8 +617,19 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         import os as _os
 
+        # The fused multi-step draft path (metadata advanced in place between
+        # draft steps) is only a win for a single draft step. At k>1 it
+        # measured both slower (73 vs 77 tps at 65K) and lower acceptance
+        # (1.48 vs 1.63) than rebuilding the metadata per step, so keep it to
+        # k==1 and let k>1 take the per-step path.
+        _num_spec = getattr(
+            getattr(vllm_config, "speculative_config", None),
+            "num_speculative_tokens",
+            0,
+        )
         self.supports_draft_decode_metadata_update = (
-            _os.environ.get("VLLM_SM70_QSA_DRAFT_META_UPDATE") == "1"
+            _os.environ.get("VLLM_SM70_QSA_DRAFT_META_UPDATE", "1") == "1"
+            and (_num_spec or 0) <= 1
         )
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             compress_ratio = kv_cache_spec.tokens_per_state

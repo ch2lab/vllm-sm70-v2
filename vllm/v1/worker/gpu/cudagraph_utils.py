@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import numpy as np
 import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Sequence
@@ -10,7 +11,6 @@ from dataclasses import dataclass, replace
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
-import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm

@@ -172,12 +172,28 @@ _SM70_DECODE_SCAN = {
     "fp8": (32, 2, 1, 1),
     "e4m3": (64, 2, 1, 2),
     "nvfp4": (64, 2, 2, 2),
-    "int8": (32, 2, 1, 1),
+    "int8": (32, 4, 1, 1),  # 2026-10-29: tpp 2->4 (offline: 237.8 -> 210.0 us/launch)
+}
+
+# One or two requests scan few enough columns that the whole matrix is L2
+# resident, so the tile loop is latency bound, not bandwidth bound: the generic
+# shape runs 4 tiles per CTA with a single pipeline stage and holds ~20%
+# occupancy. One tile per CTA with a 4-deep pipeline measures 28.8 -> 11.5 us
+# for a 2K-context scan (visible=2200 columns) and 70.3 -> 64.8 us at 65K, with
+# bit-identical logits. It is kept off larger batches, where the 4x CTA count
+# would only add scheduling.
+_SM70_DECODE_SCAN_SMALL_BATCH = {
+    "int8": (32, 1, 4, 1),
 }
 
 
 def _sm70_decode_scan_config(
-    cache: torch.Tensor, block_n: int, tpp: int, stages: int, warps: int
+    cache: torch.Tensor,
+    block_n: int,
+    tpp: int,
+    stages: int,
+    warps: int,
+    num_requests: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Launch shape for the decode scan, or the defaults off Volta."""
     if not current_platform.is_device_capability(70):
@@ -192,6 +208,10 @@ def _sm70_decode_scan_config(
         key = "int8"
     else:
         key = "bf16"
+    if num_requests is not None and num_requests <= 2:
+        small = _SM70_DECODE_SCAN_SMALL_BATCH.get(key)
+        if small is not None:
+            return small
     return _SM70_DECODE_SCAN[key]
 
 # SM70 cuBLAS indexer path (ported from 1Cat-vLLM's production SM70 stack,
@@ -216,6 +236,8 @@ _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = int(
 # a top-k element instead of the whole row.
 _SM70_INDEXER_PREFILTER = os.getenv("VLLM_SM70_QSA_PREFILTER", "1") == "1"
 _SM70_INDEXER_PREFILTER_TILE = 16
+_QSA_HEADSUM_BLOCK_N = 512
+_QSA_HEADSUM_WARPS = 4
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
@@ -432,6 +454,36 @@ def _qsa_gather_single_request_keys(
     return keys, valid
 
 
+_SCORE_DIAG = os.environ.get("VLLM_SM70_QSA_SCORE_DIAG", "") in ("1", "true", "True")
+_SCORE_DIAG_SEEN: set[tuple[int, int, int]] = set()
+_SCAN_DIAG_SEEN: set[tuple[int, ...]] = set()
+
+
+def _score_diag(rows: int, columns: int, tile_columns: int, heads: int) -> None:
+    """One-shot shape/byte census of the indexer score pass (VLLM_SM70_QSA_SCORE_DIAG=1).
+
+    The tiled torch.mm materialises an fp32 score tile through HBM and a second
+    kernel reads it back to relu+sum over the query heads; the HBM round trip is
+    what any epilogue fusion would remove, so its exact size has to be measured,
+    not inferred from the tiling formula.
+    """
+    if not _SCORE_DIAG:
+        return
+    key = (rows, columns, tile_columns)
+    if key in _SCORE_DIAG_SEEN:
+        return
+    _SCORE_DIAG_SEEN.add(key)
+    n_tiles = math.ceil(columns / tile_columns)
+    tile_mib = rows * heads * tile_columns * 4 / 2**20
+    total_mib = rows * heads * columns * 4 / 2**20
+    init_logger(__name__).info(
+        "[QSA-SCORE] rows=%d columns=%d heads=%d tile_columns=%d n_tiles=%d "
+        "tile=%.1f MiB round_trip=%.1f MiB write+read=%.1f MiB",
+        rows, columns, heads, tile_columns, n_tiles,
+        tile_mib, total_mib, 2 * total_mib,
+    )
+
+
 def _qsa_mqa_cublas(
     q: torch.Tensor,
     keys: torch.Tensor,
@@ -454,6 +506,7 @@ def _qsa_mqa_cublas(
         min(columns, _SM70_INDEXER_SCORE_TILE_BYTES // bytes_per_column),
     )
     tile_columns = max(256, tile_columns // 256 * 256)
+    _score_diag(rows, columns, tile_columns, num_heads)
     for column_start in range(0, columns, tile_columns):
         column_stop = min(column_start + tile_columns, columns)
         width = column_stop - column_start
@@ -462,10 +515,18 @@ def _qsa_mqa_cublas(
         scores = torch.mm(
             q2,
             keys[column_start:column_stop].t(),
-            out_dtype=torch.float32,
+            # 2026-10-29: fp16 score tile (halves the HBM write here and the
+            # read in _qsa_relu_headsum_visible, which is bandwidth-bound).
+            # Gate: sm70_tests/gate_indexer_fp16_scores.py -> top-2048 set
+            # overlap 99.98%, score-mass ratio 0.999999 (>= 0.999).
+            out_dtype=torch.float16,
         )
+        # 2026-10-29: BLOCK_N 256 -> 512 (offline sweep, sm70_tests/
+        # bench_qsa_relu_headsum.py: 59.9 -> 35.4 us/launch on the in-service
+        # shape; 512/4 beats 256/8 and 512/8). One CTA now covers 512 columns,
+        # halving the CTA count; the last tile is masked when width < 512.
         _qsa_relu_headsum_visible_kernel[
-            (rows, triton.cdiv(width, 256))
+            (rows, triton.cdiv(width, _QSA_HEADSUM_BLOCK_N))
         ](
             scores,
             visible,
@@ -480,9 +541,9 @@ def _qsa_mqa_cublas(
             column_start,
             math.sqrt(head_dim),
             NUM_HEADS=num_heads,
-            BLOCK_N=256,
+            BLOCK_N=_QSA_HEADSUM_BLOCK_N,
             TILE=_SM70_INDEXER_PREFILTER_TILE,
-            num_warps=4,
+            num_warps=_QSA_HEADSUM_WARPS,
         )
     return logits, tile_max
 
@@ -1195,12 +1256,23 @@ def qsa_select_paged_decode(
     fp8_lut = _fp8_needs_table(k_cache)
     cache = k_cache.view(torch.uint8) if fp8_lut else k_cache
     block_n, tiles_per_program, stages, warps = _sm70_decode_scan_config(
-        k_cache, block_n, tiles_per_program, stages, warps
+        k_cache, block_n, tiles_per_program, stages, warps, num_requests
     )
     grid = (
         num_requests,
         triton.cdiv(columns, block_n * tiles_per_program),
     )
+    if _SCORE_DIAG:
+        _k = (num_requests, columns, block_n, tiles_per_program, stages, warps)
+        if _k not in _SCAN_DIAG_SEEN:
+            _SCAN_DIAG_SEEN.add(_k)
+            init_logger(__name__).info(
+                "[QSA-SCAN] reqs=%d cols=%d block_n=%d tpp=%d stages=%d warps=%d "
+                "grid=%s heads=%d dql=%d head_dim=%d page=%d pt_width=%d cache=%s",
+                num_requests, columns, block_n, tiles_per_program, stages, warps,
+                grid, q.shape[1], decode_query_len, q.shape[2],
+                k_cache.shape[1], page_table.shape[1], k_cache.dtype,
+            )
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
         cache,

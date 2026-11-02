@@ -37,25 +37,19 @@ _page4_workspaces: dict[tuple[int, int], tuple[object, ...]] = {}
 # the arm goes live only after the M2 in-service A/B gate (progress.md
 # 10-15 晚(11): WIN >= 4800 / DEAD < 4600 tok/s 65K).
 #
-# Env name deliberately has NO VLLM_ prefix: empirically (10-15 M2 run)
-# worker processes in this stack only observed the unprefixed name
-# (SM70_QSA_FMA via the sm70-serve systemd drop-in); the VLLM_-prefixed
-# variant set in the serve script never reached the workers.
+# Env name has no VLLM_ prefix; it is exported by the serve script.
+# 2026-10-28: the /tmp file valves were retired. The premise they were built
+# on ("workers in this stack do not observe env set at the service level") is
+# false on the current stack: sm70_env_audit shows the worker's os.environ
+# carries the full serve-script set (see sm70/20_request_lifecycle.md §14).
 _FLASHV100_TP8_ENABLE_ENV = "SM70_PAGE4_TP8"
-# File valve (same class as VLLM_SM70_AR_HIER_FILE): the workers in this
-# stack do not observe env set at the API-server/service level, so the
-# in-service A/B flips the route by writing a file — no restart.
-_FLASHV100_TP8_MODE_FILE = "/tmp/page4_tp8_mode"
+_PAGE4_BACKEND_ENV = "SM70_QSA_PAGE4_BACKEND"
 _flashv100_tp8_mod = None
 _flashv100_tp8_attempted = False
 _page4_tp8_workspaces: dict[tuple[int, int], tuple[object, ...]] = {}
 
-# P0 localization (10-16): in-tree stable-ABI QSA page4 backend. Worker
-# valve file (same class as _FLASHV100_TP8_MODE_FILE — workers in this
-# stack do not see VLLM_-prefixed env): content "local" routes the
-# page4/XQA call sites to the torch.ops._C ops built into the vllm
-# stable module; missing ops log a warning and keep the .so route.
-_QSA_PAGE4_LOCAL_MODE_FILE = "/tmp/qsa_page4_backend"
+# P0 localization (10-16): in-tree stable-ABI QSA page4 backend, selected by
+# SM70_QSA_PAGE4_BACKEND=local (env, exported by the serve script).
 _qsa_page4_local_checked = False
 _qsa_page4_local_mod = None
 
@@ -75,12 +69,7 @@ def _qsa_page4_local_ops():
     if _qsa_page4_local_checked:
         return _qsa_page4_local_mod
     _qsa_page4_local_checked = True
-    try:
-        with open(_QSA_PAGE4_LOCAL_MODE_FILE) as f:
-            mode = f.read().strip()
-    except OSError:
-        return None
-    if mode != "local":
+    if os.getenv(_PAGE4_BACKEND_ENV, "").strip() != "local":
         return None
     if not hasattr(torch.ops._C, "grouped_sparse_page4_plan_fwd"):
         logger.warning(
@@ -94,10 +83,8 @@ def _qsa_page4_local_ops():
 
 
 def _qsa_page4_tp8_enabled() -> bool:
-    """Env first, then the file valve (hot A/B switch, no restart)."""
-    if os.getenv(_FLASHV100_TP8_ENABLE_ENV, "0") == "1":
-        return True
-    return os.path.exists(_FLASHV100_TP8_MODE_FILE)
+    """Serve-script env only (the /tmp file valve was retired 2026-10-28)."""
+    return os.getenv(_FLASHV100_TP8_ENABLE_ENV, "0") == "1"
 
 
 @lru_cache(maxsize=1)
@@ -764,10 +751,10 @@ def _flashv100_module():
     _flashv100_mod = _qsa_page4_local_ops()
     if _flashv100_mod is None:
         logger.error(
-            "QSA page4 DISABLED: in-tree stable-ABI ops missing (write "
-            "'local' to %s and check `import vllm._custom_ops`); there is no "
+            "QSA page4 DISABLED: in-tree stable-ABI ops missing (set "
+            "%s=local and check `import vllm._custom_ops`); there is no "
             ".so fallback by policy - do not trust page4 numbers",
-            _QSA_PAGE4_LOCAL_MODE_FILE,
+            _PAGE4_BACKEND_ENV,
         )
     return _flashv100_mod
 
@@ -898,7 +885,7 @@ _page4_logged = False
 
 
 
-def _qsa_verify_page_budget() -> tuple[int, int]:
+def _qsa_verify_page_budget(prefill: bool = False) -> tuple[int, int]:
     """Return (per_query_page_budget, legacy_postplan_token_cap).
 
     Per-query page budget (new, opt-in): the planner walks each query's
@@ -913,17 +900,7 @@ def _qsa_verify_page_budget() -> tuple[int, int]:
     existing deployment does not change semantics silently; setting
     ``VLLM_SM70_QSA_VERIFY_PAGE_BUDGET`` switches to the score-ordered budget.
     """
-    # Hot valve for budget sweeps: a file beats the environment so a single
-    # boot can measure several points without a restart. Persisted under
-    # /data (not /tmp, which is tmpfs).
-    budget = 0
-    try:
-        with open("/data/sm70_results/qsa_verify_budget") as f:
-            budget = int(f.read().strip() or "0")
-    except (OSError, ValueError):
-        budget = 0
-    if budget <= 0:
-        budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET", "0"))
+    budget = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_BUDGET", "512"))
     if budget > 0:
         # Proof-of-effect line (04_standards: prove the change took effect
         # before trusting any number).
@@ -934,7 +911,9 @@ def _qsa_verify_page_budget() -> tuple[int, int]:
         return budget, 0
     legacy = int(os.getenv("VLLM_SM70_QSA_VERIFY_PAGE_CAP", "0"))
     if legacy > 0:
-        logger.warning(
+        # Once per worker, not per decode step: this used to spam ~180k lines a
+        # day, which is how the defect went unnoticed for nine days.
+        logger.warning_once(
             "VLLM_SM70_QSA_VERIFY_PAGE_CAP=%d is the legacy post-plan token "
             "cap (position-ordered, not top-N). Keeping its old behaviour; "
             "set VLLM_SM70_QSA_VERIFY_PAGE_BUDGET=<pages/query> (e.g. %d for "
@@ -944,6 +923,61 @@ def _qsa_verify_page_budget() -> tuple[int, int]:
         )
         return 0, legacy
     return 0, 0
+
+
+_rank_diag_state = {"probe": None, "mtime": 0.0}
+
+
+def _rank_diag_page_ranks(idx_p4: torch.Tensor) -> None:
+    """Log where each probe token's page sits in the score-ordered candidates.
+
+    Diagnostic only (no behaviour change): write token ids (whitespace
+    separated) to /data/sm70_results/qsa_rank_probe; every page4 planning call
+    then appends the rank of those pages in `idx_p4` to
+    /data/sm70_results/qsa_rank_diag.log.
+
+    This answers the question that decides the next optimization: if the page
+    that carries the answer already ranks in the top-16 of the candidates, the
+    loss happens after selection (plan/mask), not in the ranking; if it ranks
+    deep, the ranker is the limit and only better scores help.
+    """
+    path = "/data/sm70_results/qsa_rank_probe"
+    try:
+        st = os.stat(path)
+    except OSError:
+        _rank_diag_state["probe"] = None
+        return
+    if _rank_diag_state["probe"] is None or st.st_mtime != _rank_diag_state["mtime"]:
+        try:
+            with open(path) as f:
+                ids = [int(x) for x in f.read().split()]
+        except (OSError, ValueError):
+            return
+        _rank_diag_state["probe"] = torch.tensor(ids, dtype=torch.int64) if ids else None
+        _rank_diag_state["mtime"] = st.st_mtime
+    probe = _rank_diag_state["probe"]
+    if probe is None or idx_p4.numel() == 0:
+        return
+    pages = (probe.to(idx_p4.device) & ~3).to(idx_p4.dtype)
+    # Column 0 of each 4-token page is its first token.
+    starts = idx_p4[:, 0 : 2048].view(idx_p4.shape[0], 512, 4)[:, :, 0]
+    for page in pages:
+        hit = starts == page
+        rows_hit = int(hit.any(dim=1).sum())
+        if rows_hit == 0:
+            continue
+        ranks = hit.to(torch.int64).argmax(dim=1).masked_select(hit.any(dim=1))
+        line = (
+            f"rank_diag page={int(page)} rows={idx_p4.shape[0]} rows_hit={rows_hit} "
+            f"min={int(ranks.min())} med={int(ranks.median())} max={int(ranks.max())}\n"
+        )
+        try:
+            with open("/data/sm70_results/qsa_rank_diag.log", "a") as f:
+                f.write(line)
+        except OSError:
+            pass
+
+
 
 
 def _qsa_page4_route(
@@ -959,6 +993,8 @@ def _qsa_page4_route(
     output_gate_view: torch.Tensor,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    prefill: bool = False,
+    layer_idx: int = -1,
 ) -> None:
     """Run the Flash-V100 grouped page4 planner + fwd into out."""
     global _page4_audit_done, _page4_logged
@@ -1045,7 +1081,7 @@ def _qsa_page4_route(
     # buffer is one index column wider, so hand the planner the first 2050
     # columns with the count clamped to what they hold — bit-identical to
     # 1Cat's production buffer (their indexer fits 2050 columns).
-    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "0") == "1":
+    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "1") == "1":
         # Candidate I: one launch instead of clamp + cat, same integers
         # (gated, default 0 = byte-identical main path; the module is only
         # imported when the valve is on).
@@ -1061,7 +1097,8 @@ def _qsa_page4_route(
             dim=1,
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
-    _page_budget, _legacy_cap = _qsa_verify_page_budget()
+    _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
+    _rank_diag_page_ranks(idx_p4)
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
         block_table,
@@ -1159,10 +1196,10 @@ def _flashv100_tp8_module():
     _flashv100_tp8_mod = _qsa_page4_local_ops()
     if _flashv100_tp8_mod is None:
         logger.error(
-            "QSA page4 TP8 DISABLED: in-tree stable-ABI ops missing (write "
-            "'local' to %s and check `import vllm._custom_ops`); there is no "
+            "QSA page4 TP8 DISABLED: in-tree stable-ABI ops missing (set "
+            "%s=local and check `import vllm._custom_ops`); there is no "
             ".so fallback by policy - do not trust page4 numbers",
-            _QSA_PAGE4_LOCAL_MODE_FILE,
+            _PAGE4_BACKEND_ENV,
         )
     return _flashv100_tp8_mod
 
@@ -1247,6 +1284,8 @@ def _qsa_page4_tp8_route(
     output_gate_view: torch.Tensor,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    prefill: bool = False,
+    layer_idx: int = -1,
 ) -> None:
     """TP8 page4: pad q to the M1a 4-head geometry (head 3 zero), run
     planner + fwd, copy the 3 real heads into out, apply the gate."""
@@ -1304,7 +1343,7 @@ def _qsa_page4_tp8_route(
     out_p4 = cap_outp4[:rows]
     q_p4[:, :3].copy_(q)
     q_p4[:, 3].zero_()
-    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "0") == "1":
+    if os.getenv("VLLM_SM70_QSA_PLAN_PACK", "1") == "1":
         # Candidate I: one launch instead of clamp + cat, same integers
         # (gated, default 0 = byte-identical main path; the module is only
         # imported when the valve is on).
@@ -1320,7 +1359,8 @@ def _qsa_page4_tp8_route(
             dim=1,
         )
     # Score-ordered budget (new, opt-in) vs the legacy post-plan token cap.
-    _page_budget, _legacy_cap = _qsa_verify_page_budget()
+    _page_budget, _legacy_cap = _qsa_verify_page_budget(prefill)
+    _rank_diag_page_ranks(idx_p4)
     m.grouped_sparse_page4_plan_fwd(
         idx_p4,
         block_table,
@@ -2206,6 +2246,7 @@ def qsa_sparse_paged_attention(
     output_gate: torch.Tensor,
     query_positions: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
+    layer_idx: int = -1,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 or FP8-e4m3 K/V caches.
 
@@ -2344,6 +2385,8 @@ def qsa_sparse_paged_attention(
             output_gate_view,
             k_scale or 1.0,
             v_scale or 1.0,
+            prefill=use_prefill_config,
+            layer_idx=layer_idx,
         )
         return out
 
@@ -2377,6 +2420,8 @@ def qsa_sparse_paged_attention(
             output_gate_view,
             k_scale=k_scale or 1.0,
             v_scale=v_scale or 1.0,
+            prefill=use_prefill_config,
+            layer_idx=layer_idx,
         )
         return out
 
@@ -2448,7 +2493,7 @@ def qsa_sparse_paged_attention(
         # raw pool bytes to the split-K kernel.
         raise NotImplementedError(
             "QSA nvfp4 KV needs the page4-TP8 route "
-            "(SM70_PAGE4_TP8=1 or /tmp/page4_tp8_mode)"
+            "(SM70_PAGE4_TP8=1)"
         )
 
     if (
@@ -2461,7 +2506,7 @@ def qsa_sparse_paged_attention(
         # deep in Triton with a CompilationError.
         raise NotImplementedError(
             "QSA fp8-e4m3 KV on sm_70 needs the page4-TP8 route "
-            "(SM70_PAGE4_TP8=1 or /tmp/page4_tp8_mode); the Triton arm "
+            "(SM70_PAGE4_TP8=1); the Triton arm "
             "cannot compile fp8e4nv on this architecture"
         )
 

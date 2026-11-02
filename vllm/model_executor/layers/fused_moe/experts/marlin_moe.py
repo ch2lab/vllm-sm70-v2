@@ -68,7 +68,7 @@ def _sm70_fuse_act() -> bool:
     """
     import os as _os
 
-    return _os.environ.get("VLLM_SM70_MOE_FUSE_ACT", "0") == "1"
+    return _os.environ.get("VLLM_SM70_MOE_FUSE_ACT", "1") == "1"
 
 
 def _sm70_nvfp4_moe() -> bool:

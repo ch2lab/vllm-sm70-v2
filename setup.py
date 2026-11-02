@@ -1667,6 +1667,13 @@ if USE_PRECOMPILED_RUST_FRONTEND and not is_metadata_only_build():
     for pkg, files in patch.items():
         package_data.setdefault(pkg, []).extend(files)
 
+# SM70 (V100) flat all-reduce: build_sm70.sh produces vllm/sm70_flat_ar.so and
+# sm70_flat_ar.py loads it from the package directory. It is not an ext_module,
+# so without this line the wheel ships the loader but not the kernel and every
+# install silently loses the flat AR path (13.79 vs 23.6 us per call).
+if (ROOT_DIR / "vllm" / "sm70_flat_ar.so").exists():
+    add_vllm_package_data("sm70_flat_ar.so")
+
 # If the rust frontend binary is already present in the source tree (e.g.,
 # pre-built in a separate Docker build stage), ship it as-is.
 if PRECOMPILED_RUST_FRONTEND_PATH.exists():

@@ -870,7 +870,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # A SECOND model construction (expert-parallel setup, dummy build)
             # re-registers the same prefix. Default keeps the strict check;
             # VLLM_SM70_ALLOW_DUP_LAYER=1 replaces the stale entry instead.
-            if os.getenv("VLLM_SM70_ALLOW_DUP_LAYER", "0") != "1":
+            if os.getenv("VLLM_SM70_ALLOW_DUP_LAYER", "1") != "1":
                 raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
@@ -1347,118 +1347,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        if (
-            os.environ.get("VLLM_SM70_GDNWGT") == "1"
-            and not getattr(self, "_qkvz_wgt_dumped", False)
-        ):
-            self._qkvz_wgt_dumped = True
-            import sys as _wsys
-            _wrk = (
-                torch.distributed.get_rank()
-                if torch.distributed.is_initialized()
-                else 0
-            )
-            for _wn, _wm in (("qkvz", self.in_proj_qkvz), ("ba", self.in_proj_ba)):
-                for _sn, _sv in _wm.state_dict().items():
-                    if isinstance(_sv, torch.Tensor):
-                        print(
-                            f"[WGT] r{_wrk} {_wn} {_sn} shp={tuple(_sv.shape)} "
-                            f"dtype={_sv.dtype}",
-                            file=_wsys.stderr,
-                            flush=True,
-                        )
-        # SM70 Qwen3.8: one merged qkvz+ba GEMV launch (set by
-        # enable_qwen38_sm70_fp16_gemv on the exact-model contract); the op
-        # falls back to the two standard projections outside M=1 decode.
-        if getattr(self, "sm70_qwen38_fp16_fused_input", False):
-            mixed_qkvz, ba = torch.ops.vllm.qwen38_sm70_fp16_gdn_input_packed(
-                hidden_states, self.in_proj_qkvz.weight, self.in_proj_ba.weight
-            )
-        else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-        if os.environ.get("VLLM_SM70_GDNPROJ") == "1":
-            import sys as _psys
-            import torch.distributed as _pdist
-            _prk = _pdist.get_rank() if _pdist.is_initialized() else 0
-            _hin = hidden_states.detach().float()
-            _qo = mixed_qkvz.detach().float()
-            _bo = ba.detach().float()
-            print(
-                f"[PROJ] r{_prk} {self.prefix[-30:]} "
-                f"in_sum={_hin.sum().item():.6g} in_max={_hin.abs().max().item():.6g} "
-                f"qkvz_sum={_qo.sum().item():.6g} qkvz_max={_qo.abs().max().item():.6g} "
-                f"qkvz_shp={tuple(_qo.shape)} ba_sum={_bo.sum().item():.6g} "
-                f"ba_shp={tuple(_bo.shape)}",
-                file=_psys.stderr,
-                flush=True,
-            )
-            # Dump the actual weight the qkvz layer holds / uses.
-            _kern = getattr(self.in_proj_qkvz.quant_method, "fp8_linear", None)
-            for _attr, _src in (
-                ("weight", lambda: getattr(self.in_proj_qkvz, "weight", None)),
-                ("deq", lambda: getattr(_kern, "_weight_deq", None)),
-                ("qpn", lambda: getattr(_kern, "_qpn", None)),
-            ):
-                _wt = _src()
-                if isinstance(_wt, torch.Tensor):
-                    _wf = _wt.detach().float()
-                    print(
-                        f"[PROJW] r{_prk} {self.prefix[-30:]} {_attr} "
-                        f"shp={tuple(_wt.shape)} sum={_wf.sum().item():.6g} "
-                        f"max={_wf.abs().max().item():.6g}",
-                        file=_psys.stderr,
-                        flush=True,
-                    )
-            # GDN-specific params that must be TP-sharded correctly.
-            for _pn, _pt in (
-                ("conv1d", self.conv1d.weight),
-                ("A_log", self.A_log),
-                ("dt_bias", self.dt_bias),
-                ("norm", self.norm.weight),
-            ):
-                if isinstance(_pt, torch.Tensor):
-                    _pf = _pt.detach().float()
-                    print(
-                        f"[PROJW] r{_prk} {self.prefix[-30:]} {_pn} "
-                        f"shp={tuple(_pt.shape)} sum={_pf.sum().item():.6g} "
-                        f"max={_pf.abs().max().item():.6g}",
-                        file=_psys.stderr,
-                        flush=True,
-                    )
-            # out_proj (RowParallelLinear): verify weight sharding. Each rank's
-            # weight [out, in_per_rank] must equal TP1 weight [out, in_full][:,
-            # rank*in_per_rank : (rank+1)*in_per_rank].
-            _opw = getattr(self.out_proj, "weight", None)
-            if not isinstance(_opw, torch.Tensor):
-                # FP8 out_proj: the SM70 kernel deletes .weight and keeps the
-                # dequantized FP16 copy on the kernel.
-                _k = getattr(
-                    getattr(self.out_proj, "quant_method", None),
-                    "fp8_linear",
-                    None,
-                )
-                if _k is not None:
-                    _opw = getattr(_k, "_weight_deq", None)
-                    if _opw is None:
-                        _opw = getattr(_k, "_qpn", None)
-            if isinstance(_opw, torch.Tensor):
-                _opw = _opw.detach().float()
-                # first-half input slice: == this rank's full weight at TP2,
-                # == TP1 weight's first-half input columns. Comparable across TP.
-                _half = self.value_dim // 2
-                _wsum = _opw.sum().item()
-                _wfirst = _opw[..., :_half].sum().item()
-                _row0first = _opw[0, :_half].sum().item()
-                _row1first = _opw[1, :_half].sum().item()
-                print(
-                    f"[PROJW] r{_prk} {self.prefix[-30:]} out_proj "
-                    f"shp={tuple(_opw.shape)} sum={_wsum:.6g} "
-                    f"first_insum={_wfirst:.6g} "
-                    f"row0={_row0first:.6g} row1={_row1first:.6g}",
-                    file=_psys.stderr,
-                    flush=True,
-                )
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode

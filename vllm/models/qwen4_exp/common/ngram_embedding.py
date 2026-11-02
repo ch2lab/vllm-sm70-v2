@@ -74,7 +74,7 @@ def _ple_sync_requested() -> bool:
     PinnedPleEmbedding.start_prefetch). Default off, so the overlapped side-stream
     path stays the production behaviour.
     """
-    return os.environ.get("VLLM_SM70_PLE_SYNC", "0") == "1"
+    return os.environ.get("VLLM_SM70_PLE_SYNC", "1") == "1"
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
