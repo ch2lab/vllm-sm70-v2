@@ -229,24 +229,29 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
                                    int n_pick_sb, int sink, int win,
                                    int* __restrict__ sel_bt,
                                    int* __restrict__ sel_len) {
-  const int h = blockIdx.x;
+  __shared__ float sm[1088];
   const int tid = threadIdx.x;
+  const int nh = gridDim.y;
   const int kv_len = kv_lens[0];
   const int npages = (kv_len + npg - 1) / npg;
-  const float* sc = scores + (long)h * nsuper;
-  int* out = sel_bt;                      // shared table (all heads see the same)
+  int* out = sel_bt;
   for (int i = tid; i < nsuper; i += blockDim.x) {
-    const float s = sc[i];
+    float s = -1e30f;
+    for (int h = 0; h < nh; ++h)
+      s = fmaxf(s, scores[(long)h * nsuper + i]);
+    sm[i] = s;
+  }
+  __syncthreads();
+  for (int i = tid; i < nsuper; i += blockDim.x) {
+    const float s = sm[i];
     if (s <= -1e29f) continue;
     int rank = 0;
-    for (int j = 0; j < nsuper; ++j) {
-      const float t = sc[j];
-      if (t > s || (t == s && j < i)) ++rank;
-    }
+    for (int j = 0; j < nsuper; ++j)
+      if (sm[j] > s || (sm[j] == s && j < i)) ++rank;
     if (rank < n_pick_sb) {
       for (int j = 0; j < per_sb; ++j) {
-        const int pg = i * per_sb + j;
-        out[rank * per_sb + j] = (pg < cols) ? bt_row[pg] : 0;
+        const int pg = min(i * per_sb + j, npages - 1);
+        out[rank * per_sb + j] = bt_row[min(pg, cols - 1)];
       }
     }
   }
@@ -285,7 +290,8 @@ void select_pages(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
       kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
       kv_lens.data_ptr<int>(), scores.data_ptr<float>(), HQ, D, NP, DD, SD,
       page_bytes, cols, nsuper, 0, 0, G, (int)super_, (int)samples);
-  build_table_kernel<<<H, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
+  dim3 g2(1, H);
+  build_table_kernel<<<g2, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
       scores.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
       kv_lens.data_ptr<int>(), (int)npg, n_pick_sb, (int)sink, (int)win,
       sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
