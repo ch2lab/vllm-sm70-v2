@@ -491,14 +491,29 @@ void run_tiles(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
 // sc[t * nb + b] = max over the block's tokens of dot(Kb[tok], qmean[t]) * sm.
 // This is the exact maximum logit any token of block b can reach for tile t, so
 // ranking blocks by it never discards a block that could dominate the softmax.
+// Grid is (tiles, splits): one block per split keeps every SM busy, since the
+// per-call work is otherwise tiny and latency-bound.
+__device__ __forceinline__ void atomic_max_f(float* p, float v) {
+  int* pi = reinterpret_cast<int*>(p);
+  int old = *pi, assumed;
+  while (v > __int_as_float(old)) {
+    assumed = old;
+    old = atomicCAS(pi, assumed, __float_as_int(v));
+    if (old == assumed) break;
+  }
+}
+
 __global__ void blk_max_score(const __half* __restrict__ Kb,
                               const __half* __restrict__ qmean,
                               float* __restrict__ sc, int bslot, int nb, int bn,
-                              int D, float sm) {
-  const int t = blockIdx.x;
+                              int D, float sm, int nsplit) {
+  const int t = blockIdx.x, part = blockIdx.y;
+  const int per = (bn + nsplit - 1) / nsplit;
+  const int lo = part * per;
+  const int hi = std::min(bn, lo + per);
   const __half* q = qmean + (long)t * D;
   float mx = -1e30f;
-  for (int tok = threadIdx.x; tok < bn; tok += blockDim.x) {
+  for (int tok = lo + threadIdx.x; tok < hi; tok += blockDim.x) {
     const __half* k = Kb + (long)tok * D;
     float acc = 0.f;
     for (int d = 0; d < D; d += 2) {
@@ -517,7 +532,7 @@ __global__ void blk_max_score(const __half* __restrict__ Kb,
   if (threadIdx.x == 0) {
     float v = -1e30f;
     for (int w = 0; w < (int)(blockDim.x >> 5); w++) v = fmaxf(v, red[w]);
-    sc[(long)t * nb + bslot] = v * sm;
+    atomic_max_f(sc + (long)t * nb + bslot, v * sm);
   }
 }
 
@@ -561,8 +576,10 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
       o += M;
     }
   }
-  auto sc = torch::zeros({nt, nblk}, Qd.options().dtype(at::kFloat));
+  auto sc = torch::full({nt, nblk}, -1e30f, Qd.options().dtype(at::kFloat));
   const int threads = 256, per = threads / 8;
+  const int nsplit = (int)std::max(1, std::min(32, (int)(BN / 256)));
+  dim3 sgrid((unsigned)nt, (unsigned)nsplit);
   for (int b = 0; b < nblk; b++) {
     const int k0 = b * (int)BN;
     const int bnb = (int)std::min<int64_t>(BN, kv_len - k0);
@@ -574,10 +591,10 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
         (int)NP, (int)DD, (int)SD, (float)k_scale, (float)v_scale,
         reinterpret_cast<const __half*>(lut.data_ptr<at::Half>()),
         (int)hstride, (int)tstride);
-    blk_max_score<<<nt, 256, 0, stream.stream()>>>(
+    blk_max_score<<<sgrid, 256, 0, stream.stream()>>>(
         reinterpret_cast<const __half*>(Kb.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(qmean.data_ptr<at::Half>()),
-        sc.data_ptr<float>(), b, nblk, bnb, D, (float)sm_scale);
+        sc.data_ptr<float>(), b, nblk, bnb, D, (float)sm_scale, nsplit);
   }
   auto sch = sc.to(at::kCPU);
   const float* sp = sch.data_ptr<float>();
