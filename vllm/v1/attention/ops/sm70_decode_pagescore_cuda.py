@@ -234,7 +234,26 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
   const int nh = gridDim.y;
   const int kv_len = kv_lens[0];
   const int npages = (kv_len + npg - 1) / npg;
+  // The budget is a *maximum*: on a short context there may be fewer pages than
+  // the budget, and writing the full budget anyway (with pages clamped to the
+  // last one) made sel_len exceed kv_len -- the kernel then attended to the same
+  // tail page many times over, costing 6.4x the work at 10K and skewing the
+  // softmax.  Cap the budget at what the request actually has.
+  const int max_sb = (npages + per_sb - 1) / per_sb;
+  const int n_pick = min(n_pick_sb, max_sb);
   int* out = sel_bt;
+  if (n_pick >= max_sb) {
+    // The budget covers the whole context: there is nothing to select.  Emit the
+    // identity page table so this step is bit-for-bit the dense path (same page
+    // order, same length) instead of a re-ranked permutation of everything --
+    // a permutation cannot be faster, and it made short contexts behave
+    // differently for no gain.
+    for (int i = tid; i < npages; i += blockDim.x)
+      out[i] = bt_row[min(i, cols - 1)];
+    __syncthreads();
+    if (tid == 0) sel_len[0] = kv_len;
+    return;
+  }
   for (int i = tid; i < nsuper; i += blockDim.x) {
     float s = -1e30f;
     for (int h = 0; h < nh; ++h)
@@ -248,7 +267,7 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
     int rank = 0;
     for (int j = 0; j < nsuper; ++j)
       if (sm[j] > s || (sm[j] == s && j < i)) ++rank;
-    if (rank < n_pick_sb) {
+    if (rank < n_pick) {
       for (int j = 0; j < per_sb; ++j) {
         const int pg = min(i * per_sb + j, npages - 1);
         out[rank * per_sb + j] = bt_row[min(pg, cols - 1)];
@@ -257,13 +276,14 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
   }
   __syncthreads();
   if (tid == 0) {
-    int pos = n_pick_sb * per_sb;
+    int pos = n_pick * per_sb;
     for (int i = 0; i < sink; ++i) out[pos++] = bt_row[min(i, cols - 1)];
     const int w0 = max(npages - win, sink);
     for (int i = 0; i < win; ++i) out[pos++] = bt_row[min(w0 + i, cols - 1)];
     out[pos++] = bt_row[min(max(npages - 1, 0), cols - 1)];
     const int tail = kv_len - (npages - 1) * npg;
-    sel_len[0] = (pos - 1) * npg + tail;
+    const int slen = (pos - 1) * npg + tail;
+    sel_len[0] = slen < kv_len ? slen : kv_len;
   }
 }
 
