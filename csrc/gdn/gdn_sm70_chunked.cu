@@ -33,7 +33,7 @@
 
 namespace {
 
-constexpr int C = 32;       // FLA chunk size
+constexpr int C = 64;       // FLA chunk size
 constexpr int K_DIM = 128;  // head dim K
 constexpr int V_DIM = 128;  // head dim V
 constexpr int BV2 = 16;     // K2 value tile (v4: 32->16: 24->48 CTAs, latency
