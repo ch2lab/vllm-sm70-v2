@@ -549,13 +549,19 @@ __global__ void blk_max_score(const __half* __restrict__ Kb,
 __global__ void seed_prior(float* __restrict__ prior,
                            const int* __restrict__ bt_row,
                            const float* __restrict__ scsu_row, int nsuper,
-                           int pages_per_sb, int cols) {
+                           int pages_per_sb, int cols, int prior_n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= nsuper) return;
   const float v = scsu_row[i];
   const int p0 = i * pages_per_sb;
-  for (int j = 0; j < pages_per_sb; ++j)
-    prior[bt_row[min(p0 + j, cols - 1)]] = v;
+  // Both ends are bounded: the slot inside the block table AND the page id read
+  // from it.  Without the second clamp a stale/garbage block-table entry (which
+  // prefix-cache reuse can leave behind) becomes an out-of-bounds write into
+  // unrelated device memory.
+  for (int j = 0; j < pages_per_sb; ++j) {
+    const int pg = bt_row[min(p0 + j, cols - 1)];
+    if (pg >= 0 && pg < prior_n) prior[pg] = v;
+  }
 }
 
 // Same maths as run_tiles, but only the kept (q tile, k block) pairs run their
@@ -630,7 +636,7 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
     seed_prior<<<(nsuper + 255) / 256, 256, 0, stream.stream()>>>(
         prior.data_ptr<float>(), bt.data_ptr<int>(),
         scsu.data_ptr<float>() + (long)(nt - 1) * nsuper, nsuper, pages_per_sb,
-        (int)bt_cols);
+        (int)bt_cols, (int)prior.numel());
   }
   auto sch = sc.to(at::kCPU);
   const float* sp = sch.data_ptr<float>();
