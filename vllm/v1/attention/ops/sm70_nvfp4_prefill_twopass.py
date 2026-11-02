@@ -843,6 +843,19 @@ def try_paged_prefill_twopass(q, kv_cache, block_table, qo_indptr, kv_lens, out,
     side_off = H * kv_cache.shape[2] * kv_cache.shape[3]
     try:
         qo, kl = qo_indptr.tolist(), kv_lens.tolist()
+        if os.environ.get("VLLM_SM70_PROBE_MASS"):
+            # Task 2.5.1 probe: the last token of the chunk attends causally to
+            # the whole prefix, which is exactly the distribution the decode step
+            # will face.  Prefill is never CUDA-graph captured, so this always
+            # runs.  Any failure disables the probe, never the request.
+            try:
+                from . import sm70_attn_mass_cuda as _mass
+
+                if _mass.enabled():
+                    _mass.probe(qo, q, kv_cache, block_table, kv_lens,
+                                sm_scale, 128, 8192)
+            except Exception:  # noqa: BLE001
+                os.environ.pop("VLLM_SM70_PROBE_MASS", None)
         for r in range(block_table.shape[0]):
             q0, q1 = int(qo[r]), int(qo[r + 1])
             klen = int(kl[r])
