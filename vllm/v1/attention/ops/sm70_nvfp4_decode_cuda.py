@@ -875,7 +875,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             _mod_xqa(H, HQ).run(q, kv_cache, _SEL_BT, _SEL_LENS, _BUF[:need], out,
                                 k_scale, v_scale, sm_scale, _NPARTS_XQA,
                                 -1, R, None, None, 0, 0,
-                                int(kv_cache.size(2)))
+                                int(kv_cache.size(2)), int(q0), int(nqt))
             return True
         _mod_xqa(H, HQ).run(q, kv_cache, block_table, kv_lens, _BUF[:need], out,
                             k_scale, v_scale, sm_scale, _NPARTS_XQA,
