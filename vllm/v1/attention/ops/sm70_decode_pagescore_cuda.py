@@ -561,6 +561,111 @@ __global__ void page_to_super_max_kernel(
   if (tid == 0) out[h * nsuper + sb] = red[0];
 }
 
+
+// Exact page score: max over the page's 16 tokens and the G query heads of
+// q.k_t.  This is the true top logit any token of the page can contribute, so
+// ranking by it cannot lose a needle to the looseness of a min/max bound (the
+// bound sums |q|*max|k| per dim, which ranks by K norm rather than relevance).
+// Thread layout mirrors the XQA KV reader: 16 tokens x 16 scale groups, each
+// thread dequantising 16 fp4 dims (uint2) with one e4m3 scale.
+__global__ void page_exact_score_kernel(
+    const unsigned char* __restrict__ kv, const int* __restrict__ bt,
+    const int* __restrict__ kvlens, const __half* __restrict__ q,
+    float* __restrict__ out, int HQ, int H, int D, int NP, int DD, int SD,
+    int page_bytes, int cols, int G, int r, const int* __restrict__ state) {
+  if (state[3] == 0) return;
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int stok = tid >> 4, ssub = tid & 15;
+  const int kv_len = kvlens[r];
+  __shared__ float s_e2[16];
+  __shared__ float s_e4[256];
+  __shared__ __half sq[8][256];
+  __shared__ float sdot[16][8];
+  if (tid < 16) s_e2[tid] = e2m1_score(tid);
+  s_e4[tid] = e4m3_score((unsigned char)tid);
+  for (int g = 0; g < G; ++g)
+    if (tid < D) sq[g][tid] = q[((long)(h * G + g)) * D + tid];
+  __syncthreads();
+  for (int pg = blockIdx.y; pg < cols; pg += gridDim.y) {
+    if (pg * NP >= kv_len) break;
+    const int bid = bt[r * cols + pg];
+    const unsigned char* base = kv + (long)bid * page_bytes;
+    const bool live = (pg * NP + stok) < kv_len;
+    float v[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) v[i] = 0.f;
+    if (live) {
+      const unsigned char* kd = base + (long)h * (NP * DD)
+                                + (long)stok * DD + ssub * 8;
+      const unsigned char* ks = base + (long)H * (NP * DD)
+                                + (long)h * (NP * SD) + (long)stok * SD + ssub;
+      const uint2 raw = *reinterpret_cast<const uint2*>(kd);
+      const float sc = s_e4[*ks];
+      const unsigned int w[2] = {raw.x, raw.y};
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int code = (w[j] >> (b * 8)) & 0xFFu;
+          v[j * 8 + b * 2] = s_e2[code & 0xF] * sc;
+          v[j * 8 + b * 2 + 1] = s_e2[code >> 4] * sc;
+        }
+    }
+    float best = -1e30f;
+    for (int g = 0; g < G; ++g) {
+      float a = 0.f;
+      if (live) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+          a += v[i] * __half2float(sq[g][ssub * 16 + i]);
+      } else {
+        a = -1e30f;
+      }
+      for (int off = 8; off > 0; off >>= 1)
+        a += __shfl_down_sync(0xffffffffu, a, off, 16);
+      if (ssub == 0) sdot[stok][g] = a;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      /* One writer: the score is the max over BOTH tokens and query heads, so
+         several threads must not each store their own head's value. */
+      float m = -1e30f;
+#pragma unroll
+      for (int t = 0; t < 16; ++t)
+        for (int g = 0; g < G; ++g) m = fmaxf(m, sdot[t][g]);
+      out[h * cols + pg] = m;
+    }
+    __syncthreads();
+  }
+}
+
+/* Host code must never dereference a device pointer: force the gate open with a
+   kernel, exactly like the periodic gate does. */
+__global__ void sel_gate_force_kernel(int* __restrict__ state) { state[3] = 1; }
+
+void page_exact_scores(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
+                       torch::Tensor kv_lens, torch::Tensor out,
+                       torch::Tensor state, int64_t r) {
+  const int HQ = q.size(0), D = q.size(1);
+  const int H = kv.size(1) / 2;
+  const int NP = kv.size(2);
+  const int DD = D / 2, SD = D / 16;
+  const int page_bytes = 2 * (H * NP * DD + H * NP * SD);
+  const int G = HQ / H;
+  const int cols = (int)bt_row.numel();
+  int* st = state.data_ptr<int>();
+  sel_gate_force_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(st);
+  const int gcols = (int)std::min<long>(cols, 512L);
+  page_exact_score_kernel<<<dim3(H, gcols), 256, 0,
+                            at::cuda::getCurrentCUDAStream()>>>(
+      kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
+      kv_lens.data_ptr<int>(),
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      out.data_ptr<float>(), HQ, H, D, NP, DD, SD, page_bytes, cols, G,
+      (int)r, st);
+}
+
 void select_pages_minmax(torch::Tensor q, torch::Tensor kv,
                          torch::Tensor bt_row, torch::Tensor kv_lens,
                          torch::Tensor sel_bt, torch::Tensor sel_len,
@@ -568,7 +673,7 @@ void select_pages_minmax(torch::Tensor q, torch::Tensor kv,
                          int64_t npg, int64_t super_, int64_t n_pick_pages,
                          int64_t sink, int64_t win, int64_t scan,
                          torch::Tensor state, int64_t period_calls,
-                         int64_t dense_max) {
+                         int64_t dense_max, int64_t exact) {
   const int HQ = q.size(0), D = q.size(1);
   const int H = kv.size(1) / 2;
   const int NP = kv.size(2);
@@ -583,27 +688,39 @@ void select_pages_minmax(torch::Tensor q, torch::Tensor kv,
      block-table width, so their row stride is not `cols`.  Getting this wrong
      silently loaded the wrong page's bound. */
   const int kstride = (int)kmin.size(1);
+  const int G = HQ / H;
   sel_gate_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
       kv_lens.data_ptr<int>(), st, (int)period_calls);
   /* Cap the page-parallel grids: with 16848 block-table columns the launch
      itself cost ~0.9 ms/step at 10K, where every block early-exits. */
   const int gcols = (int)std::min<long>(cols, 512L);
-  dim3 g1(H, gcols);
-  if (scan)
-  page_minmax_k_kernel<<<g1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
-      kv_lens.data_ptr<int>(),
-      reinterpret_cast<__half*>(kmin.data_ptr<at::Half>()),
-      reinterpret_cast<__half*>(kmax.data_ptr<at::Half>()), D, NP, DD, SD,
-      page_bytes, cols, cols, 0, 1, st, kstride);
   auto psc = torch::empty({H, cols}, opts.dtype(torch::kFloat));
-  dim3 g2(H, gcols);
-  page_bound_score_kernel<<<g2, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
-      reinterpret_cast<const __half*>(kmin.data_ptr<at::Half>()),
-      reinterpret_cast<const __half*>(kmax.data_ptr<at::Half>()),
-      psc.data_ptr<float>(), HQ, H, D, cols, st, kstride, (int)npg,
-      kv_lens.data_ptr<int>());
+  if (exact) {
+    /* One pass over K per page, scored exactly: no min/max metadata needed. */
+    page_exact_score_kernel<<<dim3(H, gcols), 256, 0,
+                              at::cuda::getCurrentCUDAStream()>>>(
+        kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
+        kv_lens.data_ptr<int>(),
+        reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+        psc.data_ptr<float>(), HQ, H, D, NP, DD, SD, page_bytes, cols, G, 0,
+        st);
+  } else {
+    dim3 g1(H, gcols);
+    if (scan)
+    page_minmax_k_kernel<<<g1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
+        kv_lens.data_ptr<int>(),
+        reinterpret_cast<__half*>(kmin.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(kmax.data_ptr<at::Half>()), D, NP, DD, SD,
+        page_bytes, cols, cols, 0, 1, st, kstride);
+    dim3 g2(H, gcols);
+    page_bound_score_kernel<<<g2, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(kmin.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(kmax.data_ptr<at::Half>()),
+        psc.data_ptr<float>(), HQ, H, D, cols, st, kstride, (int)npg,
+        kv_lens.data_ptr<int>());
+  }
   auto ssc = torch::empty({H, nsuper}, opts.dtype(torch::kFloat));
   dim3 g3(H, nsuper);
   page_to_super_max_kernel<<<g3, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -629,6 +746,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("select_pages_mean", &select_pages_mean);
   m.def("select_pages_prior", &select_pages_prior);
   m.def("select_pages_minmax", &select_pages_minmax);
+  m.def("page_exact_scores", &page_exact_scores);
 }
 """
 
@@ -696,7 +814,7 @@ def select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg=16, super_=256,
 def select_pages_minmax(q, kv, bt_row, kvlens, sel_bt, sel_len, kmin, kmax,
                         npg=16, super_=256, n_pick_pages=2048, sink=0, win=0,
                         scan=True, state=None, period_calls=1,
-                        dense_max=0):
+                        dense_max=0, exact=False):
     """Exact Quest bound: per-page K min/max, score = max(q*kmax, q*kmin).
 
     ``scan=False`` reuses the min/max metadata across layers of the same step;
@@ -716,7 +834,7 @@ def select_pages_minmax(q, kv, bt_row, kvlens, sel_bt, sel_len, kmin, kmax,
     _mod().select_pages_minmax(q, kv, bt_row, kvlens, sel_bt, sel_len, kmin,
                                kmax, npg, super_, n_pick_pages, sink, win,
                                int(scan), state, int(period_calls),
-                               int(dense_max))
+                               int(dense_max), int(exact))
     return sel_bt, sel_len
 
 
@@ -732,3 +850,8 @@ def page_mean_k(kv, bt, kvlens, kmean, r=0, pp=16):
     """Page-mean K, coalesced: [H, pages, D] fp16 in `kmean`."""
     _mod().page_mean_k(kv, bt, kvlens, kmean, r, pp)
     return kmean
+
+def page_exact_scores(q, kv, bt_row, kvlens, out, state, r=0):
+    """Per-(head, page) exact max_t(q.k_t); `out` is [H, cols] fp32."""
+    _mod().page_exact_scores(q, kv, bt_row, kvlens, out, state, r)
+    return out

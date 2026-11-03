@@ -897,6 +897,9 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
         # bit-for-bit dense.  The table must therefore hold that many pages.
         _dense_max = int(os.environ.get(
             "VLLM_SM70_DECODE_TOPK_DENSE_MAX", "0"))
+        # Rank pages by the exact max_t(q.k_t) instead of Quest's min/max bound:
+        # the bound sums |q|*max|k| per dim, so it ranks by K norm, not relevance.
+        _exact = os.environ.get("VLLM_SM70_DECODE_TOPK_EXACT", "0") == "1"
         if _topk_pages > 0 and R == 1 and nqt == 1:
             # Content-based page selection (plan Phase 3): one fused call does
             # superblock scoring + exact top-k + the compacted block table, then
@@ -1014,7 +1017,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                                     sink=_sink, win=_win_eff,
                                     scan=True, state=_SELSTATE,
                                     period_calls=max(1, _period),
-                                    dense_max=_dense_max)
+                                    dense_max=_dense_max, exact=_exact)
             elif _mean:
                 global _KMEAN
                 _need = (H, int(kv_cache.shape[0]), int(q.shape[1] * 0 + 256))
