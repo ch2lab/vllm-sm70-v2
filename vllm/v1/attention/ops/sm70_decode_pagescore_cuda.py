@@ -418,6 +418,13 @@ __global__ void page_minmax_k_kernel(
   const int d = threadIdx.x;
   const int sub = d >> 4;
   const int kv_len = kvlens[r];
+  // 256-entry LUTs: the scalar e4m3/e2m1 conversion was the whole 2.4 ms/layer
+  // (PP=16 and PP=1 measured identical), so replace it with one smem read.
+  __shared__ float s_e2[16];
+  __shared__ float s_e4[256];
+  if (d < 16) s_e2[d] = e2m1_score(d);
+  s_e4[d] = e4m3_score((unsigned char)d);
+  __syncthreads();
   for (int pg = p0; pg < p0 + PP && pg < ntiles; ++pg) {
     if (pg * NP >= kv_len) break;
     const int bid = bt[r * bt_cols + pg];
@@ -432,8 +439,8 @@ __global__ void page_minmax_k_kernel(
       if (pg * NP + t >= kv_len) break;
       const unsigned char byte = kdata[(long)t * DD + (d >> 1)];
       const int code = ((d & 1) ? (byte >> 4) : (byte & 0xF));
-      const float sc = e4m3_score(kscale[(long)t * SD + sub]);
-      const float v = e2m1_score(code) * sc;
+      const float sc = s_e4[kscale[(long)t * SD + sub]];
+      const float v = s_e2[code] * sc;
       lo = fminf(lo, v);
       hi = fmaxf(hi, v);
       ++n;
