@@ -471,6 +471,11 @@ void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict_
   };
 
   fetch(0);
+  // sLUT is written by all 256 threads but commit() reads entries written by
+  // other warps; without this barrier the first block can dequant with an
+  // uninitialised LUT (observed as intermittent non-finite logits under
+  // concurrency, 2026-11-03).
+  __syncthreads();
   commit(0);
   __syncthreads();
 
