@@ -93,6 +93,15 @@ class OutputWatchdog(LogitsProcessor):
         self, req_idx: int, sampling_params: "SamplingParams"
     ) -> bool:
         sp = sampling_params
+        rp = getattr(sp, "repetition_penalty", None)
+        # 2026-11-03: an agent config set repetition_penalty=1.5 and every
+        # sample burned max_tokens in reasoning with empty content, while the
+        # server returned 200. The safe range is 1.0-1.1; flag it loudly.
+        if rp is not None and float(rp) > 1.1:
+            logger.warning(
+                "OUTPUT-WATCHDOG HIGH-REP-PENALTY slot=%s repetition_penalty=%s "
+                "(safe range 1.0-1.1; higher values can leave the content "
+                "empty and spend max_tokens in reasoning)", req_idx, rp)
         self._params[req_idx] = (
             getattr(sp, "max_tokens", None),
             getattr(sp, "temperature", None),
