@@ -75,15 +75,18 @@ __global__ void split_decode(
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;   // warp = q-head
   const int kv_len = kvlens[r];
-  const long wslot = (long)(((r*H + h)*RATIO + warp) * splits + sp);
+  const bool active = warp < RATIO;
+  const long wslot = (long)(((r*H + h)*RATIO + (active ? warp : 0)) * splits + sp);
   const int wsbase = wslot * (D + 2);
 
-  const long qbase = (long)(r*HQ + h*RATIO + warp) * D;
+  const long qbase = (long)(r*HQ + h*RATIO + (active ? warp : 0)) * D;
   // lane owns dims [lane*8, lane*8+8)
   const int d0 = lane * 8;
   float qreg[8];
-  #pragma unroll
-  for (int j=0;j<8;j++) qreg[j] = __half2float(q[qbase + d0 + j]);
+  if (active) {
+    #pragma unroll
+    for (int j=0;j<8;j++) qreg[j] = __half2float(q[qbase + d0 + j]);
+  }
   float acc[8] = {0,0,0,0,0,0,0,0};
   float m_i = -1e30f, l_i = 0.f;
 
@@ -130,31 +133,35 @@ __global__ void split_decode(
       }
     }
     __syncthreads();
-    // this warp (q-head) attends to the N tokens
-    #pragma unroll
-    for (int t=0;t<N;t++){
-      int absolute = b*N + t;
-      if (absolute < lo || absolute >= kv_len) continue;
-      float part = 0.f;
+    // this warp (q-head) attends to the N tokens; idle warps only help dequant
+    if (active) {
       #pragma unroll
-      for (int j=0;j<8;j++) part += qreg[j] * __half2float(Ks[t][d0+j]);
-      // warp reduce
-      #pragma unroll
-      for (int off=16; off>0; off>>=1) part += __shfl_down_sync(0xffffffff, part, off);
-      float sc = __shfl_sync(0xffffffff, part, 0) * sm_scale;
-      float m_new = fmaxf(m_i, sc);
-      float p = __expf(sc - m_new);
-      float alpha = __expf(m_i - m_new);
-      l_i = l_i * alpha + p;
-      #pragma unroll
-      for (int j=0;j<8;j++) acc[j] = acc[j]*alpha + p * __half2float(Vs[t][d0+j]);
-      m_i = m_new;
+      for (int t=0;t<N;t++){
+        int absolute = b*N + t;
+        if (absolute < lo || absolute >= kv_len) continue;
+        float part = 0.f;
+        #pragma unroll
+        for (int j=0;j<8;j++) part += qreg[j] * __half2float(Ks[t][d0+j]);
+        // warp reduce
+        #pragma unroll
+        for (int off=16; off>0; off>>=1) part += __shfl_down_sync(0xffffffff, part, off);
+        float sc = __shfl_sync(0xffffffff, part, 0) * sm_scale;
+        float m_new = fmaxf(m_i, sc);
+        float p = __expf(sc - m_new);
+        float alpha = __expf(m_i - m_new);
+        l_i = l_i * alpha + p;
+        #pragma unroll
+        for (int j=0;j<8;j++) acc[j] = acc[j]*alpha + p * __half2float(Vs[t][d0+j]);
+        m_i = m_new;
+      }
     }
     __syncthreads();
   }
-  #pragma unroll
-  for (int j=0;j<8;j++) ws[wsbase + d0 + j] = acc[j];
-  if (lane == 0) { ws[wsbase + D] = m_i; ws[wsbase + D + 1] = l_i; }
+  if (active) {
+    #pragma unroll
+    for (int j=0;j<8;j++) ws[wsbase + d0 + j] = acc[j];
+    if (lane == 0) { ws[wsbase + D] = m_i; ws[wsbase + D + 1] = l_i; }
+  }
 }
 
 // combine: grid (R, H, RATIO), block 256; each block reduces `splits` partials for one (r,h,qh)
@@ -185,7 +192,9 @@ void run(torch::Tensor q, torch::Tensor kv, torch::Tensor bt, torch::Tensor kvle
          double sm_scale, int splits, int window, int R) {
 
   dim3 g(R, H, splits);
-  split_decode<<<g, 32 * RATIO, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+  // 256 threads are required by the cooperative dequant (16 tokens x 16 lanes);
+  // only the first RATIO warps own a q head.
+  split_decode<<<g, 256, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
       kv.data_ptr<unsigned char>(), bt.data_ptr<int>(), kvlens.data_ptr<int>(),
       ws.data_ptr<float>(), (float)k_scale, (float)v_scale, (float)sm_scale,
       bt.size(1), splits, window);
@@ -1010,8 +1019,11 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                             int(window_left), R, None, None, 0, 0,
                             int(kv_cache.size(2)), int(q0), int(nqt))
         return True
+    if nqt != 1 or q0 != 0:
+        return False  # spec-decode verify is XQA-only; use the Triton oracle
     need = R * HQ * _NPARTS * 258
+    # The scalar fallback (VLLM_SM70_DECODE_XQA=0) takes the compact signature;
+    # it has no page-list / q0 / nqt arguments.
     _mod(H, HQ).run(q, kv_cache, block_table, kv_lens, _BUF[:need], out,
-               k_scale, v_scale, sm_scale, _NPARTS, int(window_left), R, None,
-               None, 0, 0, int(kv_cache.size(2)), int(q0), int(nqt))
+                    k_scale, v_scale, sm_scale, _NPARTS, int(window_left), R)
     return True
