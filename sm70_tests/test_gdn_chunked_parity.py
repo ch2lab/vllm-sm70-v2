@@ -30,7 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch  # noqa: E402
 
-HQ, HV, K, V = 2, 6, 128, 128
+import os
+HQ = int(os.environ.get("GDN_HQ", "2"))
+HV = int(os.environ.get("GDN_HV", "6"))
+K, V = 128, 128
 T_LIST = [256, 100, 8192]
 RTOL, ATOL = 5e-3, 2e-3
 
