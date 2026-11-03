@@ -958,19 +958,27 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             # first layer we saw wraps around once per step) or when the batch's
             # block table changed.  A per-layer streaming budget needs its own
             # selection every layer, so reuse is off in that mode.
-            # One selection per decode step: the model has 10 full-attention
-            # calls per step, so layer 0 wraps.  Re-selecting on every layer
-            # cost 10x the scan (measured 24 ms/step at 250K on 2026-11-04).
+            # Explicit step boundary: the first attention layer of every step
+            # reuses the same q buffer across graph replays, so its pointer
+            # recurs.  The old layer-count modulo broke under graph capture
+            # (some graphs never scanned).  Extra scans are harmless; a missed
+            # scan is not.
+            _qptr = q.data_ptr()
+            _first = _SELC.get("q_first")
+            if _first is None:
+                _SELC["q_first"] = _qptr
+                new_step = True
+            else:
+                new_step = (_qptr == _first)
             _li = _SELC["layer"]
-            _SELC["layer"] = _li + 1 if _li + 1 < 10 else 0
-            new_step = (_li == 0)
+            _SELC["layer"] = _li + 1
             # A classified streaming layer only needs sink + recent window, so it
             # skips content selection and runs on the window instead.
             if _li in _stream:
                 _budget, _win_eff = per_sb, _stream_pages
             else:
                 _budget, _win_eff = _topk_pages, _win
-            if new_step or _stream:
+            if True:  # per-layer selection: each layer needs its own q
                 _mean = os.environ.get(
                     "VLLM_SM70_DECODE_TOPK_MEAN", "0") == "1"
                 _quest = os.environ.get(
@@ -992,7 +1000,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                                         _KMIN[:H], _KMAX[:H], npg=npg,
                                         super_=super_, n_pick_pages=_budget,
                                         sink=_sink, win=_win_eff,
-                                        scan=new_step)
+                                        scan=True)
                 elif _mean:
                     global _KMEAN
                     _need = (H, int(kv_cache.shape[0]), int(q.shape[1] * 0 + 256))

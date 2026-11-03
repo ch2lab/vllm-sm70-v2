@@ -502,14 +502,14 @@ void select_pages_minmax(torch::Tensor q, torch::Tensor kv,
   const int per_sb = (int)(super_ / npg);
   const int nsuper = (int)((cols + per_sb - 1) / per_sb);
   auto opts = q.options();
-  dim3 g1(H, (cols + 15) / 16);
+  dim3 g1(H, cols);
   if (scan)
   page_minmax_k_kernel<<<g1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
       kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
       kv_lens.data_ptr<int>(),
       reinterpret_cast<__half*>(kmin.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(kmax.data_ptr<at::Half>()), D, NP, DD, SD,
-      page_bytes, cols, cols, 0, 16);
+      page_bytes, cols, cols, 0, 1);
   auto psc = torch::empty({H, cols}, opts.dtype(torch::kFloat));
   dim3 g2(H, cols);
   page_bound_score_kernel<<<g2, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
