@@ -17,15 +17,27 @@ far worse.  So admission is explicit and evidence-based:
 
 Evidence (2026-11-03, ``test_geometry_parity.py``, 2048-token cache):
 
-  geometry   prefill/twopass  prefill/cuda  decode/xqa
-  (2, 16)    3.660e-04       6.245e-05     5.432e-05
-  (1, 8)     3.661e-04       6.202e-05     4.111e-05
-  (1, 4)     3.664e-04       6.179e-05     5.813e-05
+  geometry   prefill/twopass  prefill/cuda  decode/xqa  decode/scalar
+  (2, 16)    3.664e-04       6.227e-05     5.989e-05   8.386e-06
+  (1, 8)     3.660e-04       6.213e-05     6.167e-05   1.679e-05
+  (1, 4)     3.669e-04       6.223e-05     5.037e-05   0.000e+00
+
+Pending (not admitted yet, kept for the 8-GPU host):
+
+  (1, 2)     TP8           3.829e-04       6.202e-05     6.279e-05   untested
+
+  The L0 numbers above are real (diagnostic run, ``--force-geometry 1,2``);
+  the behavioural gates need a real 8-GPU service.  Set
+  ``VLLM_SM70_GEOMETRY_ALLOW=1,2`` to enable it for that validation run only;
+  once canary/secret/longgen/concurrent pass there, promote it into
+  ``VERIFIED_GEOMETRIES`` and re-run this harness without the override.
 
 Do not add a geometry "because it runs".  See ``sm70/27_phase_charter.md``.
 """
 
 from __future__ import annotations
+
+import os
 
 VERIFIED_GEOMETRIES: frozenset[tuple[int, int]] = frozenset(
     {
@@ -36,9 +48,30 @@ VERIFIED_GEOMETRIES: frozenset[tuple[int, int]] = frozenset(
 )
 
 
+def _parse_geometries(raw: str) -> frozenset[tuple[int, int]]:
+    out = set()
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        h, q = part.replace(":", ",").split(",")
+        out.add((int(h), int(q)))
+    return frozenset(out)
+
+
+# Test-only override, read once at import: the env must be set before the
+# service starts.  Used to validate a pending geometry (currently TP8) on the
+# 8-GPU host without editing this file.
+EXTRA_GEOMETRIES = _parse_geometries(
+    os.environ.get("VLLM_SM70_GEOMETRY_ALLOW", "")
+)
+
+
 def supported(H: int, HQ: int, D: int = 256) -> bool:
     """Whether the fast prefill/decode kernels may run this geometry."""
-    return D == 256 and (H, HQ) in VERIFIED_GEOMETRIES
+    return D == 256 and (
+        (H, HQ) in VERIFIED_GEOMETRIES or (H, HQ) in EXTRA_GEOMETRIES
+    )
 
 
 def supported_decode(H: int, HQ: int, D: int = 256) -> bool:
