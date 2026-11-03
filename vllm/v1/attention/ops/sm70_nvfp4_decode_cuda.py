@@ -376,9 +376,13 @@ void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict_
   int ip0 = 0, ip1 = 0;
   if (page_list != nullptr) {
     /* bounded read: the partition is a slice of the selected page list, one
-       16-token page per stage (the last page is clamped by kv_len). */
-    ip0 = (int)((long)npages_list * sp / nparts);
-    ip1 = (int)((long)npages_list * (sp + 1) / nparts);
+       16-token page per stage (the last page is clamped by kv_len).  Split over
+       the pages the table actually holds, not its capacity: the caller passes
+       the whole buffer width, and the unused tail used to give every part
+       stages that could only produce zeros (measured 4x wasted work at 250K). */
+    const int nsel = min(npages_list, (kv_len + BN - 1) / BN);
+    ip0 = (int)((long)nsel * sp / nparts);
+    ip1 = (int)((long)nsel * (sp + 1) / nparts);
     nst = ip1 - ip0;
     t0 = 0;
     t1 = kv_len;
@@ -652,9 +656,10 @@ _SEL_LENS = None
 _SC_BUF = None
 # cross-layer selection reuse (TidalDecode): the top-k page set is computed on
 # the first attention layer of each step and reused by the rest.
-_SELC = {"first_ptr": None, "bt_ptr": None, "layer": 0}
+_SELC = {"layer": 0, "cap": False}
 _KMEAN = None
 _KMIN = None
+_SELSTATE = None
 _KMAX = None
 _AR16 = torch.arange(16, dtype=torch.int32, device='cuda')
 _IDX_SINK = torch.arange(4096, dtype=torch.int64, device='cuda')
@@ -738,12 +743,16 @@ def warmup_compile(device=None, max_reqs=8):
         _BUF = torch.zeros(n, dtype=torch.float32, device=device)
     # Quest min/max metadata must exist before CUDA-graph capture: allocating
     # inside capture is illegal and caused an illegal memory access on
-    # 2026-11-03.  16384 pages = 262144/16, the max block-table width.
-    global _KMIN, _KMAX
-    if _KMIN is None or _KMIN.shape[1] < 16384 or _KMIN.device != device:
-        _KMIN = torch.empty((2, 16384, 256), dtype=torch.float16,
+    # 2026-11-03.  262144 tokens / 16 = 16384 pages is the theoretical maximum,
+    # but the scheduler's block-table width is 16848 (observed), so leave slack:
+    # the buffer is reused for any width and the kernels take its row stride.
+    global _KMIN, _KMAX, _SELSTATE
+    if _KMIN is None or _KMIN.shape[1] < 32768 or _KMIN.device != device:
+        _KMIN = torch.empty((2, 32768, 256), dtype=torch.float16,
                             device=device)
         _KMAX = torch.empty_like(_KMIN)
+    if _SELSTATE is None or _SELSTATE.device != device:
+        _SELSTATE = torch.zeros(8, dtype=torch.int32, device=device)
 
 
 _MODS_XQA_FP16 = {}
@@ -879,6 +888,15 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
         _topk_pages = int(os.environ.get("VLLM_SM70_DECODE_TOPK_PAGES", "0"))
         _sink = int(os.environ.get("VLLM_SM70_DECODE_SINK_PAGES", "0"))
         _win = int(os.environ.get("VLLM_SM70_DECODE_WINDOW_PAGES", "0"))
+        # Recent pages appended by the periodic selection: keeps tokens written
+        # since the last rebuild visible.  Separate from _win, which switches on
+        # the bounded-window delivery path below.
+        _tail = int(os.environ.get("VLLM_SM70_DECODE_TOPK_TAIL_PAGES", "0"))
+        # Up to this many pages (8192 = 131K tokens) the sparse table cannot pay
+        # for itself, so the selector emits the identity table and decode is
+        # bit-for-bit dense.  The table must therefore hold that many pages.
+        _dense_max = int(os.environ.get(
+            "VLLM_SM70_DECODE_TOPK_DENSE_MAX", "0"))
         if _topk_pages > 0 and R == 1 and nqt == 1:
             # Content-based page selection (plan Phase 3): one fused call does
             # superblock scoring + exact top-k + the compacted block table, then
@@ -947,83 +965,76 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                     "> build_table_kernel's 1088", flush=True)
                 _use_prior = False
             per_sb = super_ // npg
-            cap = max(_topk_pages, _stream_pages if _stream else 0) + _sink + _win + 1
+            cap = (max(_topk_pages, _stream_pages if _stream else 0, _dense_max)
+                   + _sink + _win + _tail + 1)
             if _SEL_BT is None or _SEL_BT.numel() < cap:
-                _SEL_BT = torch.zeros((cap,), dtype=block_table.dtype,
+                _SEL_BT = torch.zeros((1, cap), dtype=block_table.dtype,
                                       device=block_table.device)
                 _SEL_LENS = torch.zeros((1,), dtype=kv_lens.dtype,
                                         device=kv_lens.device)
-            # Cross-layer reuse: recompute only when this is the first attention
-            # layer of a new step (layer order is model-order and stable, so the
-            # first layer we saw wraps around once per step) or when the batch's
-            # block table changed.  A per-layer streaming budget needs its own
-            # selection every layer, so reuse is off in that mode.
-            # Explicit step boundary: the first attention layer of every step
-            # reuses the same q buffer across graph replays, so its pointer
-            # recurs.  The old layer-count modulo broke under graph capture
-            # (some graphs never scanned).  Extra scans are harmless; a missed
-            # scan is not.
-            _qptr = q.data_ptr()
-            _first = _SELC.get("q_first")
-            if _first is None:
-                _SELC["q_first"] = _qptr
-                new_step = True
-            else:
-                new_step = (_qptr == _first)
+            # Layer index inside the decode step.  Under CUDA-graph capture the
+            # Python runs once (at capture time), so the counter is reset when a
+            # new capture begins -- a graph that started mid-count would never
+            # see the layers it compares against.
+            _cap = torch.cuda.is_current_stream_capturing()
+            if _cap and not _SELC.get("cap"):
+                _SELC["layer"] = 0
+            _SELC["cap"] = _cap
             _li = _SELC["layer"]
-            _SELC["layer"] = _li + 1
-            # A classified streaming layer only needs sink + recent window, so it
-            # skips content selection and runs on the window instead.
+            _SELC["layer"] = _li + 1 if _li + 1 < 10 else 0
             if _li in _stream:
-                _budget, _win_eff = per_sb, _stream_pages
+                _budget, _win_eff = per_sb, _stream_pages + _tail
             else:
-                _budget, _win_eff = _topk_pages, _win
-            if True:  # per-layer selection: each layer needs its own q
-                _mean = os.environ.get(
-                    "VLLM_SM70_DECODE_TOPK_MEAN", "0") == "1"
-                _quest = os.environ.get(
-                    "VLLM_SM70_DECODE_TOPK_QUEST", "0") == "1"
-                if _use_prior:
-                    select_pages_prior(block_table[0], kv_lens, _SEL_BT,
-                                       _SEL_LENS, npg=npg, super_=super_,
-                                       n_pick_pages=_budget, sink=_sink,
-                                       win=_win_eff)
-                elif _quest:
-                    global _KMIN, _KMAX
-                    _npg_max = int(block_table.shape[1])
-                    _nsuper = (_npg_max + (super_ // npg) - 1) // (super_ // npg)
-                    if (_KMIN is None or _KMIN.shape[1] < _npg_max
-                            or _KMIN.shape[0] < H or _nsuper > 1088):
-                        return False  # not capturable here; use the dense path
-                    select_pages_minmax(q[0], kv_cache, block_table[0],
-                                        kv_lens, _SEL_BT, _SEL_LENS,
-                                        _KMIN[:H], _KMAX[:H], npg=npg,
-                                        super_=super_, n_pick_pages=_budget,
-                                        sink=_sink, win=_win_eff,
-                                        scan=True)
-                elif _mean:
-                    global _KMEAN
-                    _need = (H, int(kv_cache.shape[0]), int(q.shape[1] * 0 + 256))
-                    if (_KMEAN is None or _KMEAN.shape[0] != H
-                            or _KMEAN.shape[1] != _need[1]
-                            or _KMEAN.device != q.device):
-                        _KMEAN = torch.empty(
-                            (H, int(kv_cache.shape[0]), 256),
-                            dtype=torch.float16, device=q.device)
-                    select_pages_mean(q[0], kv_cache, block_table[0], kv_lens,
-                                      _SEL_BT, _SEL_LENS, _KMEAN,
-                                      npg=npg, super_=super_,
-                                      n_pick_pages=_budget, sink=_sink,
-                                      win=_win_eff)
-                else:
-                    select_pages(q[0], kv_cache, block_table[0], kv_lens,
-                                 _SEL_BT, _SEL_LENS, npg=npg, super_=super_,
-                                 samples=_samples,
-                                 n_pick_pages=_budget, sink=_sink,
-                                 win=_win_eff)
-                _SELC["first_ptr"] = kv_ptr if _SELC["bt_ptr"] != bt_ptr else (
-                    _SELC["first_ptr"] or kv_ptr)
-                _SELC["bt_ptr"] = bt_ptr
+                _budget, _win_eff = _topk_pages, _win + _tail
+            _mean = os.environ.get(
+                "VLLM_SM70_DECODE_TOPK_MEAN", "0") == "1"
+            _quest = os.environ.get(
+                "VLLM_SM70_DECODE_TOPK_QUEST", "0") == "1"
+            if _use_prior:
+                select_pages_prior(block_table[0], kv_lens, _SEL_BT,
+                                   _SEL_LENS, npg=npg, super_=super_,
+                                   n_pick_pages=_budget, sink=_sink,
+                                   win=_win_eff)
+            elif _quest:
+                global _KMIN, _KMAX
+                _npg_max = int(block_table.shape[1])
+                _nsuper = (_npg_max + (super_ // npg) - 1) // (super_ // npg)
+                if (_KMIN is None or _KMIN.shape[1] < _npg_max
+                        or _KMIN.shape[0] < H or _nsuper > 1088):
+                    return False  # not capturable here; use the dense path
+                # 10 = the model's full-attention layer count (one selector
+                # call per layer per step).  Zero / absent = re-select every
+                # layer; N = rebuild the table once every N decode steps.
+                _period = int(os.environ.get(
+                    "VLLM_SM70_DECODE_TOPK_QUEST_PERIOD", "0")) * 10
+                select_pages_minmax(q[0], kv_cache, block_table[0],
+                                    kv_lens, _SEL_BT, _SEL_LENS,
+                                    _KMIN[:H], _KMAX[:H], npg=npg,
+                                    super_=super_, n_pick_pages=_budget,
+                                    sink=_sink, win=_win_eff,
+                                    scan=True, state=_SELSTATE,
+                                    period_calls=max(1, _period),
+                                    dense_max=_dense_max)
+            elif _mean:
+                global _KMEAN
+                _need = (H, int(kv_cache.shape[0]), int(q.shape[1] * 0 + 256))
+                if (_KMEAN is None or _KMEAN.shape[0] != H
+                        or _KMEAN.shape[1] != _need[1]
+                        or _KMEAN.device != q.device):
+                    _KMEAN = torch.empty(
+                        (H, int(kv_cache.shape[0]), 256),
+                        dtype=torch.float16, device=q.device)
+                select_pages_mean(q[0], kv_cache, block_table[0], kv_lens,
+                                  _SEL_BT, _SEL_LENS, _KMEAN,
+                                  npg=npg, super_=super_,
+                                  n_pick_pages=_budget, sink=_sink,
+                                  win=_win_eff)
+            else:
+                select_pages(q[0], kv_cache, block_table[0], kv_lens,
+                             _SEL_BT, _SEL_LENS, npg=npg, super_=super_,
+                             samples=_samples,
+                             n_pick_pages=_budget, sink=_sink,
+                             win=_win_eff)
             n_sel = int(_SEL_BT.numel())
             _mod_xqa(H, HQ).run(q, kv_cache, _SEL_BT.reshape(1, n_sel), _SEL_LENS,
                                 _BUF[:need], out, k_scale, v_scale, sm_scale,

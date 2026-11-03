@@ -111,11 +111,10 @@ __global__ void page_mean_k_kernel(
     int D, int NP, int DD, int SD, int page_bytes, int bt_cols, int ntiles,
     int r, int PP) {
   const int h = blockIdx.x;
-  const int p0 = blockIdx.y * PP;
   const int d = threadIdx.x;               // 0..255, one dim
   const int sub = d >> 4;                  // 16-value scale group
   const int kv_len = kvlens[r];
-  for (int pg = p0; pg < p0 + PP && pg < ntiles; ++pg) {
+  for (int pg = blockIdx.y; pg < ntiles; pg += gridDim.y) {
     if (pg * NP >= kv_len) break;
     const int bid = bt[r * bt_cols + pg];
     const unsigned char* kdata = kv + (long)bid * page_bytes + (long)h * (NP * DD);
@@ -228,7 +227,9 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
                                    const int* __restrict__ kv_lens, int npg,
                                    int n_pick_sb, int sink, int win,
                                    int* __restrict__ sel_bt,
-                                   int* __restrict__ sel_len) {
+                                   int* __restrict__ sel_len,
+                                   int* __restrict__ state, int dense_max) {
+  if (state && state[3] == 0) return;
   __shared__ float sm[1088];
   const int tid = threadIdx.x;
   const int nh = gridDim.y;
@@ -242,7 +243,9 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
   const int max_sb = (npages + per_sb - 1) / per_sb;
   const int n_pick = min(n_pick_sb, max_sb);
   int* out = sel_bt;
-  if (n_pick >= max_sb) {
+  /* Below `dense_max` pages the selector cannot pay for itself (attention is
+     already cheap), so stay bit-for-bit dense: identity table, no ranking. */
+  if (n_pick >= max_sb || (dense_max > 0 && npages <= dense_max)) {
     // The budget covers the whole context: there is nothing to select.  Emit the
     // identity page table so this step is bit-for-bit the dense path (same page
     // order, same length) instead of a re-ranked permutation of everything --
@@ -251,7 +254,10 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
     for (int i = tid; i < npages; i += blockDim.x)
       out[i] = bt_row[min(i, cols - 1)];
     __syncthreads();
-    if (tid == 0) sel_len[0] = kv_len;
+    if (tid == 0) {
+      sel_len[0] = kv_len;
+      if (state) { state[4] = 0; state[5] = 1; }   /* identity: tail is a no-op */
+    }
     return;
   }
   for (int i = tid; i < nsuper; i += blockDim.x) {
@@ -285,6 +291,56 @@ __global__ void build_table_kernel(const float* __restrict__ scores,
     const int slen = (pos - 1) * npg + tail;
     sel_len[0] = slen < kv_len ? slen : kv_len;
   }
+  if (state) {
+    state[4] = n_pick * per_sb + sink;   /* where the tail region starts */
+    state[5] = 0;
+  }
+}
+
+/* Periodic re-selection gate.  state[] = [calls, last_sel_call, last_kv,
+   active, tail_off, identity, 0, 0].  Under CUDA-graph capture every layer
+   replays the same host code, so the decision has to live on the device:
+   the table is rebuilt only once every `period_calls` selector calls, and
+   immediately when the request got shorter (a new request). */
+__global__ void sel_gate_kernel(const int* __restrict__ kvlens,
+                                int* __restrict__ state, int period_calls) {
+  const int ctr = state[0] + 1;
+  state[0] = ctr;
+  const int kv = kvlens[0];
+  const bool active = (period_calls <= 1) || (state[1] == 0)
+                      || (ctr - state[1] >= period_calls) || (kv < state[2]);
+  if (active) { state[1] = ctr; state[2] = kv; }
+  state[3] = active ? 1 : 0;
+}
+
+/* The tail of the compacted table (recent window + last page) is rewritten on
+   every call, so tokens written since the last selection stay visible even when
+   the ranking itself is reused.  Runs after build_table (or alone when the gate
+   is closed) and only ever touches the tail region. */
+__global__ void sel_tail_kernel(const int* __restrict__ bt, int cols, int npg,
+                                const int* __restrict__ kvlens, int sink,
+                                int win, int* __restrict__ state,
+                                int* __restrict__ sel_bt,
+                                int* __restrict__ sel_len) {
+  if (blockIdx.x != 0) return;
+  const int kv_len = kvlens[0];
+  const int npages = (kv_len + npg - 1) / npg;
+  if (state[5] != 0) {
+    /* identity mode: the whole table is the request's own page list, so it has
+       to grow with the context (one int copy per page, cheap). */
+    for (int i = threadIdx.x; i < npages; i += blockDim.x)
+      sel_bt[i] = bt[min(i, cols - 1)];
+    if (threadIdx.x == 0) sel_len[0] = kv_len;
+    return;
+  }
+  if (threadIdx.x != 0) return;
+  int pos = state[4];
+  const int w0 = max(npages - win, sink);
+  for (int i = w0; i < npages; ++i) sel_bt[pos++] = bt[min(i, cols - 1)];
+  if (pos <= state[4]) pos = state[4] + 1;
+  const int tail = kv_len - (npages - 1) * npg;
+  const int slen = (pos - 1) * npg + tail;
+  sel_len[0] = slen < kv_len ? slen : kv_len;
 }
 
 void select_pages(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
@@ -314,7 +370,7 @@ void select_pages(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
   build_table_kernel<<<g2, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
       scores.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
       kv_lens.data_ptr<int>(), (int)npg, n_pick_sb, (int)sink, (int)win,
-      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>(), nullptr, 0);
 }
 
 
@@ -359,7 +415,8 @@ void select_pages_mean(torch::Tensor q, torch::Tensor kv, torch::Tensor bt_row,
   build_table_kernel<<<g2, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
       scores.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
       kv_lens.data_ptr<int>(), (int)npg, (int)std::max<int64_t>(1, n_pick_pages / per_sb),
-      (int)sink, (int)win, sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+      (int)sink, (int)win, sel_bt.data_ptr<int>(), sel_len.data_ptr<int>(),
+      nullptr, 0);
 }
 
 // Gather the prefill Quest prior into superblock scores: every page of a
@@ -401,7 +458,7 @@ void select_pages_prior(torch::Tensor prior, torch::Tensor bt_row,
   build_table_kernel<<<g2, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
       scores.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
       kv_lens.data_ptr<int>(), (int)npg, n_pick_sb, (int)sink, (int)win,
-      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>(), nullptr, 0);
 }
 
 // Exact Quest upper-bound metadata: per-page K min/max over all tokens of the
@@ -412,7 +469,9 @@ __global__ void page_minmax_k_kernel(
     const unsigned char* __restrict__ kv, const int* __restrict__ bt,
     const int* __restrict__ kvlens, __half* __restrict__ kmin,
     __half* __restrict__ kmax, int D, int NP, int DD, int SD,
-    int page_bytes, int bt_cols, int ntiles, int r, int PP) {
+    int page_bytes, int bt_cols, int ntiles, int r, int PP,
+    const int* __restrict__ state, int kstride) {
+  if (state[3] == 0) return;   /* periodic re-selection: reuse the last table */
   const int h = blockIdx.x;
   const int p0 = blockIdx.y * PP;
   const int d = threadIdx.x;
@@ -445,8 +504,8 @@ __global__ void page_minmax_k_kernel(
       hi = fmaxf(hi, v);
       ++n;
     }
-    kmin[((long)h * ntiles + pg) * D + d] = __float2half(n ? lo : 0.f);
-    kmax[((long)h * ntiles + pg) * D + d] = __float2half(n ? hi : 0.f);
+    kmin[((long)h * kstride + pg) * D + d] = __float2half(n ? lo : 0.f);
+    kmax[((long)h * kstride + pg) * D + d] = __float2half(n ? hi : 0.f);
   }
 }
 
@@ -454,30 +513,38 @@ __global__ void page_minmax_k_kernel(
 __global__ void page_bound_score_kernel(
     const __half* __restrict__ q, const __half* __restrict__ kmin,
     const __half* __restrict__ kmax, float* __restrict__ out,
-    int HQ, int H, int D, int cols) {
-  const int h = blockIdx.x, pg = blockIdx.y;
+    int HQ, int H, int D, int cols, const int* __restrict__ state,
+    int kstride, int npg, const int* __restrict__ kvlens) {
+  if (state[3] == 0) return;
+  const int h = blockIdx.x;
   const int d = threadIdx.x;
   const int G = HQ / H;
-  const float lo = __half2float(kmin[((long)h * cols + pg) * D + d]);
-  const float hi = __half2float(kmax[((long)h * cols + pg) * D + d]);
-  float best = -1e30f;
-  for (int g = 0; g < G; ++g) {
-    const float qv = __half2float(q[((long)(h * G + g)) * D + d]);
-    best = fmaxf(best, fmaxf(qv * hi, qv * lo));
-  }
+  const int kv_len = kvlens[0];
   __shared__ float red[256];
-  red[d] = best;
-  __syncthreads();
-  for (int s = 128; s > 0; s >>= 1) {
-    if (d < s) red[d] += red[d + s];
+  for (int pg = blockIdx.y; pg < cols; pg += gridDim.y) {
+    if (pg * npg >= kv_len) break;
+    const float lo = __half2float(kmin[((long)h * kstride + pg) * D + d]);
+    const float hi = __half2float(kmax[((long)h * kstride + pg) * D + d]);
+    float best = -1e30f;
+    for (int g = 0; g < G; ++g) {
+      const float qv = __half2float(q[((long)(h * G + g)) * D + d]);
+      best = fmaxf(best, fmaxf(qv * hi, qv * lo));
+    }
+    red[d] = best;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+      if (d < s) red[d] += red[d + s];
+      __syncthreads();
+    }
+    if (d == 0) out[h * cols + pg] = red[0];
     __syncthreads();
   }
-  if (d == 0) out[h * cols + pg] = red[0];
 }
 
 __global__ void page_to_super_max_kernel(
     const float* __restrict__ pg, float* __restrict__ out, int cols,
-    int per_sb, int nsuper, int H) {
+    int per_sb, int nsuper, int H, const int* __restrict__ state) {
+  if (state[3] == 0) return;
   const int h = blockIdx.x, sb = blockIdx.y;
   const int tid = threadIdx.x;
   const int base = sb * per_sb;
@@ -499,7 +566,9 @@ void select_pages_minmax(torch::Tensor q, torch::Tensor kv,
                          torch::Tensor sel_bt, torch::Tensor sel_len,
                          torch::Tensor kmin, torch::Tensor kmax,
                          int64_t npg, int64_t super_, int64_t n_pick_pages,
-                         int64_t sink, int64_t win, int64_t scan) {
+                         int64_t sink, int64_t win, int64_t scan,
+                         torch::Tensor state, int64_t period_calls,
+                         int64_t dense_max) {
   const int HQ = q.size(0), D = q.size(1);
   const int H = kv.size(1) / 2;
   const int NP = kv.size(2);
@@ -509,31 +578,46 @@ void select_pages_minmax(torch::Tensor q, torch::Tensor kv,
   const int per_sb = (int)(super_ / npg);
   const int nsuper = (int)((cols + per_sb - 1) / per_sb);
   auto opts = q.options();
-  dim3 g1(H, cols);
+  int* st = state.data_ptr<int>();
+  /* kmin/kmax are allocated wide (262144 tokens plus slack) and reused for any
+     block-table width, so their row stride is not `cols`.  Getting this wrong
+     silently loaded the wrong page's bound. */
+  const int kstride = (int)kmin.size(1);
+  sel_gate_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+      kv_lens.data_ptr<int>(), st, (int)period_calls);
+  /* Cap the page-parallel grids: with 16848 block-table columns the launch
+     itself cost ~0.9 ms/step at 10K, where every block early-exits. */
+  const int gcols = (int)std::min<long>(cols, 512L);
+  dim3 g1(H, gcols);
   if (scan)
   page_minmax_k_kernel<<<g1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
       kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
       kv_lens.data_ptr<int>(),
       reinterpret_cast<__half*>(kmin.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(kmax.data_ptr<at::Half>()), D, NP, DD, SD,
-      page_bytes, cols, cols, 0, 1);
+      page_bytes, cols, cols, 0, 1, st, kstride);
   auto psc = torch::empty({H, cols}, opts.dtype(torch::kFloat));
-  dim3 g2(H, cols);
+  dim3 g2(H, gcols);
   page_bound_score_kernel<<<g2, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(kmin.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(kmax.data_ptr<at::Half>()),
-      psc.data_ptr<float>(), HQ, H, D, cols);
+      psc.data_ptr<float>(), HQ, H, D, cols, st, kstride, (int)npg,
+      kv_lens.data_ptr<int>());
   auto ssc = torch::empty({H, nsuper}, opts.dtype(torch::kFloat));
   dim3 g3(H, nsuper);
   page_to_super_max_kernel<<<g3, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      psc.data_ptr<float>(), ssc.data_ptr<float>(), cols, per_sb, nsuper, H);
+      psc.data_ptr<float>(), ssc.data_ptr<float>(), cols, per_sb, nsuper, H,
+      st);
   dim3 g4(1, H);
   build_table_kernel<<<g4, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
       ssc.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
       kv_lens.data_ptr<int>(), (int)npg,
       (int)std::max<int64_t>(1, n_pick_pages / per_sb), (int)sink, (int)win,
-      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>(), st, (int)dense_max);
+  sel_tail_kernel<<<1, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
+      bt_row.data_ptr<int>(), cols, (int)npg, kv_lens.data_ptr<int>(), (int)sink,
+      (int)win, st, sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
 }
 
 
@@ -549,6 +633,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 _MOD = None
+_STATE0 = None
 
 # Page-keyed Quest prior written by the block-sparse prefill (see
 # sm70_nvfp4_prefill_twopass.run_tiles_sparse).  Pages of one 256-token
@@ -610,15 +695,28 @@ def select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg=16, super_=256,
 
 def select_pages_minmax(q, kv, bt_row, kvlens, sel_bt, sel_len, kmin, kmax,
                         npg=16, super_=256, n_pick_pages=2048, sink=0, win=0,
-                        scan=True):
+                        scan=True, state=None, period_calls=1,
+                        dense_max=0):
     """Exact Quest bound: per-page K min/max, score = max(q*kmax, q*kmin).
 
     ``scan=False`` reuses the min/max metadata across layers of the same step;
     only the per-layer score/table pass runs.
+
+    ``period_calls`` > 1 rebuilds the page table only once every that many
+    selector calls (device-side gate, CUDA-graph safe) and refreshes just the
+    recent window in between.
     """
+    global _STATE0
+    if state is None:
+        # A gate that is always open, so single-call users keep the old
+        # behaviour without threading a buffer through.
+        if _STATE0 is None or _STATE0.device != q.device:
+            _STATE0 = torch.zeros(8, dtype=torch.int32, device=q.device)
+        state = _STATE0
     _mod().select_pages_minmax(q, kv, bt_row, kvlens, sel_bt, sel_len, kmin,
                                kmax, npg, super_, n_pick_pages, sink, win,
-                               int(scan))
+                               int(scan), state, int(period_calls),
+                               int(dense_max))
     return sel_bt, sel_len
 
 
