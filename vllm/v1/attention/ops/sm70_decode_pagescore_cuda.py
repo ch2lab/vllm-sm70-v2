@@ -404,6 +404,132 @@ void select_pages_prior(torch::Tensor prior, torch::Tensor bt_row,
       sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
 }
 
+// Exact Quest upper-bound metadata: per-page K min/max over all tokens of the
+// page (dequantized).  Selection then uses max(q*kmax, q*kmin) per dim, so a
+// single high-scoring token (e.g. a needle) cannot be lost to averaging or
+// sampling.
+__global__ void page_minmax_k_kernel(
+    const unsigned char* __restrict__ kv, const int* __restrict__ bt,
+    const int* __restrict__ kvlens, __half* __restrict__ kmin,
+    __half* __restrict__ kmax, int D, int NP, int DD, int SD,
+    int page_bytes, int bt_cols, int ntiles, int r, int PP) {
+  const int h = blockIdx.x;
+  const int p0 = blockIdx.y * PP;
+  const int d = threadIdx.x;
+  const int sub = d >> 4;
+  const int kv_len = kvlens[r];
+  for (int pg = p0; pg < p0 + PP && pg < ntiles; ++pg) {
+    if (pg * NP >= kv_len) break;
+    const int bid = bt[r * bt_cols + pg];
+    const unsigned char* kdata =
+        kv + (long)bid * page_bytes + (long)h * (NP * DD);
+    const unsigned char* kscale = kv + (long)bid * page_bytes +
+                                  (long)gridDim.x * (NP * DD) +
+                                  (long)h * (NP * SD);
+    float lo = 1e30f, hi = -1e30f;
+    int n = 0;
+    for (int t = 0; t < NP; ++t) {
+      if (pg * NP + t >= kv_len) break;
+      const unsigned char byte = kdata[(long)t * DD + (d >> 1)];
+      const int code = ((d & 1) ? (byte >> 4) : (byte & 0xF));
+      const float sc = e4m3_score(kscale[(long)t * SD + sub]);
+      const float v = e2m1_score(code) * sc;
+      lo = fminf(lo, v);
+      hi = fmaxf(hi, v);
+      ++n;
+    }
+    kmin[((long)h * ntiles + pg) * D + d] = __float2half(n ? lo : 0.f);
+    kmax[((long)h * ntiles + pg) * D + d] = __float2half(n ? hi : 0.f);
+  }
+}
+
+// score(h, page) = sum_d max over q-head of max(q*kmax, q*kmin)
+__global__ void page_bound_score_kernel(
+    const __half* __restrict__ q, const __half* __restrict__ kmin,
+    const __half* __restrict__ kmax, float* __restrict__ out,
+    int HQ, int H, int D, int cols) {
+  const int h = blockIdx.x, pg = blockIdx.y;
+  const int d = threadIdx.x;
+  const int G = HQ / H;
+  const float lo = __half2float(kmin[((long)h * cols + pg) * D + d]);
+  const float hi = __half2float(kmax[((long)h * cols + pg) * D + d]);
+  float best = -1e30f;
+  for (int g = 0; g < G; ++g) {
+    const float qv = __half2float(q[((long)(h * G + g)) * D + d]);
+    best = fmaxf(best, fmaxf(qv * hi, qv * lo));
+  }
+  __shared__ float red[256];
+  red[d] = best;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (d < s) red[d] += red[d + s];
+    __syncthreads();
+  }
+  if (d == 0) out[h * cols + pg] = red[0];
+}
+
+__global__ void page_to_super_max_kernel(
+    const float* __restrict__ pg, float* __restrict__ out, int cols,
+    int per_sb, int nsuper, int H) {
+  const int h = blockIdx.x, sb = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int base = sb * per_sb;
+  float m = -1e30f;
+  for (int i = tid; i < per_sb && base + i < cols; i += blockDim.x)
+    m = fmaxf(m, pg[h * cols + base + i]);
+  __shared__ float red[256];
+  red[tid] = m;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+    __syncthreads();
+  }
+  if (tid == 0) out[h * nsuper + sb] = red[0];
+}
+
+void select_pages_minmax(torch::Tensor q, torch::Tensor kv,
+                         torch::Tensor bt_row, torch::Tensor kv_lens,
+                         torch::Tensor sel_bt, torch::Tensor sel_len,
+                         torch::Tensor kmin, torch::Tensor kmax,
+                         int64_t npg, int64_t super_, int64_t n_pick_pages,
+                         int64_t sink, int64_t win, int64_t scan) {
+  const int HQ = q.size(0), D = q.size(1);
+  const int H = kv.size(1) / 2;
+  const int NP = kv.size(2);
+  const int DD = D / 2, SD = D / 16;
+  const int page_bytes = 2 * (H * NP * DD + H * NP * SD);
+  const int cols = (int)bt_row.numel();
+  const int per_sb = (int)(super_ / npg);
+  const int nsuper = (int)((cols + per_sb - 1) / per_sb);
+  auto opts = q.options();
+  dim3 g1(H, (cols + 15) / 16);
+  if (scan)
+  page_minmax_k_kernel<<<g1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      kv.data_ptr<unsigned char>(), bt_row.data_ptr<int>(),
+      kv_lens.data_ptr<int>(),
+      reinterpret_cast<__half*>(kmin.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(kmax.data_ptr<at::Half>()), D, NP, DD, SD,
+      page_bytes, cols, cols, 0, 16);
+  auto psc = torch::empty({H, cols}, opts.dtype(torch::kFloat));
+  dim3 g2(H, cols);
+  page_bound_score_kernel<<<g2, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(kmin.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(kmax.data_ptr<at::Half>()),
+      psc.data_ptr<float>(), HQ, H, D, cols);
+  auto ssc = torch::empty({H, nsuper}, opts.dtype(torch::kFloat));
+  dim3 g3(H, nsuper);
+  page_to_super_max_kernel<<<g3, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      psc.data_ptr<float>(), ssc.data_ptr<float>(), cols, per_sb, nsuper, H);
+  dim3 g4(1, H);
+  build_table_kernel<<<g4, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
+      ssc.data_ptr<float>(), nsuper, per_sb, bt_row.data_ptr<int>(), cols,
+      kv_lens.data_ptr<int>(), (int)npg,
+      (int)std::max<int64_t>(1, n_pick_pages / per_sb), (int)sink, (int)win,
+      sel_bt.data_ptr<int>(), sel_len.data_ptr<int>());
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("page_scores", &page_scores);
   m.def("page_mean_k", &page_mean_k);
@@ -411,6 +537,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("select_pages", &select_pages);
   m.def("select_pages_mean", &select_pages_mean);
   m.def("select_pages_prior", &select_pages_prior);
+  m.def("select_pages_minmax", &select_pages_minmax);
 }
 """
 
@@ -471,6 +598,20 @@ def select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg=16, super_=256,
     """One call: score superblocks, exact top-k, build the compacted table."""
     _mod().select_pages(q, kv, bt_row, kvlens, sel_bt, sel_len, npg, super_,
                         samples, n_pick_pages, sink, win)
+    return sel_bt, sel_len
+
+
+def select_pages_minmax(q, kv, bt_row, kvlens, sel_bt, sel_len, kmin, kmax,
+                        npg=16, super_=256, n_pick_pages=2048, sink=0, win=0,
+                        scan=True):
+    """Exact Quest bound: per-page K min/max, score = max(q*kmax, q*kmin).
+
+    ``scan=False`` reuses the min/max metadata across layers of the same step;
+    only the per-layer score/table pass runs.
+    """
+    _mod().select_pages_minmax(q, kv, bt_row, kvlens, sel_bt, sel_len, kmin,
+                               kmax, npg, super_, n_pick_pages, sink, win,
+                               int(scan))
     return sel_bt, sel_len
 
 
