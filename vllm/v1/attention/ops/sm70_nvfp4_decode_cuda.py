@@ -7,6 +7,8 @@ import os
 import torch
 from torch.utils.cpp_extension import load_inline
 
+from .sm70_attention_geometry import supported_decode
+
 
 def _rows_ok(q: torch.Tensor, nqt: int, bt: torch.Tensor) -> bool:
     """The row-offset path needs rows == reqs*nqt with one block-table row per
@@ -36,9 +38,9 @@ __device__ __forceinline__ float e4m3(unsigned char b){
   return s * v;
 }
 
-// D=256, RATIO=8, N=16, DD=128, SD=16, F=144
-// Geometry is a per-build constant (two dedicated instantiations):
-//   TP1: H=2 HQ=16 PAGE=9216   TP2: H=1 HQ=8 PAGE=4608
+// D=256, N=16, DD=128, SD=16, F=144
+// Geometry is a per-build constant (one instantiation per TP layout):
+//   TP1: H=2 HQ=16 PAGE=9216   TP2: H=1 HQ=8 PAGE=4608   TP4: H=1 HQ=4 PAGE=4608
 #ifndef H_DEF
 #define H_DEF 2
 #endif
@@ -52,7 +54,7 @@ __device__ __forceinline__ float e4m3(unsigned char b){
 #define H H_DEF
 #define HQ HQ_DEF
 #define PAGE PAGE_DEF
-#define RATIO 8
+#define RATIO (HQ / H)
 #define N 16
 #define DD 128
 #define SD 16
@@ -183,7 +185,7 @@ void run(torch::Tensor q, torch::Tensor kv, torch::Tensor bt, torch::Tensor kvle
          double sm_scale, int splits, int window, int R) {
 
   dim3 g(R, H, splits);
-  split_decode<<<g, 256, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+  split_decode<<<g, 32 * RATIO, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
       kv.data_ptr<unsigned char>(), bt.data_ptr<int>(), kvlens.data_ptr<int>(),
       ws.data_ptr<float>(), (float)k_scale, (float)v_scale, (float)sm_scale,
       bt.size(1), splits, window);
@@ -228,7 +230,7 @@ using namespace nvcuda;
 #define HD 256
 #define H H_DEF
 #define HQ HQ_DEF
-#define G 8
+#define G (HQ / H)
 #define BN 16
 #define QS 264
 #define KVS 264
@@ -697,11 +699,15 @@ def warmup_compile(device=None, max_reqs=8):
     both BEFORE CUDA-graph capture (compiling/allocating inside capture breaks
     the graph)."""
     global _BUF, _MAXR
-    if os.environ.get("VLLM_SM70_DECODE_XQA") == "1":
-        _mod_xqa(2, 16).prepare()
-        _mod_xqa(1, 8).prepare()
-    _mod(2, 16)
-    _mod(1, 8)
+    # Compile every admitted geometry before CUDA-graph capture: compiling or
+    # allocating inside capture breaks the graph, and warmup does not know
+    # which TP split the service will use.
+    from .sm70_attention_geometry import VERIFIED_GEOMETRIES
+
+    for _h, _hq in sorted(VERIFIED_GEOMETRIES):
+        if os.environ.get("VLLM_SM70_DECODE_XQA") == "1":
+            _mod_xqa(_h, _hq).prepare()
+        _mod(_h, _hq)
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     _MAXR = max(int(max_reqs), 1)
@@ -709,7 +715,8 @@ def warmup_compile(device=None, max_reqs=8):
         os.environ.get("VLLM_SM70_DECODE_WINDOW_PAGES", "0")
     )
     _slots = max(_NPARTS, min(_bnd, _NPARTS_BOUNDED_MAX)) if _bnd else _NPARTS
-    n = _MAXR * 2 * 8 * _slots * 258  # R*H*RATIO*NPARTS*(D+2)
+    # H*RATIO == HQ. 16 covers TP1 (2*8) and TP2 (1*8); TP4 (1*4) over-allocates.
+    n = _MAXR * 16 * _slots * 258  # R*H*RATIO*NPARTS*(D+2)
     if _BUF is None or _BUF.numel() < n or _BUF.device != device:
         _BUF = torch.zeros(n, dtype=torch.float32, device=device)
 
@@ -821,8 +828,8 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
     R, HQ, D = q.shape
     R = R // int(nqt)
     H = kv_cache.shape[1] // 2
-    # Verified geometries: TP1 (H=2, HQ=16), TP2 (H=1, HQ=8); ratio stays 8.
-    if D != 256 or (H, HQ) not in ((2, 16), (1, 8)):
+    # Verified geometries: TP1 (H=2, HQ=16), TP2 (H=1, HQ=8).
+    if not supported_decode(H, HQ, D):
         return False
     if int(kv_cache.stride(0)) != 2 * H * 16 * 144:
         return False
@@ -843,7 +850,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                   f"kvlens={kv_lens.tolist()} splits={splits} "
                   f"window={window_left}", flush=True)
     if os.environ.get("VLLM_SM70_DECODE_XQA") == "1":
-        need = R * H * 8 * _NPARTS_XQA * 258
+        need = R * HQ * _NPARTS_XQA * 258
         _topk_pages = int(os.environ.get("VLLM_SM70_DECODE_TOPK_PAGES", "0"))
         _sink = int(os.environ.get("VLLM_SM70_DECODE_SINK_PAGES", "0"))
         _win = int(os.environ.get("VLLM_SM70_DECODE_WINDOW_PAGES", "0"))
@@ -992,7 +999,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
             # keep the last page's true token count so the tail stays masked
             tail = kv_lens[:1] - (npg - 1) * 16
             _SEL_LENS[:1].copy_(torch.where(n_sel > 0, (n_sel - 1) * 16 + tail, kv_lens[:1]))
-            need = R * H * 8 * _NPARTS_XQA * 258
+            need = R * HQ * _NPARTS_XQA * 258
             _mod_xqa(H, HQ).run(q, kv_cache, _SEL_BT, _SEL_LENS, _BUF[:need], out,
                                 k_scale, v_scale, sm_scale, _NPARTS_XQA,
                                 -1, R, None, None, 0, 0,
@@ -1003,7 +1010,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                             int(window_left), R, None, None, 0, 0,
                             int(kv_cache.size(2)), int(q0), int(nqt))
         return True
-    need = R * H * 8 * _NPARTS * 258
+    need = R * HQ * _NPARTS * 258
     _mod(H, HQ).run(q, kv_cache, block_table, kv_lens, _BUF[:need], out,
                k_scale, v_scale, sm_scale, _NPARTS, int(window_left), R, None,
                None, 0, 0, int(kv_cache.size(2)), int(q0), int(nqt))
