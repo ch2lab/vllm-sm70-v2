@@ -843,7 +843,7 @@ def try_paged_prefill_twopass(q, kv_cache, block_table, qo_indptr, kv_lens, out,
     H = (kv_cache.shape[1] if (kv_fp8 or kv_fp16)
          else kv_cache.shape[1] // 2)
     HQ = q.shape[1]
-    if D != 256 or (H, HQ) not in ((2, 16), (1, 8)):
+    if D != 256 or (H, HQ) not in ((2, 16), (1, 8), (1, 4)):
         return False
     if max_q_len <= 0 or block_table.shape[0] != qo_indptr.shape[0] - 1:
         return False

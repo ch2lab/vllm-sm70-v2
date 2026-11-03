@@ -650,7 +650,7 @@ def try_paged_prefill_cuda(q, kv_cache, block_table, qo_indptr, kv_lens, out,
     # Verified geometries: TP1 = (H=2, HQ=16), TP2 = (H=1, HQ=8). The kernel takes
     # H/HQ as runtime params (grid.y = HQ, kh = qh / (HQ / H)), so both work; other
     # splits stay on the Triton path until they are measured.
-    if D != 256 or (H, q.shape[1]) not in ((2, 16), (1, 8)):
+    if D != 256 or (H, q.shape[1]) not in ((2, 16), (1, 8), (1, 4)):
         return False
     if max_q_len <= 0 or block_table.shape[0] != qo_indptr.shape[0] - 1:
         return False
