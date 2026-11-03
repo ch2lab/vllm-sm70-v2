@@ -822,7 +822,7 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
     R = R // int(nqt)
     H = kv_cache.shape[1] // 2
     # Verified geometries: TP1 (H=2, HQ=16), TP2 (H=1, HQ=8); ratio stays 8.
-    if D != 256 or (H, HQ) not in ((2, 16), (1, 8), (1, 4)):
+    if D != 256 or (H, HQ) not in ((2, 16), (1, 8)):
         return False
     if int(kv_cache.stride(0)) != 2 * H * 16 * 144:
         return False
