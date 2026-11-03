@@ -633,8 +633,12 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
     // will see, so its per-superblock Quest scores are the ranking to reuse.
     const int nsuper = nblk * nsplit;
     const int pages_per_sb = (int)std::max<int64_t>(1, 256 / kv.size(2));
+    // Row `r` of the block table, not row 0: with more than one request in the
+    // batch, row 0 scatters this request's scores onto ANOTHER request's pages,
+    // so every concurrent request decodes against the wrong hot set (this is the
+    // "ductduct/!!!!" degeneration that only showed up under concurrency).
     seed_prior<<<(nsuper + 255) / 256, 256, 0, stream.stream()>>>(
-        prior.data_ptr<float>(), bt.data_ptr<int>(),
+        prior.data_ptr<float>(), bt.data_ptr<int>() + (long)r * bt_cols,
         scsu.data_ptr<float>() + (long)(nt - 1) * nsuper, nsuper, pages_per_sb,
         (int)bt_cols, (int)prior.numel());
   }
