@@ -49,7 +49,17 @@ def graph_time(fn, reps=20, attempts=5):
     return best * 1e3 / reps
 
 
-def build(m, n, k, shards, dev):
+def build(m, n, k, shards, dev, skew: float = 0.0):
+    """Synthetic expert weights plus a route layout.
+
+    ``skew`` controls how realistic the router is.  skew=0 spreads the
+    m*top_k expanded slots evenly over the experts, which is what the original
+    harness did -- and what flattered the RowTiles=4 arm, because an even count
+    that is an exact multiple of the block size means *neither* path pays any
+    padding waste.  skew>0 draws per-expert shares from a heavy-tailed
+    distribution, so experts end on partial blocks and a wider route block
+    costs real padded mma rows.
+    """
     torch.manual_seed(9502)
     codes = torch.randint(0, 255, (E, n, k // 2), dtype=torch.uint8, device=dev)
     scales = torch.randint(1, 120, (E, n, k // 16), dtype=torch.uint8,
@@ -58,19 +68,46 @@ def build(m, n, k, shards, dev):
                         dtype=torch.float32, device=dev) * 0.01 + 0.001
     inp = torch.randn(m, k, dtype=torch.float16, device=dev)
     out = torch.zeros(m * TOPK, n, dtype=torch.float16, device=dev)
-    per_e = m * TOPK // E
-    assert per_e % BLOCK == 0, per_e
-    blocks = E * per_e // BLOCK
-    st = torch.empty(blocks * BLOCK, dtype=torch.int32, device=dev)
-    eid = torch.empty(blocks, dtype=torch.int32, device=dev)
-    for b in range(blocks):
-        e = b // (per_e // BLOCK)
-        j0 = (b % (per_e // BLOCK)) * BLOCK
-        eid[b] = e
-        st[b * BLOCK:(b + 1) * BLOCK] = torch.arange(
-            e * per_e + j0, e * per_e + j0 + BLOCK, dtype=torch.int32)
+
+    slots = m * TOPK
+    if skew <= 0.0:
+        counts = torch.full((E,), slots // E, dtype=torch.long)
+        counts[:slots - counts.sum().item()] += 1
+    else:
+        w = torch.rand(E, dtype=torch.float64).pow(1.0 / (1.0 + skew))
+        w = w / w.sum()
+        counts = torch.bincount(
+            torch.multinomial(w.float(), slots, replacement=True),
+            minlength=E)
+    assert int(counts.sum()) == slots, int(counts.sum())
+
+    # expanded slot s belongs to token s // TOPK; give each slot to an expert so
+    # the per-expert counts match, then lay each expert out in B-wide blocks
+    # with -1 in the padded slots (the kernel skips those on load and store).
+    expert_of_slot = torch.empty(slots, dtype=torch.long)
+    pos = 0
+    for e in range(E):
+        c = int(counts[e])
+        expert_of_slot[pos:pos + c] = e
+        pos += c
+    blocks = int(sum((int(counts[e]) + BLOCK - 1) // BLOCK for e in range(E)))
+    st = torch.full((blocks * BLOCK,), -1, dtype=torch.int32)
+    eid = torch.empty(blocks, dtype=torch.int32)
+    rows_by_expert = torch.argsort(expert_of_slot, stable=True)
+    b = 0
+    start = 0
+    for e in range(E):
+        c = int(counts[e])
+        nb = (c + BLOCK - 1) // BLOCK
+        eid[b:b + nb] = e
+        rows = rows_by_expert[start:start + c]
+        st[b * BLOCK:b * BLOCK + c] = rows.to(torch.int32)
+        start += c
+        b += nb
+    assert b == blocks and start == slots
     npp = torch.full((1,), blocks * BLOCK, dtype=torch.int32, device=dev)
-    tw = torch.rand(m * TOPK, dtype=torch.float32, device=dev)
+    tw = torch.rand(slots, dtype=torch.float32, device=dev)
+    st, eid, npp = st.to(dev), eid.to(dev), npp.to(dev)
     return codes, scales, gscale, inp, out, st, eid, npp, tw
 
 
@@ -80,6 +117,9 @@ def main() -> int:
     ap.add_argument("--dump", default="",
                     help="write the raw output bits to <dump>.<proj>.bin so two "
                          "launcher arms can be compared byte for byte")
+    ap.add_argument("--skew", type=float, default=0.0,
+                    help="heavy-tailed router (0 = even, which pays no padding "
+                         "waste and therefore flatters wide route blocks)")
     args = ap.parse_args()
     import vllm  # noqa: F401
     import vllm._custom_ops  # noqa: F401
@@ -87,7 +127,7 @@ def main() -> int:
 
     dev = "cuda"
     print(f"# gpu={torch.cuda.get_device_name(0)} chunk={args.chunk} "
-          f"top_k={TOPK} experts={E} block={BLOCK} "
+          f"top_k={TOPK} experts={E} block={BLOCK} skew={args.skew} "
           f"WIDE={os.environ.get('VLLM_SM70_MOE_QPN2_WIDE','?')} "
           f"WARPS={os.environ.get('VLLM_SM70_MOE_QPN2_WARPS','?')} "
           f"NS={os.environ.get('VLLM_SM70_MOE_QPN2_NS','?')} "
@@ -97,7 +137,7 @@ def main() -> int:
     tot_us = 0.0
     for name, n, k, shards in (("w13", 1024, 2048, 2), ("w2", 2048, 512, 1)):
         codes_raw, scales_raw, gscale, inp, out, st, eid, npp, tw = build(
-            args.chunk, n, k, shards, dev)
+            args.chunk, n, k, shards, dev, args.skew)
         codes, scales = qpn2_prepare_moe(codes_raw, scales_raw)
 
         def call():
