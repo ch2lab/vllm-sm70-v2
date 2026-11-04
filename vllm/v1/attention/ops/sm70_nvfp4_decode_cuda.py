@@ -600,6 +600,11 @@ __global__ void combine_decode(const float* __restrict__ ws,
   if (nparts <= kMaxCombineParts) {
     for (int sp = tid; sp < nparts; sp += blockDim.x)
       sw[sp] = __expf(ws[(row0 + sp) * (HD + 2) + HD] - m);
+    // Barrier before thread 0 reads sw[]: without it the denominator can be
+    // built from slots other threads have not written yet.  With one write per
+    // thread (blockDim >= nparts) the race is usually benign, which is exactly
+    // why it survived a bit-identity run at blockDim 256.
+    __syncthreads();
     if (tid == 0) {
       float d = 0.f;
       for (int sp = 0; sp < nparts; sp++)
