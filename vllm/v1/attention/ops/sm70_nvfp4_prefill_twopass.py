@@ -600,10 +600,19 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
   auto qmean = torch::empty({nt, D}, opts);
   {
     auto qf = Qd.to(at::kFloat);
+    // Which query represents a tile when ranking k blocks?  The mean over the
+    // tile's rows blurs 2048 queries into one; the deepest row is the one that
+    // actually has to retrieve (it is also what the decode step will ask), so
+    // VLLM_SM70_PREFILL_SEL_Q=last ranks with that row's heads instead.
+    static const char* sel_q = getenv("VLLM_SM70_PREFILL_SEL_Q");
+    const bool use_last = sel_q != nullptr && sel_q[0] == 'l';
     long o = 0;
     for (int t = 0; t < nt; t++) {
       const int M = (int)rows[t] * Gq;
-      qmean[t].copy_(qf.narrow(0, o, M).mean(0));
+      if (use_last)
+        qmean[t].copy_(qf.narrow(0, o + M - Gq, Gq).mean(0));
+      else
+        qmean[t].copy_(qf.narrow(0, o, M).mean(0));
       o += M;
     }
   }
