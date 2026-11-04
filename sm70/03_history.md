@@ -19192,3 +19192,39 @@ PV 两臂均值差 **0.26%** ⇒ (29) 的 "3.4% 布局收益" 不存在，是跨
 （搜索必须发生在 eager/warmup 期，CUDA-graph 捕获内不得搜索），先离线与 `at::mm_out` 逐位比对
 （splitK=1，预期位相同；不同则按容差申报），再用 `moe_kernel_total.py` 的服务内 prefill trace 求和判 QK^T 桶
 是否真的从 985 µs 降下来，最后才是 250K 墙钟重复 + canary/recall/secret。
+
+---
+
+## 2026-11-05 (31) 第 10 个否证：cublasLt 换 QK^T 算法**快但降质** —— 选算法不能只看速度
+
+(30) 闸门给出：QK^T 的 cublasLt 候选 [1] 在同进程交错重测下稳定快启发式默认 **7.3%/6.9%**
+（845.8 vs 912.0 µs，81.2 vs 75.4 TF），预期省 5.1 s = prefill 3.6%。本轮**照计划实现并接线**：
+`sm70_nvfp4_prefill_twopass.py` 加 `cublasLt` 路径（`-lcublasLt`、按形状缓存不透明 `cublasLtMatmulAlgo_t`、
+搜索只在 eager 期做、捕获内一律回落 `at::mm_out`、`VLLM_SM70_TWOPASS_LTQK` 阀默认关）。
+列主序映射 `C'[BN,M] = Kb'[D,BN]^T @ Qb'[D,M]`（m=BN,n=M,k=D,A=T lda=D,B=N ldb=D,ldc=BN），
+并核实 `S=torch.empty(M,BN)` ⇒ `ldc=BN` 成立。编译/加载通过（`lt_fallbacks()==0`）。
+
+**判决：NO-GO。质量门直接拦住。** 同一脚本、同一顺序、只差阀值：
+
+| 臂 | canary | **recall** |
+|---|---|---|
+| LTQK=0（对照） | 7/7 | **24/24**，命中集与全会话基线逐个相同 |
+| LTQK=1 | 7/7 | **19/24**，miss=[10,14,16,31,38] |
+
+⇒ 不是抖动：对照组完全正常。已回滚（`git checkout`，服务回基线 9.760 ms / recall 24/24 / canary 7/7）。
+
+**根因（方法论级，最值钱的一条）**：(30) 的闸门**只测速度**。16 个候选里最快的那个，
+很可能是靠**更粗的归约**换来的（reduction scheme / k 分块 / 中间精度不同），
+而"按属性看四项全同（3/20/7/1）"恰恰说明差异在我没读的那些属性上 —— 那里正是精度藏身之处。
+⇒ **定律：为提速而选 GEMM/内核算法时，闸门必须同时含精度筛**：
+先按速度入围，再与现路径逐位/逐元素比对，只有落在 fp32 重结合噪声级（本会话用的 1e-3 相对阈）才允许入选。
+只按速度挑，就会把"数值更差的实现"当成免费性能 —— 这与用户"不得用近似换速度"的红线直接冲突。
+（对照：#12904 的 NAcc=2 也改了 fp32 结合序，max rel 4.4e-4，recall 仍 24/24 且命中集逐个相同
+⇒ 说明本次 19/24 不是"任何重结合都会翻检索"，而是这个候选确实更差。）
+
+**顺带记录三个量具缺陷（下次跑 prefill 闸门必须先避开）**：
+① `bench_decode_profile.py --prompt-len 250000 --tokens 1` **不会**产出真实 250K prefill 窗口 ——
+两臂 trace 里 QK^T 的 grid 都是 (32,10,1)（M=1280）而非 (32,256,1)/(32,210,1)，
+⇒ **prefill 闸门读表前必须先验证 QK^T 的 grid 是不是那两档**，否则等于没测；`--tokens` 要用 ≥8。
+② `itl_client.py <len> 1` 触发 `ZeroDivisionError`（每 token 均分），墙钟重复至少给 8 个 token。
+③ `/v1/completions` 无 bearer key 会 **401**；确定性输出对比要用 canary 的 `_key()` + `/v1/chat/completions`。
