@@ -325,6 +325,14 @@ __device__ __forceinline__ void deq8(__half* dst, uint2 raw, __half2 sc,
   }
 }
 
+/* Partitions below this many tokens cost more in partial traffic than in the
+   work they carry: at kv=10K, 240 parts move ~7.9 MB of fp32 partials against
+   5.9 MB of actual KV, and the kernel measured 34% slower than 120 parts
+   (sm70_tests/bench_xqa_parts.py: 73.3 us at 240 vs 48.6 us at 120).  85
+   tokens per part is that measured optimum, and it leaves 250K untouched
+   (249936/85 >> 240, so the cap is inactive there and 240 still wins). */
+constexpr int kMinTokensPerPart = 85;
+
 __global__ __launch_bounds__(THREADS, 3)
 void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict__ kv,
                   const int* __restrict__ bt, const int* __restrict__ kvlens,
@@ -348,6 +356,17 @@ void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict_
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int kv_len = kvlens[r];
 
+  /* How many partitions actually carry work for this request.  Computed here
+     and identically in combine_decode, so the two agree on which rows of ws
+     are live without any device-side handshake (which would not be safe under
+     CUDA-graph capture). */
+  const int lo0 = (window >= 0) ? max(kv_len - 1 - window, 0) : 0;
+  const int span0 = max(kv_len - lo0, 0);
+  const int np = (page_list != nullptr)
+                     ? nparts
+                     : min(nparts, max(1, span0 / kMinTokensPerPart));
+  if (page_list == nullptr && sp >= np) return;
+
   for (int i = tid; i < 16 * (HD / 8); i += THREADS) {
     int row = i / (HD / 8), c8 = (i % (HD / 8)) * 8;
     uint4 v = make_uint4(0, 0, 0, 0);
@@ -370,7 +389,7 @@ void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict_
      validated at rel=4e-4 in the 32-token kernel (not lane>>2). */
   const int rbase = (lane & 1) + 4 * ((lane >> 4) & 1) + 8 * ((lane >> 2) & 1);
 
-  const int lo = (window >= 0) ? max(kv_len - 1 - window, 0) : 0;
+  const int lo = lo0;
   int t0, t1, nst;
   int ip0 = 0, ip1 = 0;
   if (page_list != nullptr) {
@@ -386,9 +405,9 @@ void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict_
     t0 = 0;
     t1 = kv_len;
   } else {
-    const int span = max(kv_len - lo, 0);
-    t0 = lo + (int)((long)span * sp / nparts);
-    t1 = lo + (int)((long)span * (sp + 1) / nparts);
+    const int span = span0;
+    t0 = lo + (int)((long)span * sp / np);
+    t1 = lo + (int)((long)span * (sp + 1) / np);
     nst = (t1 > t0) ? ((t1 - t0 + BN - 1) / BN) : 0;
   }
 
@@ -588,17 +607,26 @@ constexpr int kMaxCombineParts = 512;
 
 __global__ void combine_decode(const float* __restrict__ ws,
                                __half* __restrict__ out, int nparts, int q0,
-                               int nqt) {
+                               int nqt, const int* __restrict__ kvlens,
+                               int window, int bounded) {
   int r = blockIdx.x, h = blockIdx.y, qh = blockIdx.z;
   int tid = threadIdx.x;
+  /* Must match decode_xqa16 exactly: only partitions [0, np) were written.
+     The row stride stays nparts (the buffer layout); only the loop bound
+     shrinks. */
+  const int kv_len = kvlens[r];
+  const int lo_c = (window >= 0) ? max(kv_len - 1 - window, 0) : 0;
+  const int span_c = max(kv_len - lo_c, 0);
+  const int np = bounded ? nparts
+                         : min(nparts, max(1, span_c / kMinTokensPerPart));
   const long row0 = (long)((r * H + h) * G + qh) * nparts;
   float m = -1e30f;
-  for (int sp = 0; sp < nparts; sp++)
+  for (int sp = 0; sp < np; sp++)
     m = fmaxf(m, ws[(row0 + sp) * (HD + 2) + HD]);
   __shared__ float sw[kMaxCombineParts];
   __shared__ float s_denom;
-  if (nparts <= kMaxCombineParts) {
-    for (int sp = tid; sp < nparts; sp += blockDim.x)
+  if (np <= kMaxCombineParts) {
+    for (int sp = tid; sp < np; sp += blockDim.x)
       sw[sp] = __expf(ws[(row0 + sp) * (HD + 2) + HD] - m);
     // Barrier before thread 0 reads sw[]: without it the denominator can be
     // built from slots other threads have not written yet.  With one write per
@@ -607,14 +635,14 @@ __global__ void combine_decode(const float* __restrict__ ws,
     __syncthreads();
     if (tid == 0) {
       float d = 0.f;
-      for (int sp = 0; sp < nparts; sp++)
+      for (int sp = 0; sp < np; sp++)
         d += sw[sp] * ws[(row0 + sp) * (HD + 2) + HD + 1];
       s_denom = d;
     }
     __syncthreads();
     for (int d = tid; d < HD; d += blockDim.x) {
       float acc = 0.f;
-      for (int sp = 0; sp < nparts; sp++)
+      for (int sp = 0; sp < np; sp++)
         acc += sw[sp] * ws[(row0 + sp) * (HD + 2) + d];
       out[(long)((r * nqt + q0) * HQ + h * G + qh) * HD + d] =
           __float2half(acc / (s_denom > 0 ? s_denom : 1.f));
@@ -622,12 +650,12 @@ __global__ void combine_decode(const float* __restrict__ ws,
     return;
   }
   float denom = 0.f;
-  for (int sp = 0; sp < nparts; sp++)
+  for (int sp = 0; sp < np; sp++)
     denom += __expf(ws[(row0 + sp) * (HD + 2) + HD] - m) *
              ws[(row0 + sp) * (HD + 2) + HD + 1];
   for (int d = tid; d < HD; d += blockDim.x) {
     float acc = 0.f;
-    for (int sp = 0; sp < nparts; sp++) {
+    for (int sp = 0; sp < np; sp++) {
       long b = (row0 + sp) * (HD + 2);
       acc += __expf(ws[b + HD] - m) * ws[b + d];
     }
@@ -677,7 +705,8 @@ void run(torch::Tensor q, torch::Tensor kv, torch::Tensor bt, torch::Tensor kvle
   dim3 gc(R, H2, G);
   combine_decode<<<gc, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
       ws.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-      nparts, (int)q0, (int)nqt);
+      nparts, (int)q0, (int)nqt, kvlens.data_ptr<int>(), window,
+      page_list.has_value() ? 1 : 0);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &run); m.def("prepare", &prepare); }
