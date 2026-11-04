@@ -577,22 +577,53 @@ void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict_
   }
 }
 
+// The partition weights depend only on (r, h, qh), not on the output column, so
+// one CTA used to derive the same nparts values nparts*blockDim.x times: every
+// thread re-ran __expf(ws[b + HD] - m) and reloaded the max/sum words.  At
+// HD=256 and nparts=240 that is ~1e6 redundant __expf per call for 3.8e3 useful
+// ones, which is why combine_decode cost as much as the attention kernel itself.
+// Hoisting them into shared memory keeps the arithmetic identical: each sw[sp]
+// is the same expression, and both accumulators still walk sp in order.
+constexpr int kMaxCombineParts = 512;
+
 __global__ void combine_decode(const float* __restrict__ ws,
                                __half* __restrict__ out, int nparts, int q0,
                                int nqt) {
   int r = blockIdx.x, h = blockIdx.y, qh = blockIdx.z;
   int tid = threadIdx.x;
+  const long row0 = (long)((r * H + h) * G + qh) * nparts;
   float m = -1e30f;
   for (int sp = 0; sp < nparts; sp++)
-    m = fmaxf(m, ws[(long)(((r * H + h) * G + qh) * nparts + sp) * (HD + 2) + HD]);
+    m = fmaxf(m, ws[(row0 + sp) * (HD + 2) + HD]);
+  __shared__ float sw[kMaxCombineParts];
+  __shared__ float s_denom;
+  if (nparts <= kMaxCombineParts) {
+    for (int sp = tid; sp < nparts; sp += blockDim.x)
+      sw[sp] = __expf(ws[(row0 + sp) * (HD + 2) + HD] - m);
+    if (tid == 0) {
+      float d = 0.f;
+      for (int sp = 0; sp < nparts; sp++)
+        d += sw[sp] * ws[(row0 + sp) * (HD + 2) + HD + 1];
+      s_denom = d;
+    }
+    __syncthreads();
+    for (int d = tid; d < HD; d += blockDim.x) {
+      float acc = 0.f;
+      for (int sp = 0; sp < nparts; sp++)
+        acc += sw[sp] * ws[(row0 + sp) * (HD + 2) + d];
+      out[(long)((r * nqt + q0) * HQ + h * G + qh) * HD + d] =
+          __float2half(acc / (s_denom > 0 ? s_denom : 1.f));
+    }
+    return;
+  }
   float denom = 0.f;
   for (int sp = 0; sp < nparts; sp++)
-    denom += __expf(ws[(long)(((r * H + h) * G + qh) * nparts + sp) * (HD + 2) + HD] - m) *
-             ws[(long)(((r * H + h) * G + qh) * nparts + sp) * (HD + 2) + HD + 1];
+    denom += __expf(ws[(row0 + sp) * (HD + 2) + HD] - m) *
+             ws[(row0 + sp) * (HD + 2) + HD + 1];
   for (int d = tid; d < HD; d += blockDim.x) {
     float acc = 0.f;
     for (int sp = 0; sp < nparts; sp++) {
-      long b = (long)(((r * H + h) * G + qh) * nparts + sp) * (HD + 2);
+      long b = (row0 + sp) * (HD + 2);
       acc += __expf(ws[b + HD] - m) * ws[b + d];
     }
     out[(long)((r * nqt + q0) * HQ + h * G + qh) * HD + d] =
