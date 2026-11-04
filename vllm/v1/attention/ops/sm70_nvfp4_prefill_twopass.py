@@ -597,7 +597,17 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
   const int nt = (int)rows.size();
   auto stream = getCurrentCUDAStream();
   auto opts = Qd.options();
+  static const char* mix_env = getenv("VLLM_SM70_PREFILL_SEL_MIX");
+  int mix = mix_env != nullptr ? atoi(mix_env) : 0;
+  if (mix > 0 && prior.numel() > 0) {
+    // The second score pass would overwrite the split-level buffer that seeds
+    // the decode prior, so the two are mutually exclusive.
+    mix = 0;
+    fprintf(stderr, "[SM70PF] SEL_MIX disabled: decode prior seeding is on\n");
+  }
+  mix = std::max(0, std::min(100, mix));
   auto qmean = torch::empty({nt, D}, opts);
+  auto qlast = mix > 0 ? torch::empty({nt, D}, opts) : torch::Tensor();
   {
     auto qf = Qd.to(at::kFloat);
     // Which query represents a tile when ranking k blocks?  The mean over the
@@ -613,6 +623,20 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
     // variant that passes that gate.
     static const char* sel_q = getenv("VLLM_SM70_PREFILL_SEL_Q");
     const bool use_last = sel_q != nullptr && sel_q[0] == 'l';
+    // Hybrid budget (VLLM_SM70_PREFILL_SEL_MIX=<pct>): keep most blocks by the
+    // tile-mean score and a slice by the deepest-row score.  Ranking only by the
+    // deepest row starves the other rows of the tile (concurrent probe 10/12);
+    // ranking only by the mean blurs retrieval (secret 2/3).  A small slice of
+    // the budget for the deepest row gets both.
+    //
+    // MEASURED 2026-11-04 (250K / 64K prefill, secret@65K, concurrent n=12):
+    //   BS=18 mix=10  26.163/6.066 = 1.130  secret 1/3  concurrent 3/12
+    //   BS=20 mix=50  26.909/6.009 = 1.174  secret 3/3  concurrent 8/12
+    // Both reach the length ratio but neither clears the concurrency gate, so
+    // the knob stays opt-in and off by default: at BLKSPARSE<=20 the retrieval
+    // slice that fixes secret is exactly the slice that breaks concurrency.
+    // The binding constraint is the unfixed shared-prefix degeneration, not the
+    // selector -- see sm70/03_history.md "OPEN BUG".
     long o = 0;
     for (int t = 0; t < nt; t++) {
       const int M = (int)rows[t] * Gq;
@@ -620,6 +644,7 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
         qmean[t].copy_(qf.narrow(0, o + M - Gq, Gq).mean(0));
       else
         qmean[t].copy_(qf.narrow(0, o, M).mean(0));
+      if (mix > 0) qlast[t].copy_(qf.narrow(0, o + M - Gq, Gq).mean(0));
       o += M;
     }
   }
@@ -628,6 +653,9 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
   const int nsplit = (int)std::max(1, std::min(32, (int)(BN / 256)));
   auto scsu = torch::full({nt, nblk * nsplit}, -1e30f,
                           Qd.options().dtype(at::kFloat));
+  auto sc2 = mix > 0 ? torch::full({nt, nblk}, -1e30f,
+                                   Qd.options().dtype(at::kFloat))
+                     : torch::Tensor();
   dim3 sgrid((unsigned)nt, (unsigned)nsplit);
   for (int b = 0; b < nblk; b++) {
     const int k0 = b * (int)BN;
@@ -645,6 +673,12 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
         reinterpret_cast<const __half*>(qmean.data_ptr<at::Half>()),
         sc.data_ptr<float>(), scsu.data_ptr<float>(), b, nblk, bnb, D,
         (float)sm_scale, nsplit, nsplit);
+    if (mix > 0)
+      blk_max_score<<<sgrid, 256, 0, stream.stream()>>>(
+          reinterpret_cast<const __half*>(Kb.data_ptr<at::Half>()),
+          reinterpret_cast<const __half*>(qlast.data_ptr<at::Half>()),
+          sc2.data_ptr<float>(), scsu.data_ptr<float>(), b, nblk, bnb, D,
+          (float)sm_scale, nsplit, nsplit);
   }
   if (prior.numel() > 0) {
     // Decode hot set: the deepest q tile sees exactly what the decode query
@@ -662,6 +696,12 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
   }
   auto sch = sc.to(at::kCPU);
   const float* sp = sch.data_ptr<float>();
+  torch::Tensor sch2;
+  const float* sp2 = nullptr;
+  if (mix > 0) {
+    sch2 = sc2.to(at::kCPU);
+    sp2 = sch2.data_ptr<float>();
+  }
   std::vector<char> keep((size_t)nt * nblk, 0);
   for (int t = 0; t < nt; t++) {
     const int bmax = (int)(plast[t] / BN);        // last eligible block
@@ -678,13 +718,25 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
       else idx.push_back(b);
     }
     const int extra = budget - forced;
+    const int n_last = (mix > 0) ? (extra * mix) / 100 : 0;
+    const int n_mean = extra - n_last;
     if (extra > 0 && !idx.empty()) {
-      std::partial_sort(idx.begin(), idx.begin() + std::min<int>(extra, idx.size()),
-                        idx.end(), [&](int a, int b) {
+      const int take_mean = std::min<int>(n_mean, idx.size());
+      std::partial_sort(idx.begin(), idx.begin() + take_mean, idx.end(),
+                        [&](int a, int b) {
                           return sp[(size_t)t * nblk + a] > sp[(size_t)t * nblk + b];
                         });
-      for (int i = 0; i < extra && i < (int)idx.size(); i++)
-        keep[(size_t)t * nblk + idx[i]] = 1;
+      for (int i = 0; i < take_mean; i++) keep[(size_t)t * nblk + idx[i]] = 1;
+      if (n_last > 0 && (int)idx.size() > take_mean) {
+        auto mid = idx.begin() + take_mean;
+        const int take_last = std::min<int>(n_last, idx.end() - mid);
+        std::partial_sort(mid, mid + take_last, idx.end(),
+                          [&](int a, int b) {
+                            return sp2[(size_t)t * nblk + a] >
+                                   sp2[(size_t)t * nblk + b];
+                          });
+        for (int i = 0; i < take_last; i++) keep[(size_t)t * nblk + mid[i]] = 1;
+      }
     }
   }
   for (int b = 0; b < nblk; b++) {
