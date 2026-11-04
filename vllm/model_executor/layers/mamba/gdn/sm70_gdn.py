@@ -321,10 +321,13 @@ def chunk_gated_delta_rule_sm70_chunked(
 #   (2, 6)  7.69 -> 3.48 ms  2.21x   Qwen3.8-Flash-Next TP8 per-rank
 #   (8, 16) 8.13 -> 7.57 ms  1.07x   Qwen3.6-35B TP2 per-rank
 #   (16, 32) 7.27 -> 14.93 ms 0.49x  Qwen3.6-35B TP1 -> keep the serial kernel
+#   (4, 8)  6.27 -> 3.79 ms  1.65x   Qwen3.6-35B TP4 per-rank (added 2026-11-04,
+#           remeasured 6.267 -> 3.791 ms, rel_l2 4.7e-4, same as the others)
+#   (2, 4)  7.88 -> 2.87 ms  2.74x   (not a production geometry here)
 # Adding a geometry here requires rerunning that bench.
 _CHUNKED_MIN_T = 1024
 _CHUNKED_K = 128
-_CHUNKED_FAST_GEOMETRIES = frozenset({(2, 6), (8, 16)})
+_CHUNKED_FAST_GEOMETRIES = frozenset({(2, 6), (8, 16), (4, 8)})
 
 
 def _chunked_eligible(q: torch.Tensor, v: torch.Tensor) -> bool:
