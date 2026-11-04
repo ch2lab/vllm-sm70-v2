@@ -77,6 +77,9 @@ def build(m, n, k, shards, dev):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--chunk", type=int, default=8192)
+    ap.add_argument("--dump", default="",
+                    help="write the raw output bits to <dump>.<proj>.bin so two "
+                         "launcher arms can be compared byte for byte")
     args = ap.parse_args()
     import vllm  # noqa: F401
     import vllm._custom_ops  # noqa: F401
@@ -105,6 +108,10 @@ def main() -> int:
         call()
         torch.cuda.synchronize()
         ok = bool(torch.isfinite(out.float()).all()) and bool(out.abs().sum() > 0)
+        if args.dump:
+            # raw bits, so two launcher arms can be compared byte for byte
+            with open(f"{args.dump}.{name}.bin", "wb") as fh:
+                fh.write(out.detach().cpu().numpy().tobytes())
         t = graph_time(call)
         fl = 2 * args.chunk * TOPK * n * k
         tot_us += t
