@@ -18852,3 +18852,26 @@ shared 只是次要因素。⇒ 定律：**这个内核族里 RowTiles 与 WCols
 base 内核，而 base 内核的 RowTiles=4 实例 `partials[16][4*256]`=65,920 B 超 48 KB 静态 shared 上限，
 **编译期即失败**，运行时不一致会直接算错）；Python 侧 `block_size_m` 在 sm70_qpn2 分支原样只给 8/16，
 新增 `VLLM_SM70_MOE_BLOCK_M` 作为测量/采纳臂。
+
+---
+
+## 2026-11-05 (23) 有了能判 prefill 内核的量具；它立刻推翻了合成 bench 的结论
+
+**量具**：`sm70_tests/moe_kernel_total.py` + `bench_decode_profile.py --prof-salt`，读 prefill trace 里
+MoE 专家 GEMM 自身的 GPU 时间总和（~1400 次启动，**真实路由分布**）。
+重复性（同配置两遍）：b16 = 8.97 / 8.85 s（散布 1.3%），b32 = 9.21 / 9.19 s（散布 0.2%）。
+对比之下 250K ttft 三次同配置是 143.014 / 143.639 / 145.025 s（1.4%）——**内核级总量的分辨率比墙钟高一个量级**，
+这才是 prefill 该用的 GO/NO-GO。生效证明即启动网格：b16 是 (4,3968)/(8,3968)，b32 是 (8,2112)/(16,2112)。
+
+**判决：`WCols=128 × RowTiles=4`（route block 32）在真实负载上慢 3.3%，弃用。**
+
+| 内核 | block16（现状） | block32（RowTiles=4） | Δ |
+|---|---|---|---|
+| w13 (n=1024) | 7.215 / 7.123 ms | 7.380 / 7.365 ms | **+3.1%** |
+| w2 (n=2048) | 5.508 / 5.433 ms | 5.667 / 5.654 ms | **+3.2%** |
+| MoE GEMM 合计 | 8.91 s | 9.20 s | **+3.3%** |
+
+而**同一臂在离线 bench 上是赢的**：均匀路由 −6.7%，即使加了 `--skew 2` 重尾路由仍 −4.2%。
+⇒ `bench_moe_wide.py` 的合成路由与真实路由之间存在尚未定位的系统性差异（真实 grid.y=3968 < 均匀推算的 4096，
+说明 `route_tiles` 是 `min(capacity, live)` 的上界而非活块数，bench 没有复现这一层）。
+**教训：MoE 内核臂的裁决权归服务内 trace 求和，不归合成 bench。** 已回滚（.cu 与 marlin_moe.py 复原，生产内核仍 REG:254）。
