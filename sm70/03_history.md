@@ -18991,3 +18991,58 @@ n=2048 那个形状只有 **64 个 CTA 打 80 个 SM** ⇒ 每 SM 只驻留 **1 
 **无损性**：`sm70_tests/test_fp8_qpn_warps_exact.py` + `test_moe_nacc_exact.py`，跨 3 seed × 2 m 共 6 组同输入对比：
 只有 1 组逐字节相同，其余最大相对差 2.1e-6 ~ 4.4e-4（fp32 重结合、低于 fp16 输出量子）。
 ⇒ 又一次印证 #12894：**位相同测试必须跨多配置**，单 seed 单形状的"全同"是运气。
+
+---
+
+## 2026-11-05 (27) prefill 首次按 (kernel, grid, block) 完整分解；**最大桶被硬证据关闭**
+
+`moe_kernel_total.py` 升级为按 **(名字, grid, block)** 分桶，并直接取 profiler 自己记录的
+`est. achieved occupancy %` / `warps per SM` / `registers per thread` / `shared memory`，
+再用 `External id` 把内核关联回发起它的 CPU op（`aten::mm` / `_C::sm70_nvfp4_qpn2_moe_gemm` /
+`vllm::unified_attention_with...` / `vllm::qwen_gdn_attention_c` / `_C::sm70_fp8_qpn_dispatch`）。
+**必须分桶的原因**：同一个内核名覆盖它被启动的所有形状，per-kernel 总量恰好掩盖了唯一要紧的信息
+（本会话唯一真诊断就是靠这个拆出 64-CTA 打 80-SM 的）。
+
+250K prefill（143.9 s GPU-busy，144.6 s 墙，266052 个内核事件）的真实构成：
+
+| 占比 | 总时长 | 次/整段 | µs/次 | CTAs | 估算占用率 | 内核 = 身份 |
+|---|---|---|---|---|---|---|
+| 13.4% | 19.27 s | 19560 | 985.0 | 8192 | 13% | `aten::mm` (32,256,1) = **QK^T** |
+| 13.0% | 18.70 s | 19980 | 935.9 | 512 | 13% | `aten::mm` (512,1,1) = **PV** |
+| 11.3% | 16.29 s | 20100 | 810.4 | 6720 | 13% | QK^T（第二档 q-block） |
+| 10.1% | 14.59 s | 19560 | 745.8 | 8192 | 19% | `fused_softmax_reg<128>` nrows=32768 |
+| 10.1% | 14.57 s | 20420 | 713.4 | 420 | 13% | PV（第二档） |
+| 8.5% | 12.27 s | 20100 | 610.6 | 6720 | 19% | `fused_softmax_reg<128>` nrows=26880 |
+| 6.6% | 9.49 s | 1320 | 7185.7 | 15872 | 13% | MoE wide `<8,2,256>` w13 |
+| 5.0% | 7.25 s | 1320 | 5489.9 | 31744 | 13% | MoE wide w2 |
+| 4.7% | 6.77 s | 1050 | 6452.0 | 256 | **20%** | `gdn_forward_vlk_varlen` block=(32,4,1) |
+| 2.9% | 4.23 s | 990 | 4275.6 | 5664 | 13% | `sm70_fp8_qpn_dispatch`（prefill 稠密投影） |
+
+**桶与形状的对应可用源码验证**（`sm70_nvfp4_prefill_twopass.py` run()：`M = nrows*G`、`BN=4096`、`D=256`）：
+QK^T grid (32,256) ⇒ n_tiles=32→BN=4096、m_tiles=256⇒**M=32768**；PV grid (512,1) ⇒ ceil(32768/128)×2=512 ✓；
+softmax grid.x=(32768+3)/4=8192 ✓；fused_update grid=32768=M ✓；bridge_kv grid=(4096/32)=128 ✓。两档 q-block = M 32768 / 26880。
+⇒ **两遍注意力 = 109.5 s = 76% 的 prefill**；MoE 只有 16.7 s（11.6%），GDN 6.77 s（4.7%）。
+
+**据此算出的真实效率**：QK^T `2·32768·4096·256 = 68.7 GFLOP / 985 µs` = **69.8 TF = 57% 峰值**；
+PV 同量 **73.4 TF = 60% 峰值**。`fused_softmax_reg` 读写 S（268 MB×2）/745.8 µs = **720 GB/s = 80% HBM**（已近最优）；
+`fused_update` ≈800 GB/s = 89% HBM（最优）。⇒ 注意力的四个组件里，**两个是带宽最优、两个卡在 57–60% TC**。
+
+**给最大桶做的"开工前闸门"（`/tmp/opencode/ltprobe.cu`，独立 nvcc 程序，不碰服务）**：
+穷举 cublasLt 在这两个精确形状上的候选算法（QK^T 5 个、PV 7 个，含 tile/stages/splitK 变体），
+**并且它复现了服务内的时间**（QK^T 995 µs vs 服务 985、PV 918 vs 936 ⇒ 探针可信）：
+
+| 形状 | 启发式默认 | 全部候选最优 |
+|---|---|---|
+| QK^T m=4096 n=32768 k=256 | 1046.9 µs / 53.4% | **995.3 µs / 56.1%**（tile=20 stages=7 splitK=1） |
+| PV m=256 n=32768 k=4096 | 924.5 µs / 60.4% | **917.9 µs / 60.9%**（tile=24 splitK=2） |
+
+⇒ **cuBLASLt 在这两个形状上没有比默认好超过 1% 的算法。** 注意力的 GEMM 路线对"库级调优"彻底关闭
+（以前只有"档案说自研不敌 cuBLAS"的口头结论，现在有了穷举证据）。
+唯一可能的出路是手写内核替换 QK^T/PV —— 而 K=256 / N=256 的瘦形状正是 cuBLAS 只有 57–60% 的原因，
+自研要在 4 warp/128 线程的 Volta 上翻越它，风险与本会话已否证的 8 个臂同级，**不轻启**。
+
+**本轮唯一剩下的、有机理有数据的 prefill 靶子**：`gdn_forward_vlk_varlen_kernel` 6.77 s（4.7%），
+grid=(32,1,8)×block=(32,4,1) ⇒ **256 CTA、每 CTA 只有 4 warp ⇒ 12.8 warp/SM、估算占用率 20%**。
+但必须先证它是"发射受限"而非"token 串行延迟受限"：它是 fp32 递推（≈0.06% TC 峰值），
+每 CTA 串行走完 T 个 token；若如此，加 warp 不缩短链，只有**把列切得更细（z 从 8 提上去、CTA 数翻几倍）**才可能有效。
+⇒ 下一轮先做这个判别（离线同形状改 z 看墙钟），再决定是否动内核。
