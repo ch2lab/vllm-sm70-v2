@@ -848,8 +848,21 @@ def _num(name, dflt):
         return dflt
 
 
-BM_DEF = _num("VLLM_SM70_TWOPASS_BM", 4096)
 BN_DEF = _num("VLLM_SM70_TWOPASS_BN", 4096)
+
+# BM=4096 is the default; the sweep behind it (fresh boot per setting, prefill
+# ttft at 250K twice and at 64K once, 512 output tokens):
+#
+#   TP   BM=2048                 BM=4096                 ratio 2048 -> 4096
+#   4    43.798 / 43.789, 6.313  43.679 / 43.731, 6.350  1.818 -> 1.803
+#   2    82.84 / 83.16, 11.51    81.43 / 81.68, 11.44    1.887 -> 1.866
+#   1    148.69, 18.04 (*)       143.56 / 144.48, 17.83  2.161 -> 2.110 (*)
+#
+# TP4 is indifferent (all four differences <= 0.6%, i.e. noise); TP2 gains 1.7%
+# at 250K.  (*) TP1's BM=2048 column is from an older session -- every other
+# number here is same-session, and cross-session baselines drift several percent
+# on this box, so TP1's -3.5% needs a same-session check before it is quoted.
+BM_DEF = _num("VLLM_SM70_TWOPASS_BM", 4096)
 
 
 def _seed_prior_buf(kv_cache):
