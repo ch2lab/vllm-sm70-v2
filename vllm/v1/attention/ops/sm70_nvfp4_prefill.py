@@ -265,14 +265,6 @@ def sm70_nvfp4_paged_prefill(
             kv_fp8=kv_fp8, kv_fp16=kv_fp16, lut=lut,
         ):
             return
-    if os.environ.get("VLLM_SM70_PREFILL_CUDA") == "1":
-        from .sm70_nvfp4_prefill_cuda import try_paged_prefill_cuda
-
-        if try_paged_prefill_cuda(
-            q, kv_cache, block_table, qo_indptr, kv_lens, out, k_scale, v_scale,
-            sm_scale, window_left, max_q_len,
-        ):
-            return
     _, two_h, N, F = kv_cache.shape
     if kv_fp8 or kv_fp16:
         raise RuntimeError(

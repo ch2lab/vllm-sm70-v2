@@ -19,14 +19,6 @@ Layout of this module (identical to the verified prototype):
   * the mask is position-based only, so it is prefix-cache safe.
 
 Valve: VLLM_SM70_PREFILL_TWOPASS (default 0 = off -> fa_pf stays in charge).
-
-Block sparsity: VLLM_SM70_PREFILL_BLKSPARSE=<percent of eligible k blocks to keep>
-(default 0 = off).  run_tiles_sparse bridges every k block once, scores it with the
-Quest upper bound (max over the block of q_mean . k * sm_scale), then runs QK /
-softmax / PV only for the kept (q tile, k block) pairs.  Sink and the tile's own
-diagonal/recent blocks are always kept.  At keep=100% the output is bit-identical
-to run_tiles; at keep=40% a 250K prefill drops from 146.6 s to 96.7 s while the
-canary (7/7) and 131K/250K retrieval (3/3) gates still pass.
 """
 
 import os
@@ -489,319 +481,9 @@ void run_tiles(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
     qoff += nr;
   }
 }
-// ---- block-sparse prefill (Quest-style upper bound) ---------------------------
-// sc[t * nb + b] = max over the block's tokens of dot(Kb[tok], qmean[t]) * sm.
-// This is the exact maximum logit any token of block b can reach for tile t, so
-// ranking blocks by it never discards a block that could dominate the softmax.
-// Grid is (tiles, splits): one block per split keeps every SM busy, since the
-// per-call work is otherwise tiny and latency-bound.
-__device__ __forceinline__ void atomic_max_f(float* p, float v) {
-  int* pi = reinterpret_cast<int*>(p);
-  int old = *pi, assumed;
-  while (v > __int_as_float(old)) {
-    assumed = old;
-    old = atomicCAS(pi, assumed, __float_as_int(v));
-    if (old == assumed) break;
-  }
-}
-
-__global__ void blk_max_score(const __half* __restrict__ Kb,
-                              const __half* __restrict__ qmean,
-                              float* __restrict__ sc, float* __restrict__ scsu,
-                              int bslot, int nb, int bn, int D, float sm,
-                              int nsplit, int parts) {
-  const int t = blockIdx.x, part = blockIdx.y;
-  const int per = (bn + nsplit - 1) / nsplit;
-  const int lo = part * per;
-  const int hi = std::min(bn, lo + per);
-  const __half* q = qmean + (long)t * D;
-  float mx = -1e30f;
-  for (int tok = lo + threadIdx.x; tok < hi; tok += blockDim.x) {
-    const __half* k = Kb + (long)tok * D;
-    float acc = 0.f;
-    for (int d = 0; d < D; d += 2) {
-      const float2 qq = __half22float2(*reinterpret_cast<const __half2*>(q + d));
-      const float2 kk = __half22float2(*reinterpret_cast<const __half2*>(k + d));
-      acc += qq.x * kk.x + qq.y * kk.y;
-    }
-    mx = fmaxf(mx, acc);
-  }
-  __shared__ float red[32];
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  for (int off = 16; off > 0; off >>= 1)
-    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-  if (lane == 0) red[warp] = mx;
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float v = -1e30f;
-    for (int w = 0; w < (int)(blockDim.x >> 5); w++) v = fmaxf(v, red[w]);
-    v *= sm;
-    // sc: block-level (the prefill mask reads this on the host).
-    // scsu: split-level = one 256-token superblock, which is the granularity the
-    // decode selector ranks.  Split `part` of block `bslot` is superblock
-    // bslot * parts + part, so the store is race free.
-    atomic_max_f(sc + (long)t * nb + bslot, v);
-    if (part < parts) scsu[(long)t * nb * parts + (long)bslot * parts + part] = v;
-  }
-}
-
-// Copy the deepest q tile's superblock scores into the page-keyed decode prior.
-// Pages of one superblock share a score, so the store is a plain one (the last
-// write wins: deepest layer, last kv head, last tile = closest to decode).
-__global__ void seed_prior(float* __restrict__ prior,
-                           const int* __restrict__ bt_row,
-                           const float* __restrict__ scsu_row, int nsuper,
-                           int pages_per_sb, int cols, int prior_n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= nsuper) return;
-  const float v = scsu_row[i];
-  const int p0 = i * pages_per_sb;
-  // Both ends are bounded: the slot inside the block table AND the page id read
-  // from it.  Without the second clamp a stale/garbage block-table entry (which
-  // prefix-cache reuse can leave behind) becomes an out-of-bounds write into
-  // unrelated device memory.
-  for (int j = 0; j < pages_per_sb; ++j) {
-    const int pg = bt_row[min(p0 + j, cols - 1)];
-    if (pg >= 0 && pg < prior_n) prior[pg] = v;
-  }
-}
-
-// Same maths as run_tiles, but only the kept (q tile, k block) pairs run their
-// QK/softmax/PV.  Block scores come from one cheap pass that bridges every block
-// once and keeps the per-tile maximum logit, so the mask is the Quest bound
-// rather than a sampled estimate.  Sink blocks and the tile's own diagonal and
-// most recent blocks are always kept.
-void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
-                      torch::Tensor qpos, torch::Tensor Kb, torch::Tensor Vb,
-                      torch::Tensor S, torch::Tensor PV, torch::Tensor O,
-                      torch::Tensor mrow, torch::Tensor lrow,
-                      torch::Tensor alpha, torch::Tensor out,
-                      std::vector<int64_t> rows, std::vector<int64_t> plast,
-                      double k_scale, double v_scale, double sm_scale,
-                      int64_t r, int64_t kh, int64_t kv_len, int64_t page,
-                      int64_t side_off, int64_t bt_cols, int64_t BN,
-                      torch::Tensor lut, int64_t hstride, int64_t tstride,
-                      int64_t nsink, int64_t nrecent, double keep_frac,
-                      torch::Tensor prior) {
-  const int D = Qd.size(1);
-  const int NP = kv.size(2), F = kv.size(3);
-  const int SD = F / 9, DD = F - SD;
-#if KVFP8 || KVFP16
-  const int H = kv.size(1);
-#else
-  const int H = kv.size(1) / 2;
-#endif
-  const int HQ = out.size(1);
-  const int Gq = HQ / H;
-  const int nblk = (int)((kv_len + BN - 1) / BN);
-  const int nt = (int)rows.size();
-  auto stream = getCurrentCUDAStream();
-  auto opts = Qd.options();
-  static const char* mix_env = getenv("VLLM_SM70_PREFILL_SEL_MIX");
-  int mix = mix_env != nullptr ? atoi(mix_env) : 0;
-  if (mix > 0 && prior.numel() > 0) {
-    // The second score pass would overwrite the split-level buffer that seeds
-    // the decode prior, so the two are mutually exclusive.
-    mix = 0;
-    fprintf(stderr, "[SM70PF] SEL_MIX disabled: decode prior seeding is on\n");
-  }
-  mix = std::max(0, std::min(100, mix));
-  auto qmean = torch::empty({nt, D}, opts);
-  auto qlast = mix > 0 ? torch::empty({nt, D}, opts) : torch::Tensor();
-  {
-    auto qf = Qd.to(at::kFloat);
-    // Which query represents a tile when ranking k blocks?  The mean over the
-    // tile's rows blurs 2048 queries into one; the deepest row is the one that
-    // actually has to retrieve (it is also what the decode step will ask), so
-    // VLLM_SM70_PREFILL_SEL_Q=last ranks with that row's heads instead.
-    //
-    // MEASURED 2026-11-04 (BLKSPARSE=20, 250K, one env var apart): `last` fixes
-    // retrieval (secret@65K 2/3 -> 3/3) and gives a 26.528 s / 6.031 s =
-    // 1.153x length ratio, but it starves the other 2047 rows of the tile --
-    // the concurrent shared-prefix probe collapses to 10/12 broken, against
-    // 1/20 on the baseline.  Do not enable it; the default (mean) is the only
-    // variant that passes that gate.
-    static const char* sel_q = getenv("VLLM_SM70_PREFILL_SEL_Q");
-    const bool use_last = sel_q != nullptr && sel_q[0] == 'l';
-    // Hybrid budget (VLLM_SM70_PREFILL_SEL_MIX=<pct>): keep most blocks by the
-    // tile-mean score and a slice by the deepest-row score.  Ranking only by the
-    // deepest row starves the other rows of the tile (concurrent probe 10/12);
-    // ranking only by the mean blurs retrieval (secret 2/3).  A small slice of
-    // the budget for the deepest row gets both.
-    //
-    // MEASURED 2026-11-04 (250K / 64K prefill, secret@65K, concurrent n=12):
-    //   BS=18 mix=10  26.163/6.066 = 1.130  secret 1/3  concurrent 3/12
-    //   BS=20 mix=50  26.909/6.009 = 1.174  secret 3/3  concurrent 8/12
-    // Both reach the length ratio but neither clears the concurrency gate, so
-    // the knob stays opt-in and off by default: at BLKSPARSE<=20 the retrieval
-    // slice that fixes secret is exactly the slice that breaks concurrency.
-    // The binding constraint is the unfixed shared-prefix degeneration, not the
-    // selector -- see sm70/03_history.md "OPEN BUG".
-    long o = 0;
-    for (int t = 0; t < nt; t++) {
-      const int M = (int)rows[t] * Gq;
-      if (use_last)
-        qmean[t].copy_(qf.narrow(0, o + M - Gq, Gq).mean(0));
-      else
-        qmean[t].copy_(qf.narrow(0, o, M).mean(0));
-      if (mix > 0) qlast[t].copy_(qf.narrow(0, o + M - Gq, Gq).mean(0));
-      o += M;
-    }
-  }
-  auto sc = torch::full({nt, nblk}, -1e30f, Qd.options().dtype(at::kFloat));
-  const int threads = 256, per = threads / 8;
-  const int nsplit = (int)std::max(1, std::min(32, (int)(BN / 256)));
-  auto scsu = torch::full({nt, nblk * nsplit}, -1e30f,
-                          Qd.options().dtype(at::kFloat));
-  auto sc2 = mix > 0 ? torch::full({nt, nblk}, -1e30f,
-                                   Qd.options().dtype(at::kFloat))
-                     : torch::Tensor();
-  dim3 sgrid((unsigned)nt, (unsigned)nsplit);
-  for (int b = 0; b < nblk; b++) {
-    const int k0 = b * (int)BN;
-    const int bnb = (int)std::min<int64_t>(BN, kv_len - k0);
-    bridge_kv<<<(int(BN) + per - 1) / per, threads, 0, stream.stream()>>>(
-        kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
-        reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),
-        reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r, (int)kh, k0,
-        (int)BN, (int)kv_len, (long)page, (long)side_off, (int)bt_cols, (int)H,
-        (int)NP, (int)DD, (int)SD, (float)k_scale, (float)v_scale,
-        reinterpret_cast<const __half*>(lut.data_ptr<at::Half>()),
-        (int)hstride, (int)tstride);
-    blk_max_score<<<sgrid, 256, 0, stream.stream()>>>(
-        reinterpret_cast<const __half*>(Kb.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(qmean.data_ptr<at::Half>()),
-        sc.data_ptr<float>(), scsu.data_ptr<float>(), b, nblk, bnb, D,
-        (float)sm_scale, nsplit, nsplit);
-    if (mix > 0)
-      blk_max_score<<<sgrid, 256, 0, stream.stream()>>>(
-          reinterpret_cast<const __half*>(Kb.data_ptr<at::Half>()),
-          reinterpret_cast<const __half*>(qlast.data_ptr<at::Half>()),
-          sc2.data_ptr<float>(), scsu.data_ptr<float>(), b, nblk, bnb, D,
-          (float)sm_scale, nsplit, nsplit);
-  }
-  if (prior.numel() > 0) {
-    // Decode hot set: the deepest q tile sees exactly what the decode query
-    // will see, so its per-superblock Quest scores are the ranking to reuse.
-    const int nsuper = nblk * nsplit;
-    const int pages_per_sb = (int)std::max<int64_t>(1, 256 / kv.size(2));
-    // Row `r` of the block table, not row 0: with more than one request in the
-    // batch, row 0 scatters this request's scores onto ANOTHER request's pages,
-    // so every concurrent request decodes against the wrong hot set (this is the
-    // "ductduct/!!!!" degeneration that only showed up under concurrency).
-    seed_prior<<<(nsuper + 255) / 256, 256, 0, stream.stream()>>>(
-        prior.data_ptr<float>(), bt.data_ptr<int>() + (long)r * bt_cols,
-        scsu.data_ptr<float>() + (long)(nt - 1) * nsuper, nsuper, pages_per_sb,
-        (int)bt_cols, (int)prior.numel());
-  }
-  auto sch = sc.to(at::kCPU);
-  const float* sp = sch.data_ptr<float>();
-  torch::Tensor sch2;
-  const float* sp2 = nullptr;
-  if (mix > 0) {
-    sch2 = sc2.to(at::kCPU);
-    sp2 = sch2.data_ptr<float>();
-  }
-  std::vector<char> keep((size_t)nt * nblk, 0);
-  for (int t = 0; t < nt; t++) {
-    const int bmax = (int)(plast[t] / BN);        // last eligible block
-    if (bmax < 0) continue;
-    const int n_el = std::min(bmax + 1, nblk);
-    const int forced = (int)std::min<int64_t>(nsink + nrecent, n_el);
-    int budget = forced + (int)std::ceil(keep_frac * (double)(n_el - forced));
-    budget = std::min(std::max(budget, forced), n_el);
-    std::vector<int> idx;
-    idx.reserve(n_el);
-    for (int b = 0; b < n_el; b++) {
-      const bool f = (b < nsink) || (b >= n_el - nrecent);
-      if (f) keep[(size_t)t * nblk + b] = 1;
-      else idx.push_back(b);
-    }
-    const int extra = budget - forced;
-    const int n_last = (mix > 0) ? (extra * mix) / 100 : 0;
-    const int n_mean = extra - n_last;
-    if (extra > 0 && !idx.empty()) {
-      const int take_mean = std::min<int>(n_mean, idx.size());
-      std::partial_sort(idx.begin(), idx.begin() + take_mean, idx.end(),
-                        [&](int a, int b) {
-                          return sp[(size_t)t * nblk + a] > sp[(size_t)t * nblk + b];
-                        });
-      for (int i = 0; i < take_mean; i++) keep[(size_t)t * nblk + idx[i]] = 1;
-      if (n_last > 0 && (int)idx.size() > take_mean) {
-        auto mid = idx.begin() + take_mean;
-        const int take_last = std::min<int>(n_last, idx.end() - mid);
-        std::partial_sort(mid, mid + take_last, idx.end(),
-                          [&](int a, int b) {
-                            return sp2[(size_t)t * nblk + a] >
-                                   sp2[(size_t)t * nblk + b];
-                          });
-        for (int i = 0; i < take_last; i++) keep[(size_t)t * nblk + mid[i]] = 1;
-      }
-    }
-  }
-  for (int b = 0; b < nblk; b++) {
-    const int k0 = b * (int)BN;
-    bool any = false;
-    for (int t = 0; t < nt; t++) any = any || keep[(size_t)t * nblk + b];
-    if (!any) continue;
-    bridge_kv<<<(int(BN) + per - 1) / per, threads, 0, stream.stream()>>>(
-        kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
-        reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),
-        reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r, (int)kh, k0,
-        (int)BN, (int)kv_len, (long)page, (long)side_off, (int)bt_cols, (int)H,
-        (int)NP, (int)DD, (int)SD, (float)k_scale, (float)v_scale,
-        reinterpret_cast<const __half*>(lut.data_ptr<at::Half>()),
-        (int)hstride, (int)tstride);
-    long o = 0;
-    for (int t = 0; t < nt; t++) {
-      const int M = (int)rows[t] * Gq;
-      int hi = (int)std::min<int64_t>(BN, plast[t] + 1 - k0);
-      if (hi <= 0 || !keep[(size_t)t * nblk + b]) { o += M; continue; }
-      hi = (hi + 7) & ~7;
-      auto St = S.narrow(0, 0, M);
-      auto PVt = PV.narrow(0, 0, M);
-      if (hi < (int)BN) {
-        auto Sd = at::mm(Qd.narrow(0, o, M), Kb.narrow(0, 0, hi).transpose(0, 1));
-        fused_softmax_gen<<<(M + 3) / 4, 128, 0, stream.stream()>>>(
-            reinterpret_cast<__half*>(Sd.data_ptr<at::Half>()),
-            mrow.narrow(0, o, M).data_ptr<float>(),
-            lrow.narrow(0, o, M).data_ptr<float>(),
-            alpha.narrow(0, o, M).data_ptr<float>(),
-            qpos.narrow(0, o, M).data_ptr<int>(), M, k0, hi, (int)kv_len,
-            (float)sm_scale);
-        auto PVd = at::mm(Sd, Vb.narrow(0, 0, hi));
-        fused_update<<<M, 128, 0, stream.stream()>>>(
-            O.narrow(0, o, M).data_ptr<float>(),
-            reinterpret_cast<const __half*>(PVd.data_ptr<at::Half>()),
-            alpha.narrow(0, o, M).data_ptr<float>(), M);
-      } else {
-        at::mm_out(St, Qd.narrow(0, o, M), Kb.transpose(0, 1));
-        launch_softmax(St, mrow.narrow(0, o, M), lrow.narrow(0, o, M),
-                       alpha.narrow(0, o, M), qpos.narrow(0, o, M), M, k0,
-                       (int)kv_len, (float)sm_scale, stream.stream());
-        at::mm_out(PVt, St, Vb);
-        fused_update<<<M, 128, 0, stream.stream()>>>(
-            O.narrow(0, o, M).data_ptr<float>(),
-            reinterpret_cast<const __half*>(PVt.data_ptr<at::Half>()),
-            alpha.narrow(0, o, M).data_ptr<float>(), M);
-      }
-      o += M;
-    }
-  }
-  long o = 0, qoff = 0;
-  for (int t = 0; t < nt; t++) {
-    const int nr = (int)rows[t], M = nr * Gq;
-    auto res = O.narrow(0, o, M).view({nr, Gq, D}) /
-               lrow.narrow(0, o, M).view({nr, Gq, 1});
-    out.narrow(0, qoff, nr).narrow(1, kh * Gq, Gq).copy_(res.to(at::kHalf));
-    o += M;
-    qoff += nr;
-  }
-}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &run);
   m.def("run_tiles", &run_tiles);
-  m.def("run_tiles_sparse", &run_tiles_sparse);
   m.def("bench_softmax", &bench_softmax);
   m.def("bench_update", &bench_update);
   m.def("bench_bridge", &bench_bridge);
@@ -838,7 +520,6 @@ def enabled() -> bool:
 
 
 _BUF: dict = {}
-_EMPTY = torch.empty(0, dtype=torch.float32)
 
 
 def _num(name, dflt):
@@ -863,19 +544,6 @@ BN_DEF = _num("VLLM_SM70_TWOPASS_BN", 4096)
 # number here is same-session, and cross-session baselines drift several percent
 # on this box, so TP1's -3.5% needs a same-session check before it is quoted.
 BM_DEF = _num("VLLM_SM70_TWOPASS_BM", 4096)
-
-
-def _seed_prior_buf(kv_cache):
-    """Page-keyed Quest prior for the decode selector (empty = disabled).
-
-    The decode hot set can then be ranked by the real attention structure seen
-    during prefill instead of by a fresh sampled estimate, at zero extra reads.
-    """
-    if _num("VLLM_SM70_PREFILL_SEED_PRIOR", 0) != 1:
-        return _EMPTY
-    from .sm70_decode_pagescore_cuda import prior_buffer
-
-    return prior_buffer(int(kv_cache.shape[0]), kv_cache.device)
 
 
 def _bufs(dev, G, BM, BN, D, need_rows):
@@ -936,19 +604,6 @@ def try_paged_prefill_twopass(q, kv_cache, block_table, qo_indptr, kv_lens, out,
     side_off = H * kv_cache.shape[2] * kv_cache.shape[3]
     try:
         qo, kl = qo_indptr.tolist(), kv_lens.tolist()
-        if os.environ.get("VLLM_SM70_PROBE_MASS"):
-            # Task 2.5.1 probe: the last token of the chunk attends causally to
-            # the whole prefix, which is exactly the distribution the decode step
-            # will face.  Prefill is never CUDA-graph captured, so this always
-            # runs.  Any failure disables the probe, never the request.
-            try:
-                from . import sm70_attn_mass_cuda as _mass
-
-                if _mass.enabled():
-                    _mass.probe(qo, q, kv_cache, block_table, kv_lens,
-                                sm_scale, 128, 8192)
-            except Exception:  # noqa: BLE001
-                os.environ.pop("VLLM_SM70_PROBE_MASS", None)
         for r in range(block_table.shape[0]):
             q0, q1 = int(qo[r]), int(qo[r + 1])
             klen = int(kl[r])
@@ -983,28 +638,14 @@ def try_paged_prefill_twopass(q, kv_cache, block_table, qo_indptr, kv_lens, out,
                 lrow[:tot].zero_()
                 alpha[:tot].fill_(1.0)
                 _fmt = "fp8" if kv_fp8 else ("fp16" if kv_fp16 else "nvfp4")
-                bs = _num("VLLM_SM70_PREFILL_BLKSPARSE", 0)
-                if bs > 0:
-                    prior = _seed_prior_buf(kv_cache)
-                    _mod(_fmt).run_tiles_sparse(
-                        Qd, kv_cache, block_table, qpos, b["Kb"], b["Vb"],
-                        b["S"], b["PV"], O, mrow, lrow, alpha, out[q0:q1],
-                        rows, plast, k_scale, v_scale, sm_scale, r, kh, klen,
-                        kv_cache.stride(0), side_off, block_table.shape[1], BN,
-                        lut if lut is not None else q, kv_cache.stride(1),
-                        kv_cache.stride(2),
-                        _num("VLLM_SM70_PREFILL_SINK_BLK", 1),
-                        _num("VLLM_SM70_PREFILL_RECENT_BLK", 1),
-                        bs / 100.0, prior)
-                else:
-                    _mod(_fmt).run_tiles(Qd, kv_cache, block_table, qpos, b["Kb"],
-                                     b["Vb"], b["S"], b["PV"], O, mrow, lrow,
-                                     alpha, out[q0:q1], rows, plast, k_scale,
-                                     v_scale,
-                                     sm_scale, r, kh, klen, kv_cache.stride(0),
-                                     side_off, block_table.shape[1], BN,
-                                     lut if lut is not None else q,
-                                     kv_cache.stride(1), kv_cache.stride(2))
+                _mod(_fmt).run_tiles(Qd, kv_cache, block_table, qpos, b["Kb"],
+                                 b["Vb"], b["S"], b["PV"], O, mrow, lrow,
+                                 alpha, out[q0:q1], rows, plast, k_scale,
+                                 v_scale,
+                                 sm_scale, r, kh, klen, kv_cache.stride(0),
+                                 side_off, block_table.shape[1], BN,
+                                 lut if lut is not None else q,
+                                 kv_cache.stride(1), kv_cache.stride(2))
         return True
     except Exception as e:  # noqa: BLE001 - the valve must never break prefill
         if os.environ.get("VLLM_SM70_TWOPASS_DEBUG") == "1":
