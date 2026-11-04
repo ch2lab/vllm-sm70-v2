@@ -968,7 +968,15 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                     "> build_table_kernel's 1088", flush=True)
                 _use_prior = False
             per_sb = super_ // npg
-            cap = (max(_topk_pages, _stream_pages if _stream else 0, _dense_max)
+            # The identity (dense) branch of page_minmax_select writes one entry
+            # per page, i.e. up to `block_table.shape[1]` (cols) of them, not up
+            # to the budget.  Sizing this from max(topk, dense_max) alone let a
+            # request with more pages than the budget run off the end of
+            # _SEL_BT and overwrite whatever the allocator put next -- which is
+            # how sel_len could end up smaller than kv_len (making decode both
+            # faster and wrong at 131K-196K once dense_max was lowered).
+            cap = (max(_topk_pages, _stream_pages if _stream else 0, _dense_max,
+                       int(block_table.shape[1]))
                    + _sink + _win + _tail + 1)
             if _SEL_BT is None or _SEL_BT.numel() < cap:
                 _SEL_BT = torch.zeros((1, cap), dtype=block_table.dtype,
