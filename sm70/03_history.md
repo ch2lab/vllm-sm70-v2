@@ -18819,3 +18819,36 @@ canary 7/7、recall 24/24、secret@250K 2/2。
 **遗留隐患（未验）**：`serve_qwen36.sh` 强制 `VLLM_SM70_DECODE_XQA_PARTS=240`，而内核注释
 （`sm70_nvfp4_decode_cuda.py:218-223`）自述单 rank 下 240 是"RACE，rel 可达 8e+1 与 NaN，
 'ductduct…' 退化输出的来源"，安全值 120。尚未用 A/B 证实或否证。
+
+---
+
+## 2026-11-05 (22) MoE wide 内核的真实约束是寄存器，不是 shared；RowTiles=4 在 WCols=128 下成立
+
+**更正 (21) 之后一条结论的归因。** 上一轮把 "RowTiles=4 慢 6.3×" 归因于 `partials[SplitK][RowTiles*256]`
+涨到 32 KB 导致占用率崩塌。`cuobjdump -res-usage` 给出真因：
+
+```
+nvfp4_qpn2_moe_wide_kernel<8,2,256,false,false,false>   REG:254  STACK:0   SHARED:16576   ← 生产内核
+nvfp4_qpn2_moe_wide_kernel<8,4,128,false,false,false>   REG:255  STACK:88  SHARED:33152
+```
+生产内核已经**贴着 Volta 的 255 寄存器上限**，所以 `accum[RowTiles][WCols/32][8]` 一涨就必然溢栈（STACK:88）；
+shared 只是次要因素。⇒ 定律：**这个内核族里 RowTiles 与 WCols 必须反向调**，
+因为累加器数量 = RowTiles × (WCols/32) × 8，而 SplitK 完全不影响它（所以"降 SplitK 换 RowTiles"是无效的，实测前即被算术否证）。
+
+**据此唯一可行的臂**：`WCols=128 × RowTiles=4`（route block 32，kMoeBlockM 必须等于 moe_block_size）。
+离线（chunk=8192，各两次可复现）：
+
+| 臂 | w13 | w2 |
+|---|---|---|
+| block16 / WIDE=256 / RowTiles=2（现状） | 6.946 ms · 39.6 TFLOPS · 32.2% | 5.394 ms · 25.5 · 20.7% |
+| **block32 / WIDE=128 / RowTiles=4** | **6.330 ms · 43.4 TFLOPS · 35.3%** | **5.184 ms · 26.5 · 21.6%** |
+
+每 MoE 层 12.340 → 11.514 ms（−6.7%）。
+**无损性**：两臂在 chunk∈{1024,8192} × {w13,w2} 四个输出缓冲上 **sha256 完全相同**
+（`bench_moe_wide.py --dump`，逐字节比较）——只换了 CTA 分组，每行的 K 归约顺序未变。
+
+实现要点（`csrc/quantization/marlin/sm70_nvfp4_qpn2.cu`）：
+`moe_block_size` 放开 32；`block32` 时**强制** `wcols=128`（否则 `route_tiles<=20` 等占用率启发式会把路径降级到
+base 内核，而 base 内核的 RowTiles=4 实例 `partials[16][4*256]`=65,920 B 超 48 KB 静态 shared 上限，
+**编译期即失败**，运行时不一致会直接算错）；Python 侧 `block_size_m` 在 sm70_qpn2 分支原样只给 8/16，
+新增 `VLLM_SM70_MOE_BLOCK_M` 作为测量/采纳臂。
