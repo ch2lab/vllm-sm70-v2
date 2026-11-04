@@ -22,6 +22,17 @@ import os
 
 ROUTER = "_sm70_topk_softmax_kernel"
 
+# functional buckets, lower-cased substring match, first hit wins
+BUCKETS = {
+    "MoE (qpn/nvfp4 gemv)": ("qpn", "moe"),
+    "attention": ("decode_xqa", "combine_decode", "fa_", "fmha", "softmax",
+                  "run_tiles", "bridge_kv", "rope"),
+    "GDN linear-attn": ("gdn", "gated_delta", "conv1d"),
+    "dense GEMM/gemv": ("gemv", "gemm", "cutlass", "splitk", "volta_", "sgemm"),
+    "norm/act/quant glue": ("norm", "silu", "sigmoid", "dequant", "float8",
+                            "topk_softmax", "align_block", "elementwise"),
+}
+
 
 def load(path: str):
     opener = gzip.open if path.endswith(".gz") else open
@@ -36,18 +47,49 @@ def main() -> int:
     ap.add_argument("trace")
     ap.add_argument("--layers", type=int, default=40)
     ap.add_argument("--top", type=int, default=28)
+    ap.add_argument("--mode", choices=["decode", "prefill"], default="decode")
     args = ap.parse_args()
 
     ker = load(args.trace)
     tot: dict[str, float] = collections.defaultdict(float)
     cnt: dict[str, int] = collections.Counter()
+    grid: dict[str, tuple] = {}
     for e in ker:
         tot[e["name"]] += float(e.get("dur", 0) or 0)
         cnt[e["name"]] += 1
+        grid.setdefault(e["name"], tuple(e.get("args", {}).get("grid", [])))
     if not tot:
         print("no kernel events")
         return 1
 
+    busy = sum(tot.values()) / 1e6
+    span = (max(e['ts'] + e.get('dur', 0) for e in ker)
+            - min(e['ts'] for e in ker)) / 1e6
+
+    if args.mode == "prefill":
+        # no per-step normalisation: rank the whole window and bucket it
+        print(f"file   {os.path.basename(args.trace)}")
+        print(f"window {span:.2f} s wall, {busy:.2f} s GPU-busy "
+              f"({busy/span*100:.0f}% busy), {len(ker)} kernel events\n")
+        print(f"{'total_ms':>9} {'%gpu':>6} {'n':>7} {'us/call':>8} {'grid':>16}  name")
+        for name, dur in sorted(tot.items(), key=lambda kv: -kv[1])[:args.top]:
+            print(f"{dur/1e3:>9.1f} {dur/1e6/busy*100:>5.1f}% {cnt[name]:>7} "
+                  f"{dur/max(1,cnt[name]):>8.1f} {str(grid[name]):>16}  {name[:74]}")
+        agg: dict[str, float] = collections.defaultdict(float)
+        for name, dur in tot.items():
+            low = name.lower()
+            for b, keys in BUCKETS.items():
+                if any(k in low for k in keys):
+                    agg[b] += dur
+                    break
+            else:
+                agg["other"] += dur
+        print("\nby function (% of GPU-busy):")
+        for b, dur in sorted(agg.items(), key=lambda kv: -kv[1]):
+            print(f"  {dur/1e3:>9.1f} ms  {dur/1e6/busy*100:>5.1f}%  {b}")
+        return 0
+
+    rname = next((k for k in tot if ROUTER in k), None)
     rname = next((k for k in tot if ROUTER in k), None)
     if rname is None:
         print(f"cannot infer step count: {ROUTER} absent")
@@ -92,19 +134,11 @@ def main() -> int:
           f"{prefill/1e6:.2f} s total)")
 
     # group into functional buckets so the target is unambiguous
-    buckets = {
-        "MoE (qpn/nvfp4 gemv)": ("qpn", "moe"),
-        "attention decode": ("decode_xqa", "combine_decode", "fa_", "fmha"),
-        "GDN linear-attn": ("gdn", "gated_delta", "conv1d"),
-        "dense GEMM/gemv": ("gemv", "gemm", "cutlass", "splitK", "volta_", "sgemm"),
-        "norm/act/quant glue": ("norm", "silu", "sigmoid", "dequant", "Float8",
-                                "topk_softmax", "align_block", "elementwise"),
-    }
     agg: dict[str, float] = collections.defaultdict(float)
     for ms, _, _, name in rows:
         low = name.lower()
-        for b, keys in buckets.items():
-            if any(k.lower() in low for k in keys):
+        for b, keys in BUCKETS.items():
+            if any(k in low for k in keys):
                 agg[b] += ms
                 break
         else:
