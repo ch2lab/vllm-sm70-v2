@@ -144,6 +144,50 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
   }
 }
 
+// The 2^14 that dequant_e2m1x8 multiplies into every code to undo the FP4
+// exponent bias is a power of two, so it can live in the group scale instead:
+// round_half(raw * (gs * 2^14)) == round_half(raw * gs) * 2^14, after which one
+// HMUL2 per pair reproduces what the two above produced.  That is 4 fewer
+// instructions per packed uint (24 vs 28), which matters because this kernel is
+// issue-bound, not bandwidth-bound.
+// Where that identity is exact: while scale * 2^14 stays in fp16's *normal*
+// range AND scale itself is normal, i.e. an effective scale in
+// [2^-14, 65504/2^14] = [6.1e-5, 3.998].  Below 2^-14 the two paths are NOT
+// bit-identical, and the reason is asymmetric precision rather than a bug: the
+// unbiased path above rounds the scale through an fp16 subnormal (quantum
+// 2^-24), while folding keeps the value normal where it rounds at quantum
+// 2^-25.  Measured over 15.7M group scales of this checkpoint, 0.46% are
+// subnormal and the top of the range has 100x headroom (max 0.0400), so the
+// residue is 0.46% of dequantizations at <=0.43 ulp-of-max, always in the
+// direction of the *more* accurate value.  bench_moe_wide.py --smin 8 confirms
+// the two arms are byte-identical once every scale is normal.
+__device__ __forceinline__ half2 nvfp4_effective_scale_biased(
+    uint8_t value, float global_scale) {
+  const half raw = __low2half(fp8e4m3_to_half2(value));
+  const half scaled = __float2half_rn(
+      __fmul_rn(__half2float(raw), __fmul_rn(global_scale, 16384.0f)));
+  return __halves2half2(scaled, scaled);
+}
+
+// dequant_e2m1x8 for a scale that already carries the 2^14.  Pair it with
+// nvfp4_effective_scale_biased; using it with the unbiased scale would underflow
+// every weight by 2^14.
+__device__ __forceinline__ void dequant_e2m1x8_biased(unsigned packed,
+                                                     half2 scale,
+                                                     half2 output[4]) {
+  constexpr unsigned kSign = 0x80008000u;
+  constexpr unsigned kExponentMantissa = 0x0e000e00u;
+  unsigned values[4];
+  values[0] = ((packed << 12) & kSign) | ((packed << 9) & kExponentMantissa);
+  values[1] = ((packed << 8) & kSign) | ((packed << 5) & kExponentMantissa);
+  values[2] = ((packed << 4) & kSign) | ((packed << 1) & kExponentMantissa);
+  values[3] = (packed & kSign) | ((packed >> 3) & kExponentMantissa);
+#pragma unroll
+  for (int index = 0; index < 4; ++index) {
+    output[index] = __hmul2(*reinterpret_cast<half2*>(&values[index]), scale);
+  }
+}
+
 #define VLLM_SM70_QPN2_MMA(C, A0, A1, B0, B1)                       \
   asm volatile(                                                     \
       "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "            \
@@ -645,8 +689,35 @@ int qpn2_moe_ns() {
   return v;
 }
 
+// A/B knob: fold the 2^14 FP4 exponent-bias undo out of the e2m1 dequant and
+// into the fp32 group scale.  Saves 4 instructions per packed uint in the wide
+// kernel's inner loop (SASS: HMUL2 680 -> 360, HMMA unchanged at 1280, total
+// -5.9%), which is the right axis because that kernel is issue-bound.
+// Adopted on: VLLM_SM70_MOE_QPN2_BIASED_SCALE=0 restores the old path.
+// Measured in-service on a verified cold 250K prefill: MoE wide 17.19 -> 16.77 s
+// (-2.44%), 250K wall 146.96 -> 146.23 s; canary 7/7, recall 24/24 with the
+// same hit set, secret@250K 2/2; registers 254 -> 250.
+// NOT bit-identical, and the residue is characterised rather than waved away:
+// 0.46% of this checkpoint's MoE group scales are fp16-subnormal, and there the
+// old path rounds the scale through a subnormal while this one keeps it normal.
+// Over 4M samples the folded scale is never worse and quantizes 2-4x finer, so
+// the difference is a precision gain, bounded at <=0.43 ulp-of-max (max
+// relative 2.1e-4).  With all scales forced normal the two arms are
+// byte-identical over 134 MB and 268 MB buffers.
+// Deliberately NOT cached in a static, unlike the sibling knobs above: the
+// kernel-side arms are chosen per launch, so a re-readable valve lets one
+// process interleave both arms in a single timing loop.  Cross-process
+// absolutes are not comparable on this box (clock drift), and the A/B has to be
+// same-process to mean anything.  One getenv per GEMM launch is free next to
+// the launch itself.
+int qpn2_moe_biased_scale() {
+  const char* env = std::getenv("VLLM_SM70_MOE_QPN2_BIASED_SCALE");
+  // NS-style opt-out: adopted on, an explicit 0 restores the old dequant.
+  return (env != nullptr && std::strcmp(env, "0") == 0) ? 0 : 1;
+}
+
 template <int SplitK, int RowTiles, int WCols, bool K4Gran,
-          bool NSplit = false, bool Fp16B = false>
+          bool NSplit = false, bool Fp16B = false, bool BiasedScale = false>
 __global__ void nvfp4_qpn2_moe_wide_kernel(
     const uint8_t* __restrict__ codes,   // [E, n, k/2] QPN2-packed
     const uint8_t* __restrict__ group_scales,  // [E, n, k/16]
@@ -778,13 +849,21 @@ __global__ void nvfp4_qpn2_moe_wide_kernel(
           const float global_scale_value =
               global_scale[static_cast<size_t>(expert) * gs_shards +
                            (static_cast<int>(tile) < tiles_per_shard ? 0 : 1)];
-          const half2 scale = nvfp4_effective_scale(
+          const uint8_t sbyte =
               __ldg(scale_base + static_cast<size_t>(tile) * groups_k16 * 32 +
-                    static_cast<size_t>(group) * 32 + lane),
-              global_scale_value);
+                    static_cast<size_t>(group) * 32 + lane);
+          const half2 scale =
+              BiasedScale
+                  ? nvfp4_effective_scale_biased(sbyte, global_scale_value)
+                  : nvfp4_effective_scale(sbyte, global_scale_value);
           half2 weights[8];
-          dequant_e2m1x8(packed.x, scale, weights);
-          dequant_e2m1x8(packed.y, scale, weights + 4);
+          if constexpr (BiasedScale) {
+            dequant_e2m1x8_biased(packed.x, scale, weights);
+            dequant_e2m1x8_biased(packed.y, scale, weights + 4);
+          } else {
+            dequant_e2m1x8(packed.x, scale, weights);
+            dequant_e2m1x8(packed.y, scale, weights + 4);
+          }
           const unsigned* w = reinterpret_cast<const unsigned*>(weights);
 #pragma unroll
           for (int i = 0; i < 8; ++i) bwords[i] = w[i];
@@ -830,13 +909,21 @@ __global__ void nvfp4_qpn2_moe_wide_kernel(
           const float global_scale_value =
               global_scale[static_cast<size_t>(expert) * gs_shards +
                            (static_cast<int>(tile) < tiles_per_shard ? 0 : 1)];
-          const half2 scale = nvfp4_effective_scale(
+          const uint8_t sbyte =
               __ldg(scale_base +
                     static_cast<size_t>(tile) * groups_k16 * 32 +
-                    static_cast<size_t>(group) * 32 + lane),
-              global_scale_value);
-          dequant_e2m1x8(packed.x, scale, weights[t]);
-          dequant_e2m1x8(packed.y, scale, weights[t] + 4);
+                    static_cast<size_t>(group) * 32 + lane);
+          const half2 scale =
+              BiasedScale
+                  ? nvfp4_effective_scale_biased(sbyte, global_scale_value)
+                  : nvfp4_effective_scale(sbyte, global_scale_value);
+          if constexpr (BiasedScale) {
+            dequant_e2m1x8_biased(packed.x, scale, weights[t]);
+            dequant_e2m1x8_biased(packed.y, scale, weights[t] + 4);
+          } else {
+            dequant_e2m1x8(packed.x, scale, weights[t]);
+            dequant_e2m1x8(packed.y, scale, weights[t] + 4);
+          }
         }
       }
 #pragma unroll
@@ -936,7 +1023,7 @@ __global__ void nvfp4_qpn2_moe_wide_kernel(
 }
 
 template <int SplitK, int RowTiles, int WCols, bool K4Gran,
-          bool NSplit = false, bool Fp16B = false>
+          bool NSplit = false, bool Fp16B = false, bool BiasedScale = false>
 void launch_qpn2_moe_wide(const uint8_t* codes, const uint8_t* scales,
                           const half* input, half* output, float* partials_out,
                           const int32_t* sorted_token_ids,
@@ -956,12 +1043,14 @@ void launch_qpn2_moe_wide(const uint8_t* codes, const uint8_t* scales,
     logged = true;
     fprintf(stderr,
             "[sm70-qpn2] MoE shadow path active: cols=%d k4gran=%d nsplit=%d "
-            "n=%d k=%d grid=(%d,%d,%d)\n",
-            WCols, (int)K4Gran, (int)NSplit, n, k, nx, route_tiles, ksplit);
+            "biased=%d n=%d k=%d grid=(%d,%d,%d)\n",
+            WCols, (int)K4Gran, (int)NSplit, (int)BiasedScale, n, k, nx,
+            route_tiles, ksplit);
     fflush(stderr);
   }
   const dim3 grid(nx, route_tiles, ksplit);
-  nvfp4_qpn2_moe_wide_kernel<SplitK, RowTiles, WCols, K4Gran, NSplit, Fp16B>
+  nvfp4_qpn2_moe_wide_kernel<SplitK, RowTiles, WCols, K4Gran, NSplit, Fp16B,
+                             BiasedScale>
       <<<grid, (32 * SplitK), 0, stream>>>(
           codes, scales, input, output, partials_out, sorted_token_ids,
           expert_ids, num_tokens_past_padded, topk_weights, global_scale, n, k,
@@ -1507,35 +1596,38 @@ void sm70_nvfp4_qpn2_moe_gemm_impl(torch::stable::Tensor& out,
     }                                                                        \
   } while (0)
   const bool block8 = (moe_block_size == 8);
-  #define LAUNCH_WIDE_T(ROWS, WC, K4G)                                       \
-    qpn2::launch_qpn2_moe_wide<kSplitK, ROWS, WC, K4G, false, Fp16B>(         \
-        reinterpret_cast<const uint8_t*>(codes.data_ptr()),                   \
-        reinterpret_cast<const uint8_t*>(scales.data_ptr()),                  \
-        reinterpret_cast<const half*>(input.data_ptr()),                      \
+  // Single-variable A/B arm for the e2m1 dequant feed (see
+  // nvfp4_effective_scale_biased).  Both instantiations exist in the binary, so
+  // cuobjdump can price them before anything runs.
+  const bool biased = (qpn2::qpn2_moe_biased_scale() != 0);
+  #define LAUNCH_WIDE_ARGS                                                      \
+    reinterpret_cast<const uint8_t*>(codes.data_ptr()),                        \
+        reinterpret_cast<const uint8_t*>(scales.data_ptr()),                   \
+        reinterpret_cast<const half*>(input.data_ptr()),                       \
         reinterpret_cast<half*>(out.mutable_data_ptr()), partials_ptr,         \
-        sorted_token_ids.const_data_ptr<int32_t>(),                           \
-        expert_ids.const_data_ptr<int32_t>(),                                 \
-        num_tokens_past_padded.const_data_ptr<int32_t>(),                     \
-        topk_weights.const_data_ptr<float>(),                                \
+        sorted_token_ids.const_data_ptr<int32_t>(),                            \
+        expert_ids.const_data_ptr<int32_t>(),                                  \
+        num_tokens_past_padded.const_data_ptr<int32_t>(),                      \
+        topk_weights.const_data_ptr<float>(),                                  \
         global_scale.const_data_ptr<float>(), n, k, m, static_cast<int>(top_k),\
-        mul_topk_weights, route_tiles, ksplit, gs_shards,                     \
-        (n / gs_shards) / 32, stream)
+        mul_topk_weights, route_tiles, ksplit, gs_shards,                      \
+        (n / gs_shards) / 32, stream
+  #define LAUNCH_WIDE_TB(ROWS, WC, K4G, NSP, BIAS)                             \
+    qpn2::launch_qpn2_moe_wide<kSplitK, ROWS, WC, K4G, NSP, Fp16B, BIAS>(       \
+        LAUNCH_WIDE_ARGS)
+  #define LAUNCH_WIDE_T(ROWS, WC, K4G)                                          \
+    do {                                                                        \
+      if (biased) { LAUNCH_WIDE_TB(ROWS, WC, K4G, false, true); }               \
+      else { LAUNCH_WIDE_TB(ROWS, WC, K4G, false, false); }                     \
+    } while (0)
   // T9 L-A (2026-10-15): N-split warps on the 256-col path — each warp owns one
   // 32-column sub-tile, full K, ksplit=1, no partials/reduction. Research
   // knob VLLM_SM70_MOE_QPN2_NS (default off).
-  #define LAUNCH_WIDE_NS(ROWS)                                               \
-    qpn2::launch_qpn2_moe_wide<kSplitK, ROWS, 256, false, true, Fp16B>(        \
-        reinterpret_cast<const uint8_t*>(codes.data_ptr()),                   \
-        reinterpret_cast<const uint8_t*>(scales.data_ptr()),                  \
-        reinterpret_cast<const half*>(input.data_ptr()),                      \
-        reinterpret_cast<half*>(out.mutable_data_ptr()), partials_ptr,         \
-        sorted_token_ids.const_data_ptr<int32_t>(),                           \
-        expert_ids.const_data_ptr<int32_t>(),                                 \
-        num_tokens_past_padded.const_data_ptr<int32_t>(),                     \
-        topk_weights.const_data_ptr<float>(),                                \
-        global_scale.const_data_ptr<float>(), n, k, m, static_cast<int>(top_k),\
-        mul_topk_weights, route_tiles, ksplit, gs_shards,                     \
-        (n / gs_shards) / 32, stream)
+  #define LAUNCH_WIDE_NS(ROWS)                                                 \
+    do {                                                                       \
+      if (biased) { LAUNCH_WIDE_TB(ROWS, 256, false, true, true); }            \
+      else { LAUNCH_WIDE_TB(ROWS, 256, false, true, false); }                  \
+    } while (0)
   // P6 shadow path (T8, 2026-10-15): default off; env gates and kernel docs on
   // nvfp4_qpn2_moe_wide_kernel. wcols>0 wins over k4mode (both = widek4).
   int wcols = 0;
