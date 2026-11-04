@@ -848,7 +848,7 @@ def _num(name, dflt):
         return dflt
 
 
-BM_DEF = _num("VLLM_SM70_TWOPASS_BM", 1024)
+BM_DEF = _num("VLLM_SM70_TWOPASS_BM", 4096)
 BN_DEF = _num("VLLM_SM70_TWOPASS_BN", 4096)
 
 
