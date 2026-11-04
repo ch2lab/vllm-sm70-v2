@@ -604,6 +604,13 @@ void run_tiles_sparse(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
     // tile's rows blurs 2048 queries into one; the deepest row is the one that
     // actually has to retrieve (it is also what the decode step will ask), so
     // VLLM_SM70_PREFILL_SEL_Q=last ranks with that row's heads instead.
+    //
+    // MEASURED 2026-11-04 (BLKSPARSE=20, 250K, one env var apart): `last` fixes
+    // retrieval (secret@65K 2/3 -> 3/3) and gives a 26.528 s / 6.031 s =
+    // 1.153x length ratio, but it starves the other 2047 rows of the tile --
+    // the concurrent shared-prefix probe collapses to 10/12 broken, against
+    // 1/20 on the baseline.  Do not enable it; the default (mean) is the only
+    // variant that passes that gate.
     static const char* sel_q = getenv("VLLM_SM70_PREFILL_SEL_Q");
     const bool use_last = sel_q != nullptr && sel_q[0] == 'l';
     long o = 0;
