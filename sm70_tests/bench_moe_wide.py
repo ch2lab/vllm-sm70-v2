@@ -26,7 +26,10 @@ import torch
 
 TOPK = 8
 E = 256
-BLOCK = 16
+# Route-block width. 16 is production; 32 selects RowTiles=4 in the wide
+# kernel (kMoeBlockM must equal moe_block_size), which halves the per-mma cost
+# of the in-register e2m1 dequant at the price of double shared memory.
+BLOCK = int(os.environ.get("SM70_BENCH_BLOCK", "16"))
 PEAK_TFLOPS = 123.0
 
 
