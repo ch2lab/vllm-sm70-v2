@@ -27,6 +27,8 @@ vard = collections.defaultdict(float)
 cnt = collections.Counter()
 gemm_grids = collections.Counter()
 sm_variants = collections.Counter()
+br_variants = collections.Counter()
+br_vard = collections.defaultdict(float)
 for e in ev:
     n = e["name"]
     a = e.get("args", {}) or {}
@@ -46,6 +48,12 @@ for e in ev:
     elif "bridge_kv" in n:
         fam["bridge_kv"] += d
         cnt["bridge_kv"] += 1
+        # effect proof: the template argument names the dequant that actually ran.
+        # A bool template parameter demangles as true/false, not 0/1.
+        m = re.search(r"bridge_kv<(\w+)>", n)
+        key = f"bridge_kv<{m.group(1)}>" if m else "bridge_kv<?>"
+        br_variants[key] += 1
+        br_vard[key] += d
     elif "s884gemm" in n or "cutlass" in n or "gemm" in n.lower():
         fam["attn_gemm"] += d
         cnt["attn_gemm"] += 1
@@ -73,5 +81,8 @@ if ok:
     print(f"    expected QK^T grid.x = BN/128 = {bn_expected // 128}")
     for k, c in sm_variants.most_common():
         print(f"    softmax variant {k:10} n={c:7}  {vard[k]/1e6:7.2f} s")
+    for k, c in br_variants.most_common():
+        print(f"    {k:19} n={c:7}  {br_vard[k]/1e6:7.2f} s"
+              f"  {br_vard[k]/c/1e3:7.3f} ms/call")
     for (g, nm), c in gemm_grids.most_common(6):
         print(f"      grid{g} x{c:<6} {nm}")

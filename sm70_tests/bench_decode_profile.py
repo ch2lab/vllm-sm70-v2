@@ -133,19 +133,35 @@ def main() -> int:
     t, p_prof = chat(args.base, prof_prompt, args.tokens)
     print(f"[prof] profiled run:   {t:.2f} s ({args.tokens / t:.1f} tok/s), "
           f"prompt_tokens={p_prof}", flush=True)
-    _post(args.base, "/stop_profile", timeout=1200)
+    # /stop_profile is best-effort.  It has repeatedly hung forever here while the
+    # trace was already fully written (the server returns no response; the client
+    # sits in poll_schedule_timeout on one socket with the GPU idle).  The trace
+    # files on disk are the real completion signal, so a slow or failed stop must
+    # never block the run - and must not be mistaken for a failed measurement.
+    try:
+        _post(args.base, "/stop_profile", timeout=30)
+        print("[prof] stop_profile acknowledged", flush=True)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[prof] stop_profile did not return ({type(e).__name__}); "
+              f"proceeding on the trace files on disk", flush=True)
 
-    print("[prof] waiting for trace files...", flush=True)
+    print("[prof] waiting for trace files to appear and stop growing...", flush=True)
     new: list[str] = []
-    for _ in range(120):
+    prev_sizes: dict[str, int] = {}
+    stable = 0
+    for _ in range(180):
         new = sorted(set(glob.glob(os.path.join(args.out, "*.trace.json*")))
                      - before)
-        if new:
-            time.sleep(3)
-            new = sorted(set(glob.glob(os.path.join(args.out, "*.trace.json*")))
-                         - before)
-            if new:
+        sizes = {p: os.path.getsize(p) for p in new}
+        # non-empty AND unchanged since the previous sample: an existence check
+        # alone would accept a trace still being written and under-count kernels
+        if new and sizes == prev_sizes and all(s > 0 for s in sizes.values()):
+            stable += 1
+            if stable >= 2:
                 break
+        else:
+            stable = 0
+        prev_sizes = sizes
         time.sleep(2)
     if not new:
         print("[prof] NO TRACE PRODUCED", file=sys.stderr)

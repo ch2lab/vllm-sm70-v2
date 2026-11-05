@@ -41,11 +41,29 @@ using namespace at::cuda;
 
 #define DH 256
 
-__device__ __forceinline__ float e2m1(int n) {
-  const float L[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-  float v = L[n & 7];
-  return (n & 8) ? -v : v;
+// e2m1 magnitudes {0,.5,1,1.5,2,3,4,6} are exact fp32 patterns: writing m as
+// 2E+M, the value for E>=1 is 2^(E-1)*(1+M/2), i.e. bits ((126+E)<<23)|(M<<22);
+// m=1 is the subnormal 0.5 and m=0 is zero.  Building the bits rather than
+// indexing an 8-float table removes a local-memory array: bridge_kv carried
+// STACK:32 with STL:128/LDL:64, one spilled table read per dequantised element
+// (each thread decodes 16 K codes + 16 V codes), which is why it ran at 81 GB/s
+// = 9% of HBM against a 13-14 us floor.  Both branches return identical values,
+// so this is not a numerical change; TABLE=true keeps the old table so the two
+// can be A/B'd in service from one binary.
+template <bool TABLE>
+__device__ __forceinline__ float e2m1v(int n) {
+  if (TABLE) {
+    const float L[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float v = L[n & 7];
+    return (n & 8) ? -v : v;
+  }
+  const int m = n & 7;
+  const unsigned bits = (m == 0) ? 0u
+                        : (m == 1) ? 0x3F000000u
+                        : (unsigned)(((126 + (m >> 1)) << 23) | ((m & 1) << 22));
+  return __int_as_float((int)(bits | ((unsigned)(n & 8) << 28)));
 }
+__device__ __forceinline__ float e2m1(int n) { return e2m1v<false>(n); }
 __device__ __forceinline__ float e4m3(unsigned char b) {
   int s = (b & 0x80) ? -1 : 1, e = (b >> 3) & 0xF, m = b & 7;
   if (e == 15 && m == 7) return 448.f;
@@ -70,6 +88,7 @@ __device__ __forceinline__ __half2 f8_pair(unsigned char b0, unsigned char b1,
                            __half2float(lut[b1]) * sc);
 }
 
+template <bool TABLE>
 __global__ void bridge_kv(const unsigned char* __restrict__ kv,
                           const int* __restrict__ bt, __half* __restrict__ Kb,
                           __half* __restrict__ Vb, int r, int kh, int k0, int bn,
@@ -149,10 +168,10 @@ __global__ void bridge_kv(const unsigned char* __restrict__ kv,
     for (int bb = 0; bb < 4; bb++) {
       const unsigned char bk = (kw[w] >> (bb * 8)) & 0xFF;
       const unsigned char bv = (vw[w] >> (bb * 8)) & 0xFF;
-      pk.h2[bb] = __floats2half2_rn(e2m1(bk & 0xF) * sfk,
-                                    e2m1((bk >> 4) & 0xF) * sfk);
-      pv.h2[bb] = __floats2half2_rn(e2m1(bv & 0xF) * sfv,
-                                    e2m1((bv >> 4) & 0xF) * sfv);
+      pk.h2[bb] = __floats2half2_rn(e2m1v<TABLE>(bk & 0xF) * sfk,
+                                    e2m1v<TABLE>((bk >> 4) & 0xF) * sfk);
+      pv.h2[bb] = __floats2half2_rn(e2m1v<TABLE>(bv & 0xF) * sfv,
+                                    e2m1v<TABLE>((bv >> 4) & 0xF) * sfv);
     }
     *reinterpret_cast<uint4*>(&Kb[tok * DH + d0 + w * 8]) = pk.u;
     *reinterpret_cast<uint4*>(&Vb[tok * DH + d0 + w * 8]) = pv.u;
@@ -353,6 +372,25 @@ static int softmax_wpr() {
   return v;
 }
 
+// Keeps the pre-fold table dequant alive so the two can be A/B'd in service from
+// one build; the template instantiations are distinct symbols, so a trace shows
+// which one actually ran.  0 (unset) = the spill-free bit-built path.
+static int bridge_table() {
+  static const int v = [] {
+    const char* e = std::getenv("VLLM_SM70_TWOPASS_BRIDGE_TABLE");
+    return e ? std::atoi(e) : 0;
+  }();
+  return v;
+}
+
+#define BRIDGE_LAUNCH(GRID, THREADS, STREAM, ...)                     \
+  do {                                                                \
+    if (bridge_table())                                               \
+      bridge_kv<true><<<GRID, THREADS, 0, STREAM>>>(__VA_ARGS__);     \
+    else                                                              \
+      bridge_kv<false><<<GRID, THREADS, 0, STREAM>>>(__VA_ARGS__);    \
+  } while (0)
+
 inline void launch_softmax(torch::Tensor S, torch::Tensor mrow,
                            torch::Tensor lrow, torch::Tensor alpha,
                            torch::Tensor qpos, int nrows, int k0, int kv_len,
@@ -413,7 +451,7 @@ void run(torch::Tensor Q, torch::Tensor kv, torch::Tensor bt,
   for (int k0 = 0; k0 < (int)kv_len; k0 += (int)BN) {
     const int bn = (int)BN;
     const int threads = 256, per = threads / 8;
-    bridge_kv<<<(bn + per - 1) / per, threads, 0, stream.stream()>>>(
+    BRIDGE_LAUNCH((bn + per - 1) / per, threads, stream.stream(),
         kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
         reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r, (int)kh, k0,
@@ -467,20 +505,29 @@ void bench_update(torch::Tensor O, torch::Tensor PV, torch::Tensor alpha) {
       alpha.data_ptr<float>(), M);
 }
 
+// `table` picks the dequant variant explicitly (-1 = follow the env valve) so a
+// single process can prove the bit-built path and the old table path agree.
 void bench_bridge(torch::Tensor kv, torch::Tensor bt, torch::Tensor Kb,
                   torch::Tensor Vb, int64_t r, int64_t kh, int64_t k0,
                   int64_t bn, int64_t kv_len, int64_t page, int64_t side_off,
                   int64_t bt_cols, int64_t H, int64_t NP, int64_t DD,
-                  int64_t SD, double k_scale, double v_scale) {
+                  int64_t SD, double k_scale, double v_scale, int64_t table) {
   const int threads = 256, per = threads / 8;
-  bridge_kv<<<((int)bn + per - 1) / per, threads, 0,
-              getCurrentCUDAStream().stream()>>>(
-      kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
-      reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),
-      reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r, (int)kh,
-      (int)k0, (int)bn, (int)kv_len, (long)page, (long)side_off, (int)bt_cols,
-      (int)H, (int)NP, (int)DD, (int)SD, (float)k_scale, (float)v_scale, nullptr,
-      0, 0);
+  const bool tab = (table >= 0) ? (table != 0) : (bridge_table() != 0);
+#define BB_ARGS                                                       \
+  kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),                   \
+      reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),             \
+      reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r,     \
+      (int)kh, (int)k0, (int)bn, (int)kv_len, (long)page,             \
+      (long)side_off, (int)bt_cols, (int)H, (int)NP, (int)DD,         \
+      (int)SD, (float)k_scale, (float)v_scale, nullptr, 0, 0
+  if (tab)
+    bridge_kv<true><<<((int)bn + per - 1) / per, threads, 0,
+                      getCurrentCUDAStream().stream()>>>(BB_ARGS);
+  else
+    bridge_kv<false><<<((int)bn + per - 1) / per, threads, 0,
+                       getCurrentCUDAStream().stream()>>>(BB_ARGS);
+#undef BB_ARGS
 }
 
 // Same maths as run(), but the k loop is outermost and *all* q tiles of one
@@ -511,7 +558,7 @@ void run_tiles(torch::Tensor Qd, torch::Tensor kv, torch::Tensor bt,
   for (int k0 = 0; k0 < (int)kv_len; k0 += (int)BN) {
     const int bn = (int)BN;
     const int threads = 256, per = threads / 8;
-    bridge_kv<<<(bn + per - 1) / per, threads, 0, stream.stream()>>>(
+    BRIDGE_LAUNCH((bn + per - 1) / per, threads, stream.stream(),
         kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
         reinterpret_cast<__half*>(Kb.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(Vb.data_ptr<at::Half>()), (int)r, (int)kh, k0,
