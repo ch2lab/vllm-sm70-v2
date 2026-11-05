@@ -36,6 +36,7 @@ _CUDA = r"""
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdlib>
 using namespace at::cuda;
 
 #define DH 256
@@ -158,47 +159,82 @@ __global__ void bridge_kv(const unsigned char* __restrict__ kv,
   }
 }
 
-// Mask + row max + exp + rowsum with P written in place.  One warp per row and
-// the whole row lives in registers, so each element is read once and written
-// once (the 3-pass version read the logits twice and ran ~2x slower).
-// PER = BN / 32 halves per lane.
-template <int PER>
+// Mask + row max + exp + rowsum with P written in place.  Each row is held in
+// registers and touched exactly twice (one read, one write); the 3-pass version
+// read the logits twice and ran ~2x slower.  PER = BN/32 halves per lane when a
+// single warp owns the row.
+//
+// WPR warps cooperate on one row so PER can grow without the row outgrowing the
+// register file.  At BN=8192 a single warp needs NH = PER/2 = 128 __half2:
+// cuobjdump shows REG:255 (the Volta cap) with STACK:0, so it does not spill -
+// it collapses to 65536/(255*128) = 2 CTAs/SM, i.e. 8 of 64 warps (12%
+// occupancy), which is where the in-service 27.90 s -> 31.72 s regression comes
+// from even though every BN processes the same element count.
+//
+// Halving NH is not enough: WPR=2 (NH=64) still lands on REG:255 and *now*
+// spills STACK:88, so it stays at 2 CTAs/SM.  WPR=4 (NH=32) is the first choice
+// that clears the cliff - REG:149, STACK:0, 3 CTAs/SM (19%) - so BN=8192
+// dispatches there.  The two barriers below are compiled out at WPR=1, so the
+// BN<=4096 path keeps its existing codegen.
+template <int PER, int WPR>
 __global__ void fused_softmax_reg(__half* __restrict__ S,
                                   float* __restrict__ mrow,
                                   float* __restrict__ lrow,
                                   float* __restrict__ alpha,
                                   const int* __restrict__ qpos, int nrows,
                                   int k0, int kv_len, float sm) {
-  constexpr int NH = PER / 2;           // __half2 values per lane
+  constexpr int NH_ALL = PER / 2;         // __half2 per lane if one warp owns a row
+  constexpr int NH = NH_ALL / WPR;        // this warp's share of the row
+  constexpr int WARPS = 128 / 32;
+  constexpr int ROWS = WARPS / WPR;       // rows per block
+  __shared__ float pmx[ROWS][WPR];
+  __shared__ float pls[ROWS][WPR];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int row = blockIdx.x * (blockDim.x >> 5) + warp;
-  if (row >= nrows) return;
+  const int rb = warp / WPR, sub = warp % WPR;
+  // Out-of-range rows are clamped rather than returned early: with WPR>1 every
+  // warp of a block must reach the barriers, and the stores below are
+  // predicated on `live` so a clamped row cannot double-apply the update.
+  const int row_raw = blockIdx.x * ROWS + rb;
+  const bool live = row_raw < nrows;
+  const int row = live ? row_raw : nrows - 1;
   const int pos = qpos[row];
   const int lim = min(pos + 1, kv_len) - k0;   // live columns in this block
   __half* base = S + (long)row * (PER * 32);
   // A warp covers 64 halves per half2 instruction; 4 of those fill one 256-half
   // chunk.  Every lane's 128 B region is thus contiguous with its neighbours.
   auto col = [&](int i) { return (i >> 2) * 256 + (i & 3) * 64 + lane * 2; };
+  const int i0 = sub * NH;
   __half2 r[NH];
 #pragma unroll
   for (int i = 0; i < NH; i++)
-    r[i] = *reinterpret_cast<const __half2*>(base + col(i));
+    r[i] = *reinterpret_cast<const __half2*>(base + col(i0 + i));
   float mx = -1e30f;
 #pragma unroll
   for (int i = 0; i < NH; i++) {
-    const int c = col(i);
+    const int c = col(i0 + i);
     if (c + 1 < lim) mx = fmaxf(mx, fmaxf(__low2float(r[i]), __high2float(r[i])) * sm);
     else if (c < lim) mx = fmaxf(mx, __low2float(r[i]) * sm);
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
     mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-  const float newm = fmaxf(mrow[row], mx);
-  const float a = __expf(mrow[row] - newm);
+  float newm, a;
+  if (WPR == 1) {
+    newm = fmaxf(mrow[row], mx);
+    a = __expf(mrow[row] - newm);
+  } else {
+    if (lane == 0) pmx[rb][sub] = mx;
+    __syncthreads();
+    float rm = -1e30f;
+#pragma unroll
+    for (int w = 0; w < WPR; w++) rm = fmaxf(rm, pmx[rb][w]);
+    newm = fmaxf(mrow[row], rm);
+    a = __expf(mrow[row] - newm);
+  }
   float ls = 0.f;
 #pragma unroll
   for (int i = 0; i < NH; i++) {
-    const int c = col(i);
+    const int c = col(i0 + i);
     float e0 = 0.f, e1 = 0.f;
     if (c + 1 < lim) {
       e0 = __expf(__low2float(r[i]) * sm - newm);
@@ -211,13 +247,26 @@ __global__ void fused_softmax_reg(__half* __restrict__ S,
   }
 #pragma unroll
   for (int i = 0; i < NH; i++)
-    *reinterpret_cast<__half2*>(base + col(i)) = r[i];
+    *reinterpret_cast<__half2*>(base + col(i0 + i)) = r[i];
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
-  if (lane == 0) {
-    mrow[row] = newm;
-    lrow[row] = lrow[row] * a + ls;
-    alpha[row] = a;
+  if (WPR == 1) {
+    if (live && lane == 0) {
+      mrow[row] = newm;
+      lrow[row] = lrow[row] * a + ls;
+      alpha[row] = a;
+    }
+  } else {
+    if (lane == 0) pls[rb][sub] = ls;
+    __syncthreads();
+    if (live && lane == 0 && sub == 0) {
+      float tot = 0.f;
+#pragma unroll
+      for (int w = 0; w < WPR; w++) tot += pls[rb][w];
+      mrow[row] = newm;
+      lrow[row] = lrow[row] * a + tot;
+      alpha[row] = a;
+    }
   }
 }
 
@@ -280,21 +329,44 @@ __global__ void fused_softmax_gen(__half* __restrict__ S, float* __restrict__ mr
   }
 }
 
-// Dispatch on BN; specialised widths keep the row in registers.
-#define SM_LAUNCH(BN)                                                        \
-  fused_softmax_reg<(BN) / 32><<<(nrows + 3) / 4, 128, 0, stream>>>(          \
-      reinterpret_cast<__half*>(S.data_ptr<at::Half>()), mrow.data_ptr<float>(), \
-      lrow.data_ptr<float>(), alpha.data_ptr<float>(), qpos.data_ptr<int>(),  \
-      nrows, k0, (int)kv_len, (float)sm)
+// Dispatch on BN; the row stays in registers, split over WPR warps when BN is
+// large enough that a single warp would spill (see fused_softmax_reg).
+#define SM_LAUNCH(BN, WPR)                                                    \
+  do {                                                                        \
+    constexpr int ROWS_ = (128 / 32) / (WPR);                                 \
+    fused_softmax_reg<(BN) / 32, (WPR)><<<(nrows + ROWS_ - 1) / ROWS_, 128,   \
+                                           0, stream>>>(                      \
+        reinterpret_cast<__half*>(S.data_ptr<at::Half>()),                    \
+        mrow.data_ptr<float>(), lrow.data_ptr<float>(),                       \
+        alpha.data_ptr<float>(), qpos.data_ptr<int>(), nrows, k0,             \
+        (int)kv_len, (float)sm);                                              \
+  } while (0)
+
+// A/B valve for the WPR choice without a rebuild.  The variants are distinct
+// template symbols, so a trace attributes them separately even if a run mixes
+// them; 0 (unset) selects the measured default.
+static int softmax_wpr() {
+  static const int v = [] {
+    const char* e = std::getenv("VLLM_SM70_TWOPASS_SOFTMAX_WPR");
+    return e ? std::atoi(e) : 0;
+  }();
+  return v;
+}
 
 inline void launch_softmax(torch::Tensor S, torch::Tensor mrow,
                            torch::Tensor lrow, torch::Tensor alpha,
                            torch::Tensor qpos, int nrows, int k0, int kv_len,
                            float sm, cudaStream_t stream) {
   switch (S.size(1)) {
-    case 2048: SM_LAUNCH(2048); break;
-    case 4096: SM_LAUNCH(4096); break;
-    case 8192: SM_LAUNCH(8192); break;
+    case 2048: SM_LAUNCH(2048, 1); break;
+    case 4096: SM_LAUNCH(4096, 1); break;
+    case 8192:
+      switch (softmax_wpr()) {
+        case 1: SM_LAUNCH(8192, 1); break;
+        case 2: SM_LAUNCH(8192, 2); break;
+        default: SM_LAUNCH(8192, 4); break;
+      }
+      break;
     default: TORCH_CHECK(false, "unsupported BN ", S.size(1));
   }
 }
@@ -367,6 +439,24 @@ void bench_softmax(torch::Tensor S, torch::Tensor mrow, torch::Tensor lrow,
                    int64_t bn, int64_t kv_len, double sm) {
   launch_softmax(S, mrow, lrow, alpha, qpos, (int)S.size(0), (int)k0,
                  (int)kv_len, (float)sm, getCurrentCUDAStream().stream());
+}
+
+// Forces a specific (BN, WPR) so the cross-warp combine can be checked against
+// the single-warp path on a BN where both are legal, and so each choice's
+// register cost can be timed in isolation.
+void bench_softmax_wpr(torch::Tensor S, torch::Tensor mrow, torch::Tensor lrow,
+                       torch::Tensor alpha, torch::Tensor qpos, int64_t k0,
+                       int64_t kv_len, double sm, int64_t wpr) {
+  const int nrows = (int)S.size(0);
+  auto stream = getCurrentCUDAStream().stream();
+  const int bn = (int)S.size(1);
+#define SM_CASE(BN, WPR) \
+  if (bn == (BN) && wpr == (WPR)) { SM_LAUNCH(BN, WPR); return; }
+  SM_CASE(2048, 1) SM_CASE(2048, 2) SM_CASE(2048, 4)
+  SM_CASE(4096, 1) SM_CASE(4096, 2) SM_CASE(4096, 4)
+  SM_CASE(8192, 1) SM_CASE(8192, 2) SM_CASE(8192, 4)
+#undef SM_CASE
+  TORCH_CHECK(false, "unsupported (BN, wpr) ", bn, "/", wpr);
 }
 
 void bench_update(torch::Tensor O, torch::Tensor PV, torch::Tensor alpha) {
@@ -485,6 +575,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &run);
   m.def("run_tiles", &run_tiles);
   m.def("bench_softmax", &bench_softmax);
+  m.def("bench_softmax_wpr", &bench_softmax_wpr);
   m.def("bench_update", &bench_update);
   m.def("bench_bridge", &bench_bridge);
 }

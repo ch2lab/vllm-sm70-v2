@@ -10,6 +10,7 @@ s884gemm grids so the shapes can be eyeballed.
 import collections
 import gzip
 import json
+import re
 import sys
 
 path = sys.argv[1]
@@ -19,8 +20,10 @@ ev = [e for e in json.load(gzip.open(path, "rt"))["traceEvents"]
       if e.get("cat") == "kernel"]
 busy = sum(float(e.get("dur", 0) or 0) for e in ev) / 1e6
 fam = collections.defaultdict(float)
+vard = collections.defaultdict(float)
 cnt = collections.Counter()
 gemm_grids = collections.Counter()
+sm_variants = collections.Counter()
 for e in ev:
     n = e["name"]
     a = e.get("args", {}) or {}
@@ -29,6 +32,11 @@ for e in ev:
     if "fused_softmax_reg" in n:
         fam["softmax"] += d
         cnt["softmax"] += 1
+        # effect proof: the template args name the variant that actually ran
+        m = re.search(r"fused_softmax_reg<(\d+),\s*(\d+)>", n)
+        key = f"<{m.group(1)},{m.group(2)}>" if m else "?"
+        sm_variants[key] += 1
+        vard[key] += d
     elif "fused_update" in n:
         fam["update"] += d
         cnt["update"] += 1
@@ -52,5 +60,7 @@ if busy > 100 and sig:
         avg = fam[k] / cnt[k] / 1e3 if cnt[k] else 0.0
         print(f"    {k:11} {fam[k]/1e6:8.2f} s  n={cnt[k]:7}  {avg:7.1f} us/call")
     print(f"    expected QK^T grid.x = BN/128 = {bn_expected // 128}")
+    for k, c in sm_variants.most_common():
+        print(f"    softmax variant {k:10} n={c:7}  {vard[k]/1e6:7.2f} s")
     for (g, nm), c in gemm_grids.most_common(6):
         print(f"      grid{g} x{c:<6} {nm}")
