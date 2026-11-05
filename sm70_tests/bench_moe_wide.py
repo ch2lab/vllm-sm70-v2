@@ -147,11 +147,15 @@ def main() -> int:
                     help="floor of the random e4m3 group-scale byte; >=8 keeps every "
                          "effective scale normal, which is where the biased arm is "
                          "provably bit-identical")
-    ap.add_argument("--ab", action="store_true",
-                    help="time the e2m1 dequant-feed arms (biased scale off/on) "
-                         "interleaved inside THIS process.  Cross-process "
-                         "absolutes are not comparable on this box, so a paired "
-                         "same-process delta is the only readable number")
+    ap.add_argument("--ab", nargs="?", const="wide", default="",
+                    choices=["", "wide"],
+                    help="time the e2m1 dequant-feed arms interleaved inside THIS "
+                         "process.  Only the wide (prefill) kernel has the arm: "
+                         "the same fold on the route-tiled decode kernel measured "
+                         "+1.75% kernel / +0.27% ITL and was removed, so there is "
+                         "no 'tiled' target to offer.  Cross-process absolutes are "
+                         "not comparable on this box, so a paired same-process "
+                         "delta is the only readable number")
     ap.add_argument("--rounds", type=int, default=5)
     args = ap.parse_args()
     import vllm  # noqa: F401
@@ -159,12 +163,19 @@ def main() -> int:
     from vllm.sm70_nvfp4_ops import qpn2_moe_gemm, qpn2_prepare_moe
 
     dev = "cuda"
+    ab_vars = ("VLLM_SM70_MOE_QPN2_BIASED_SCALE",)   # wide kernel only
+
+    def set_arm(arm: int) -> None:
+        for v in ab_vars:
+            os.environ[v] = str(arm)
+
     print(f"# gpu={torch.cuda.get_device_name(0)} chunk={args.chunk} "
           f"top_k={TOPK} experts={E} block={BLOCK} skew={args.skew} "
           f"WIDE={os.environ.get('VLLM_SM70_MOE_QPN2_WIDE','?')} "
           f"WARPS={os.environ.get('VLLM_SM70_MOE_QPN2_WARPS','?')} "
           f"NS={os.environ.get('VLLM_SM70_MOE_QPN2_NS','?')} "
-          f"KSPLIT={os.environ.get('VLLM_SM70_MOE_QPN2_KSPLIT','?')}")
+          f"KSPLIT={os.environ.get('VLLM_SM70_MOE_QPN2_KSPLIT','?')} "
+          f"AB={args.ab or 'off'} vars={','.join(ab_vars) if args.ab else '-'}")
     print(f"{'proj':>5} {'n':>6} {'k':>6} {'TFLOP':>7} {'ms':>7} "
           f"{'TFLOPS':>7} {'%peak':>6}  finite")
     tot_us = 0.0
@@ -189,9 +200,9 @@ def main() -> int:
                 # alternate which arm goes first so a slow drift cannot favour
                 # one of them
                 for arm in ((0, 1) if r % 2 == 0 else (1, 0)):
-                    os.environ["VLLM_SM70_MOE_QPN2_BIASED_SCALE"] = str(arm)
+                    set_arm(arm)
                     per[arm].append(graph_time(call))
-            os.environ["VLLM_SM70_MOE_QPN2_BIASED_SCALE"] = "0"
+            set_arm(1)          # back to the adopted default
             b0, b1 = min(per[0]), min(per[1])
             tf0 = fl / (b0 * 1e-6) / 1e12
             tf1 = fl / (b1 * 1e-6) / 1e12
@@ -204,13 +215,14 @@ def main() -> int:
                   f"{100*(max(per[1])/b1-1):.1f}% finite={ok}")
             if args.dump:
                 for arm in (0, 1):
-                    os.environ["VLLM_SM70_MOE_QPN2_BIASED_SCALE"] = str(arm)
+                    set_arm(arm)
                     out.zero_()
                     call()
                     torch.cuda.synchronize()
-                    with open(f"{args.dump}.arm{arm}.{name}.bin", "wb") as fh:
+                    with open(f"{args.dump}.{args.ab}.{name}.arm{arm}.bin",
+                              "wb") as fh:
                         fh.write(out.detach().cpu().numpy().tobytes())
-                os.environ["VLLM_SM70_MOE_QPN2_BIASED_SCALE"] = "0"
+                set_arm(1)
             tot_us += b0
             continue
         if args.dump:
