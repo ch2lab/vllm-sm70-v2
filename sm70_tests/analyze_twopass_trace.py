@@ -29,6 +29,8 @@ gemm_grids = collections.Counter()
 sm_variants = collections.Counter()
 br_variants = collections.Counter()
 br_vard = collections.defaultdict(float)
+other = collections.defaultdict(float)
+othern = collections.Counter()
 for e in ev:
     n = e["name"]
     a = e.get("args", {}) or {}
@@ -67,6 +69,15 @@ for e in ev:
         # when judging whether a larger TP is actually paying for itself
         fam["nccl"] += d
         cnt["nccl"] += 1
+    else:
+        # Everything the named buckets do not claim. Without this the family
+        # table silently under-counts: at TP4 the named buckets summed to 33.6 s
+        # of a 41.0 s busy time, and comparing that against TP1's 136.8 s of 140.4
+        # produced the impossible conclusion that non-attention work *grew* with
+        # TP. Anything left here is either an unmodelled stage or a name pattern
+        # that stopped matching, so it must be printed, not dropped.
+        other[n.split("(")[0][:58]] += d
+        othern[n.split("(")[0][:58]] += 1
 
 sig = {"bridge_kv", "softmax", "update"} <= set(cnt)
 ok = busy >= min_busy and sig
@@ -78,6 +89,14 @@ if ok:
         # which made a 1.35 ms softmax read as "1.4 us"
         avg = fam[k] / cnt[k] / 1e3 if cnt[k] else 0.0
         print(f"    {k:11} {fam[k]/1e6:8.2f} s  n={cnt[k]:7}  {avg:8.3f} ms/call")
+    named = sum(fam.values())
+    print(f"    {'NAMED':11} {named/1e6:8.2f} s  ({100*named/(busy*1e6):5.1f}% of busy)")
+    for nm, dd in sorted(other.items(), key=lambda kv: -kv[1])[:12]:
+        print(f"      other {dd/1e6:7.2f} s  n={othern[nm]:7}  "
+              f"{dd/othern[nm]/1e3:8.3f} ms/call  {nm}")
+    print(f"    {'UNNAMED':11} {sum(other.values())/1e6:8.2f} s  "
+          f"({100*sum(other.values())/(busy*1e6):5.1f}% of busy) across "
+          f"{len(other)} distinct kernels")
     print(f"    expected QK^T grid.x = BN/128 = {bn_expected // 128}")
     for k, c in sm_variants.most_common():
         print(f"    softmax variant {k:10} n={c:7}  {vard[k]/1e6:7.2f} s")
