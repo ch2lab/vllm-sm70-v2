@@ -149,13 +149,16 @@ def main() -> int:
                          "provably bit-identical")
     ap.add_argument("--ab", nargs="?", const="wide", default="",
                     choices=["", "wide"],
-                    help="time the e2m1 dequant-feed arms interleaved inside THIS "
-                         "process.  Only the wide (prefill) kernel has the arm: "
-                         "the same fold on the route-tiled decode kernel measured "
-                         "+1.75% kernel / +0.27% ITL and was removed, so there is "
-                         "no 'tiled' target to offer.  Cross-process absolutes are "
-                         "not comparable on this box, so a paired same-process "
-                         "delta is the only readable number")
+                    help="time the wide kernel's e2m1 exponent-bias fold "
+                         "(VLLM_SM70_MOE_QPN2_BIASED_SCALE) interleaved inside "
+                         "THIS process.  Arms that were falsified and removed "
+                         "from the binary are deliberately NOT offered - the "
+                         "route-tiled fold, a manual depth-1 load pipeline, and "
+                         "__ldg-for-codes all live in sm70/03_history.md, not "
+                         "here - because a valve that no longer exists would "
+                         "silently measure two identical arms.  Cross-process "
+                         "absolutes are not comparable on this box, so a paired "
+                         "same-process delta is the only readable number")
     ap.add_argument("--rounds", type=int, default=5)
     args = ap.parse_args()
     import vllm  # noqa: F401
@@ -163,7 +166,8 @@ def main() -> int:
     from vllm.sm70_nvfp4_ops import qpn2_moe_gemm, qpn2_prepare_moe
 
     dev = "cuda"
-    ab_vars = ("VLLM_SM70_MOE_QPN2_BIASED_SCALE",)   # wide kernel only
+    ab_spec = {"wide": (("VLLM_SM70_MOE_QPN2_BIASED_SCALE",), "1")}  # adopted on
+    ab_vars, ab_home = ab_spec[args.ab or "wide"]
 
     def set_arm(arm: int) -> None:
         for v in ab_vars:
@@ -202,7 +206,7 @@ def main() -> int:
                 for arm in ((0, 1) if r % 2 == 0 else (1, 0)):
                     set_arm(arm)
                     per[arm].append(graph_time(call))
-            set_arm(1)          # back to the adopted default
+            set_arm(int(ab_home))    # back to this kernel's adopted default
             b0, b1 = min(per[0]), min(per[1])
             tf0 = fl / (b0 * 1e-6) / 1e12
             tf1 = fl / (b1 * 1e-6) / 1e12
@@ -222,7 +226,7 @@ def main() -> int:
                     with open(f"{args.dump}.{args.ab}.{name}.arm{arm}.bin",
                               "wb") as fh:
                         fh.write(out.detach().cpu().numpy().tobytes())
-                set_arm(1)
+                set_arm(int(ab_home))
             tot_us += b0
             continue
         if args.dump:
