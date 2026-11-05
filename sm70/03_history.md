@@ -20024,3 +20024,24 @@ Volta 上"单 warp 组串行递推 + 每 token 屏障/装载"的结构性代价�
 全新内核设计（如 token 内 ILP 重构），历史两次失败在前，属大预算赌博而非可屏臂。
 **逐段封顶账本至此完整**：attention ~85%、moe_wide 90–95%、fp8 投影 95–96%、
 fp8_cast 噪声级、gdn_rec 23% fp32 峰（结构性，已证）。
+
+### (45) volta-nvfp4 QPN2-MoE 屏测关闭：服务形状 m=1 我方 0.98×/0.82×（w13 平、w2 我方快 18%）（2026-11-05）
+
+最后一条外部候选（"1.538× vs Marlin-MoE" 的出处）。屏测：`moe_screen.cu`
+（他们的 174 行内核 + 从 skinny_kernels.cu 复制的 3 个 helper + pybind，独立编译 67 s）
+vs 生产 `nvfp4_qpn2_moe_sm70_kernel`，同一份 raw codes 各自 prepack、同一合成路由
+（E=256、top_k=8、8-slot 块、pad=S），CUPTI 内核时间、同进程交错、min-of-5×20。
+
+| 形状 | m | ours µs | skinny µs | 比率 | skny%DRAM |
+|---|---|---|---|---|---|
+| w13 (1024,2048) | 1 | 18.04 | 18.47 | **0.98× 平** | 57% |
+| w2  (2048, 512) | 1 | 11.35 | 13.79 | **0.82× 我赢** | 38% |
+
+数值对位（m=1，两形状）：双方对 fp32 参考最大误差相同（4.70e-01/2.42e-01，
+fp16 输出舍入量级），互差 6.25e-02（累加次序级，非位精确）。m=8 臂我方走
+wide 内核（模板名不含 moe_sm70，计数 0 为工具伪影），而 skinny m=8 仅 6–9%
+DRAM——无胜信号，不补测。**判决：不吸收。** 他们的 1.538× 基线是 stock
+Marlin-MoE，与我们的同宗已调优 qpn2 不可比。至此吸收账本五条全部实测裁决
+（strata 0.777×、Marlin 7–13% HBM、norm_quant −0.41%、skinny-dense 0.4–0.5%、
+本条 m=1 平/负）；decode MoE GEMV 停在 ~52–57% DRAM 延迟受限区，与战役
+"decode GEMV 已近实际墙"结论一致。
