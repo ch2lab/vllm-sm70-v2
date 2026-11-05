@@ -20067,3 +20067,23 @@ Marlin-MoE，与我们的同宗已调优 qpn2 不可比。至此吸收账本五�
 实测否证（WY 分块 2.05×、strata 列独占 0.777×、COLS=1 +6~18%、预取 +19~31%），
 gdn_rec 的 23% fp32 峰值是**该递推公式类在 Volta 上的结构性墙**。实验源码已回滚
 （死臂与 NaN 臂不入库），回滚后重编验证通过（输出形状正确、0 NaN），树净 HEAD=bfac31ef3f。
+
+### (47) "decode 43% 占空比"系口径错误，实测否证：decode 是 GPU-bound（87%+ duty），无发射受限杠杆（2026-11-05）
+
+怀疑 decode 是 CPU/发射受限（依据：busy 2.24 s ÷ 墙 5.22 s ≈ 43%）。三重证据否证：
+1. **无 profiler 直接测量**（duty_probe.py，流式单流 512 tok，ITL=10.127 ms 与尺子一致）：
+   nvidia-smi util mean=98.1%（p10=97）；
+2. **trace 内间隙结构**（单一来源，不跨运行）：273849 条内核记录、窗口 2.39 s，
+   **union-busy 87%**，>1 ms 间隙仅 11 个共 0.02 s——GPU 上没有空闲可捡；
+3. 并发反证：若 m=1 是发射受限，conc8 步长应≈不变、聚合应 ≈8×104=832；实测 275
+   （步长 10.1→29 ms 随批增长 2.9×）⇒ 步时由 GPU 工作量主导。
+
+"43%"的来源是把 CUPTI busy（trace 跨度内）除以了另一进程的客户端墙钟（45.8 s 的
+profiled 运行里 trace 只跨 2.39 s——墙钟被 CUPTI 逐启动记录处理主导，空闲发生在
+trace 边界之外，不是内核间隙）。教训入定律：**占空比必须在单一时间线内计算**
+（union-busy ÷ trace span），跨运行分子分母必错。
+
+副产品（真问题浮出）：conc8 步时 29 ms = m=1 的 2.9×，**批缩放差**才是 decode 侧
+剩余问题——每序列线性增长的工作（GDN packed_decode 状态流、per-seq attention、
+MoE 槽位）在并发下成为主项。下一候选：抓一份 conc8 decode trace 做与 (43) 同款
+per-shape 归因（现有 bench 只测单流）。
