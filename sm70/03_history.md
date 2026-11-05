@@ -19441,3 +19441,64 @@ K 扫描拟合（E=256/K=8，`sm70_tests/probe_topk_cost.py`）：**固定开销
 若要做，先按定律 B 用**非背靠背**的口径复现基线再谈。
 
 本轮无提速数字；服务已回到已验证态：**10K ITL 9.735/9.736/9.753、canary 7/7、recall 24/24**，工作区仅本文件与探针。
+
+---
+
+## 2026-11-05 (35) 稠密 QPN2 内核关闭（三条独立证据）+ 参考项目的 CacheCodes 查清即等同已否证之物
+
+### 先纠正上一轮的错判，再按定律⑥诊断
+
+上一轮我写"稠密 QPN2 内核无任何 Python 调用者 ⇒ 无时间可省"。**错了**：调用链是
+`sm70_nvfp4_dispatch.cu` → `kernels/linear/nvfp4/sm70.py:109 gemm_dispatch()`，
+trace 反查确认它每层两个投影、**39.8 次/步 × 2**：
+
+| 形状 | CTAs | µs/次 | ms/step | 有效带宽 |
+|---|---|---|---|---|
+| n=1024, k≈4096 | 32 / 80 SM | 8.92–9.02 | 0.355–0.359 | **264 GB/s = 29% HBM** |
+| n=2048, k≈1024 | 64 / 80 SM | 4.40 | 0.175 | **268 GB/s = 30% HBM** |
+
+⇒ 合计 **0.534 ms/step**（我先前只数了一个形状，报成 0.358）。两个形状都落在
+**#11420 实测的 28% GEMV 实际带宽带**上。
+
+### 三条独立证据把它关闭（没有写折叠代码）
+
+1. **跨 CTA K-split（现成阀 `VLLM_SM70_QPN2_KSPLIT`，零代码）**：把 CTA 从 32/64 摊到 256/128，
+   主内核只快 1.4–2.5%（8.92→8.70、4.40→4.34），却必须多跑一次 reduce：
+   净 **0.534 → 0.705 ms/step（+32%）**。⇒ 本期实测证实了 2026-09-21 那句
+   "Grid-z K-split measured regressive on all shapes — leave off"，而不是直接引用它。
+   ⇒ **CTA 数不是限制**（32→256 几乎无变化）。
+2. **访存局域性假设（我自己提的，自己否证）**：我猜 `[group][lane]` 布局会让 warp 每次只读
+   256 B、跳 256 B（半线访问），于是提议"成对 group 预打包"让每 lane 用 uint4 覆盖两组、
+   warp 发整条 512 B。**推导真实偏移后发现是错的**：warp 内 g 递增就是 +256 B **连续**，
+   每 warp 读连续 4 KB、每 CTA 连续 64 KB ⇒ 没有半线问题，改动不会买到任何东西 ⇒ **未实现**。
+   （顺带也算了 scale 的逐字节加载：即便按 128 B 线放大也只把 29%→39%，非主因。）
+3. **计算侧**：它 29% HBM 且 K-split 无效 ⇒ 与 route-tiled 同类，属**实际带宽带**而非可回收空间；
+   折叠是减指令杠杆，对非 issue-bound 的内核无效（定律⑥，(33)/(34) 已两次付过学费）。
+
+### 参考项目的 CacheCodes：查清之后 = 已否证的东西
+
+`1cat-vllm/csrc/sm70_turbomind/ops/nvfp4_qpn2_layout.cuh:30-44` 的 `Nvfp4Qpn2CodeReader::load`
+在 `CacheCodes` 为真时做的事**就是 `__ldg` 取代 `__ldcs`**，别无其他：
+
+```cpp
+if constexpr (CacheCodes) { return make_uint2(__ldg(ptr), __ldg(ptr + 32)); }
+return make_uint2(__ldcs(ptr), __ldcs(ptr + 32));
+```
+
+而它自己的调用点注释给出适用条件："Cache the TP4 GDN/attention output weights (3.75 MiB).
+The larger QKV and MLP projections retain streaming loads; **caching regresses them**" ——
+即**只有"小到能进 L2 且会被反复读"的权重集**才赚。我们这条路上两个条件都不成立：
+`code_ptr = codes + tile*groups_k16*32 + lane`（再 `+ group*32`），`tile`=列块、`warp`=K 区间
+⇒ 每个 `(tile, group, lane)` 三元组**每次启动只被读一次**，启动内零复用；跨 step 又有
+~141 MB/步 的其他流量把 6 MB L2 冲干净。⇒ **该技术对我们是惰性的**，
+且它等价于上一轮已在 route-tiled 上实测 **+8.5% 回退**的 `__ldg` 互换。
+⇒ 参考项目这条要求在稠密 nvfp4 GEMV 上**可迁移的部分已查尽**：机制理解、条件核对、判定不适用。
+
+### 另记一条仪器缺陷
+
+K-split 臂里内核求和 +0.171 ms/step，但 ITL 只动 +0.03 ms ⇒ **profiler 会膨胀 ~2 µs 级小内核的时长**，
+对这种量级的内核求和会**高估**真实代价（与定律⑧互补：ITL 因漂移不可判小效应，求和因膨胀会放大小内核）。
+
+**BN 扫描（(34) 遗留）仍在跑**：BN=8192 已见 `fused_update` 4.0→2.08 s（机理如预测）但
+`fused_softmax_reg` 26.9→31.7 s（PER=BN/32=256 ⇒ ~256 寄存器/线程 ⇒ 溢出），启动数 275,607→179,367；
+墙钟与内核求和方向冲突，等 BN=4096 同期控制臂才可判。
