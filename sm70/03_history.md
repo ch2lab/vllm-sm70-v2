@@ -20151,3 +20151,35 @@ TP8→TP4、port→8003、max-model-len 524288→262144（用户）、hf-overrid
 KV 按实际剩余自动分配，启动日志 KV-size 行为唯一调参依据）；EP/hc-sp/prefix-caching/
 MTP k=1/parsers/metrics/capture 阶梯全部照抄。模型 rsync 自 .129（109.2 GB safetensors，
 文件数+字节双校验）。启动判定只认 journal "Application startup complete"（禁 /health）。
+
+### (50) FlashNext TP4 备选配置验证通过（boot + 3 真实请求全绿）；两次失败根因=本仓 page4 双阀缺失（2026-11-06）
+
+`/root/run/serve_flashnext_tp4.sh`（= .129 测过的 `run_tp4_serve_ipc.sh`+`tp4_mtp_k.env` 逐条照抄，
+仅改本机管道：load-format auto / port 8003 / 本地 key）第三次启动**全绿**：
+`Application startup complete` 00:40:41、`Model loading took 20.84 GiB`/卡、
+**`GPU KV cache size: 487,446 tokens`/卡**（util 0.93 + 固定 KV 2.5e9/GPU 一次过，
+证实用户判断"KV 池过不了=配置问题"）、3 条真实请求 200 OK 且答案正确（17*23=391、北京=直辖市）。
+日志尾部 00:41:00 的 EngineDeadError 是验证链自身 `systemctl stop` 的关停噪声
+（SIGTERM→teardown 正常行），非崩溃。**备选配置就此定稿**：unit `vllm-flashnext`
+disabled 常驻，与 Q36 互斥手动起停。
+
+**前两次失败根因（本机特有）**：本仓对 nvfp4 QSA KV 硬依赖 page4 路由——
+`qsa.py:2495` 无 `SM70_PAGE4_TP8=1` 直接 raise；`_qsa_page4_local_ops`（qsa.py:66）无
+`SM70_QSA_PAGE4_BACKEND=local` 返回 None（政策：无 .so 回退）。.129 的 TP4 脚本没带这两个阀
+（其生产脚本 chat2:81-82 才设置），照抄即挂。本机 `_custom_ops` 实测已含
+`grouped_sparse_page4_plan_fwd`（stable-ABI 在树构建），补阀即通。
+**教训：跨机照抄启动配置时，env 阀清单要以"目标仓的硬依赖检查"为准，不能只抄脚本。**
+
+### (51) conc8 xqa16"418µs 之谜"结案：屏测 shape 错配（词≠token）；真实 KV 读 92MB/call，24% HBM（2026-11-06）
+
+`bench_decode_conc_profile.py` 的 `PROMPT_TOK=2048` 是**词数**（"tok%06d"词，Qwen tokenizer
+实测 2867 词→**20069 token**，每词≈7 token）。此前所有离线扫参（screens/xqa_parts.py）按
+kvlen=2048 跑，与服务（≈20069+生成数）**不是同一 shape**，"80.7µs vs 418µs"的对比从一开始就无效。
+按真实 shape 重算：xqa16 服务/call 读 8req×20300tok×576B(K+V,nvfp4)=**92.2MB**，440µs→210GB/s
+=**24% HBM**，同 shape 地板 ≈103µs ⇒ **≈4.3× 空间**，decode conc8 最大剩余杠杆（busy 占比 19.4%）。
+trace 佐证：xqa16 时长三分位簇 335/370/440µs（请求逐步加入）、与 MoE 重叠 0%、REG:80/LOCAL:0 无
+spill、smem 30.4KB 按设计 3 CTA/SM。PARTS=24 的 NO-GO 同步解释：真实 shape 下 np=236 已近饱和，
+24 会砍 10× CTA 并行度必然劣化——该臂的死因是屏测 shape 错，不是"空转 CTA 不可回收"本身。
+稀疏选页路线维持死刑（(46) 质量门 15/24 fact blocks），dense 是唯一合规形态。
+工具：`sm70_tests/bench_xqa_insitu.py`（真实 shape + 冷L2/MoE交错/散列bt 分臂复现器）。
+纪律更新：**屏测前必须用真 tokenizer 数一遍 harness 的 prompt token 数，词≠token。**
