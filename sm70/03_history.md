@@ -20206,3 +20206,14 @@ in-flight 字节不足以盖住依赖链，退化为延迟受限）。公式 rou
 真 kvlen 20069 不是 2048）造成的误判，见 (51)；该臂死因不适用于本公式（R=1 保 120）。
 **合并安全**：TP8 几何不在 `VERIFIED_GEOMETRIES{(2,16),(1,8),(1,4)}`，`supported_decode` 直接
 False，.129 TP8 到不了该分支；且默认关。备份 `backups/sm70_nvfp4_decode_cuda.py.pre_rscale_20261106`。
+
+**(52) 追加：长上下文同场 A/B（bench_longctx_sweep，一次进程内对照，salt 冷前缀）**：
+| 指标 | 阀 ON | 阀 OFF | 差 |
+|---|---|---|---|
+| 65K prefill | 3791.0 tok/s | 3763.9 | +0.7% |
+| 65K decode | 96.7 tok/s | 94.2 | +2.7% |
+| 250K prefill | 1791.2 tok/s | 1787.8 | +0.2% |
+| 250K decode | 74.8 tok/s | 73.8 | +1.4% |
+四项全不劣且四项全优；**"R=1 长上下文 240→120 会回退"的担忧未复现**（combine ws 流量收益盖过
+分区数损失）。至此门的覆盖面：concat 20K（+5.6/+3.5%）、65K（+2.7% decode）、250K（+1.4% decode）、
+prefill 三档平坦不劣、recall/secret/canary/Xid/共享文件回归全过。
