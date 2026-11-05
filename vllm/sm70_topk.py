@@ -22,6 +22,8 @@ fused_topk_router.py). Semantics match ops.topk_softmax:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -34,6 +36,11 @@ from vllm.triton_utils import tl, triton
 # compiled kernel's launcher directly.
 _fast_cache: dict = {}
 _fast_disabled: set = set()
+
+# Warps per program at decode row counts.  Four is the in-service measured
+# optimum; one warp wins only in a back-to-back graph replay, which does not
+# model this kernel's isolation in the real pipeline (see _topk_warps).
+_DECODE_WARPS = max(1, int(os.environ.get("VLLM_SM70_TOPK_DECODE_WARPS", "4")))
 
 
 @triton.jit
@@ -99,14 +106,21 @@ def _sm70_topk_softmax_kernel(
 def _topk_warps(rows: int) -> int:
     """Warps per program for the MoE top-k/softmax kernel.
 
-    At prefill row counts the grid already has thousands of programs, so the
-    four warps only add cross-warp reductions around each of the K serial
-    argmax passes: 126.1 -> 63.2 us at 8192 rows (2.00x) with bitwise
-    identical output, 68.5 -> 38.0 us at 4096. Below ~128 rows the extra warps
-    still pay off (8.72 vs 9.18 us at the two-row decode shape), which is the
-    regime the decode graph captures.
+    Prefill (rows >= 256): one warp.  The grid already has thousands of
+    programs, so extra warps only add cross-warp reductions around each of the
+    K serial argmax passes (126.1 -> 63.2 us at 8192 rows, bitwise identical).
+
+    Decode (rows < 256): four warps, measured in service.  Do NOT trust an
+    offline graph-replay bench here.  Packed 50 launches deep in one CUDA graph
+    at rows 1..32, one warp looks 12% faster (4.46 vs 5.08 us/call) - but the
+    service says the opposite: 9.82 us/call at four warps vs 10.38 at one
+    (+5.7%), 10K ITL 9.754-9.759 vs 9.787-9.793.  A back-to-back replay hides a
+    tiny serial kernel's latency behind its neighbour's execution; in the real
+    pipeline each topk launch sits alone between dependent kernels and cannot
+    overlap, so reduction parallelism is what shortens the critical path.
+    Same reason the same kernel reads 9.8 us in service and 5.1 us graphed.
     """
-    return 1 if rows >= 256 else 4
+    return 1 if rows >= 256 else _DECODE_WARPS
 
 
 def sm70_triton_topk_softmax(

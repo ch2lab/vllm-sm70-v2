@@ -19344,3 +19344,100 @@ HMUL2 少 320 条（= 每 uint 4 条 × 展开的反量化点），总指令 **�
 
 **合成 bench 这次与服务一致（都指负）**，但它在产线 decode 形状上是 16 µs/launch、散布 **15–17%**
 ⇒ 仍不可作判据；判 MoE 内核只认服务内 trace 求和 + ITL 分布（定律②）。
+
+---
+
+## 2026-11-05 (34) Qwen3.6 TP1 / V100 硬件优化路线（分析与执行计划）
+
+### 结论
+
+本方案按用户补充采用 clean-slate 原则：不继承旧路线或否决结论，只保留其原始测量作为待复核证据。优化必须从当前模型/权重/配置/真实执行形状重新建 H1，再判断该打 HBM 带宽、访存延迟/MLP、Tensor Core、launch/依赖链还是数据复用。现有 profile 所示 MoE route、decode glue、prefill attention 只是**优先核验假设**，不是预先指定的顺序。
+
+### 范围与硬约束
+
+- 对象：Qwen3.6-35B-A3B-NVFP4-Fast，单张 V100-SXM2-32GB，TP1；该模型是 40 层（30 GDN + 10 full-attention）、256 专家 top-8。TP1 不走跨 GPU collective；不要把另一条 8×V100 / Qwen3.8 campaign 的拓扑和份额搬来。
+- 只做**内核级、无损**工作：不启用 MTP/投机解码，不用近似稀疏或质量换速度，不做配置阀/布局扫描，不 vendor 第三方 attention。保持当前 dense 语义与 TP1。
+- 把逐位相同作为“无损”首选门；若实现必须改变归约/舍入并产生输出差异，不得仅凭 canary 或 recall 通过就称无损，须先作为独立数值决策请用户裁定。现有 e2m1 scale-fold 是容差级且误差实测变小，不是推广其他重结合的授权（§2026-11-05 (32)）。
+
+### 硬件画像与待复核线索
+
+V100 的参考上限约为 FP16 HMMA 125 TFLOPS（纯 HMMA 曾实测 123 TFLOPS）和 HBM2 900 GB/s；它没有 FP4 Tensor Core、`cp.async` 或 TMA。这些是 roofline 参照，不是新 profile 的结论；小 M 是否 latency/MLP-bound 也必须由当前运行证据确认。
+
+以下仅为**重建 H1 时的候选清单**，不是排序或结论；每项先确认当前模型、配置、实际调用路径及 shape，再按可回收端到端时间重排。过去一个变体失败，只否决该变体，不自动否决整类硬件杠杆。
+
+1. **候选：MoE route-tiled decode。** 历史 batch=1 trace 约 1.49 ms/step、80 次/step、每层约 12.6 MB，估算 38% HBM；NAcc=2、K-split、e2m1 fold 均有具体失败记录（§2026-11-05 (25)、(33)）。若 fresh trace 复现并判为 latency/MLP-bound，可研究 codes/scales/input 的 load 提前量或 staging 深度；先核 SASS、REG/STACK 和每 SM 驻留 CTA。其他 memory hierarchy、layout、CTA 机制须各自建立新假设，不能从旧变体结果外推。
+2. **候选：decode glue / attention。** 历史 trace 的 glue 合计约 2.30 ms/step、attention 约 1.09 ms/step（§2026-11-04/05 (21)）。重新拆高频 kernel、生产者/消费者、读写字节和依赖链；由当前 H1 决定该做 launch 融合、降低访存量还是改 CTA 调度，不因已有 combine 或 split 改动就停止重新审计。
+3. **候选：prefill。** 历史 profile 的 attention 约 76%；QK/PV 约 57%/60% HMMA 峰值，softmax 约 720 GB/s（§2026-11-05 (27)）。当前实现须重核调用路径、grid 和总时间；历史 cuBLASLt、融合 flash 与 QK 算法结果是重要反例，但只代表对应实现/shape/数值，不证明整类 dense-attention 设计不可行。任何复测要先给出区别于旧实现的新机制和精确数值门。
+4. **候选：GDN。** 历史 profile 的 TP1 decode 约 0.42 ms、prefill 约 4.7%，且某列并行变体慢 6.9%–17.8%（§2026-11-05 (28)）；当前 H1 若显示权重、kernel 结构或时间份额变化，仍可重新排序。
+
+### 用户可执行的顺序与裁决门
+
+1. 每个候选开工前，确认当前模型/TP1/服务环境与被测 kernel/grid；fresh 同进程 A/B，避免跨进程/跨 boot 绝对值比较。先用离线 CUDA-graph microbench 筛机理，不能用它作 GO/NO-GO；正式裁决用 `vllm-qwen36` 服务 ITL 的重复分布。profile salt 必须与 9502 不同、输出 token 数至少 8，并确认 trace 真有目标 grid；V100 上 ncu 不可用，不要把“占用率低”直接当可回收性能。
+2. 根据 H1 排出候选优先级，不预设先做 MoE、glue 或 attention。每个候选只改一个变量，并由内核实例/网格/SASS 证明路径确实生效；若服务侧没有可重复的端到端收益，或以 spill/occupancy/质量退化换取局部速度，就不采纳。
+3. 质量门：canary 7/7、quality_blocks 24/24 且命中集不变、secret@250K 2/2、0 新 Xid；损坏内容立即停止该候选。候选的质量/精度与速度必须来自同一实现、同一形状包络。原始数据归档 `/data/sm70_results/<iter>/<exp>/`，结论追加本文件。
+
+**最终判断**：从 V100 硬件特性出发是目标；执行时先重建本次 workload 的性能地图。历史上某候选赢或输，都不自动决定未来优先级：它只描述当时的实现和形状。先复核当前瓶颈与可回收时间，再按预计端到端收益、无损性和验证成本排序。
+
+---
+
+## 2026-11-05 (34) 第 12/13 个否证（访存在飞度方向关闭）+ 两条**判据失效条件**被实测出来
+
+### A. route-tiled 的 L2 复用假设被否证（访存在飞度这条线到此为止）
+
+(33) 判 route-tiled 是 latency-bound，于是试最后一个便宜的访存杠杆：`__ldcs`（evict-first）
+是否白白放弃了重尾热门专家的 L2 复用。加 `LdgCodes` 模板臂（`VLLM_SM70_MOE_QPN2_LDG_CODES`），
+预检两臂 **REG 56/56、STACK:0、SHARED 不变**（缓存策略不该动寄存器，实测确认），数值**逐字节相同**。
+
+同期两臂服务内 trace：**对照 1.486 ms/step，`__ldg` 1.614 ms/step = +8.5%** ⇒ NO-GO。
+合成 bench 同向（w13 +7.84%、w2 +0.00%）—— 难得地与服务一致。
+⇒ **该内核的访存路径上，减指令(−4.8% 指令，+1.75%)、加流水(见下)、改缓存策略(+8.5%) 三条全否证**；
+结合 #11420（同机 gemv 只有 28% HBM 效率），**38% HBM 对 m=1 的权重流 GEMV 就是本机实际带宽带**，
+"38% ⇒ 还有 2.4× 可回收"是理想化下界的误用。此线关闭。
+
+### B. topk 的 num_warps：合成 bench **第三次**把方向指反
+
+trace 挖掘（用 (27) 的 (kernel,grid,block) 分桶，纯 CPU、不占 GPU）暴露出 decode 里的**单 CTA 小内核簇**：
+`_sm70_topk_softmax_kernel` grid=(1,1,1) 40 次/步 × 9.82 µs = **0.393 ms/step**、
+`moe_align_block_size_tiny` 0.282、`triton_red_fused_*` 0.221 ⇒ 合计 ≈0.9 ms/step ≈ **decode 的 9%**。
+
+`_topk_warps(rows)` 在 rows<256 时返回 **4**。离线（CUDA-graph 背靠背重放 50 次，rows=1..32）说
+**1 warp 更快**：4.44–4.51 vs 5.06–5.12 µs（−12%）。于是改了 —— **服务内完全反过来**：
+
+| | warps=4（对照） | warps=1 |
+|---|---|---|
+| topk µs/次（服务内 trace） | **9.82** | **10.38（+5.7%）** |
+| topk ms/step | 0.393 | 0.415 |
+| 10K ITL（各 4 次） | 9.754–9.759 | 9.787–9.793 |
+| route-tiled（同跑作对照） | 1.487 | 1.483 ✓ 未动 |
+
+⇒ 已回滚（`_DECODE_WARPS` 默认回 4，保留阀）。**机理**：背靠背重放里相邻 launch 互相掩盖了串行延迟；
+真实流水线里 topk 夹在 gating GEMM 与 moe_align 之间**无法重叠**，此时归约并行度才决定关键路径。
+**定律：对"单 CTA / 串行归约"类小内核，离线 graph-min 不可作判据** —— 它既会低估服务内时间
+（同一内核 5.06 µs 离线 vs 9.82 µs 服务，≈2×），也会**反转排序**。这也一并解释了 (33) 里
+"topk 离线 5.0、服务 10.2"的未解之谜。
+
+### C. 另一条判据失效条件：跨 boot 的 ITL 漂移 ≈ ±0.07 ms（0.7%）
+
+`__ldg` 臂里出现自相矛盾：内核 **+8.5% 变慢**，ITL 却"变好"（9.691–9.700 vs 对照 9.756–9.766）。
+同一 trace 里其他内核都没动 ⇒ 只能是 boot 间漂移。⇒ **ITL 无法裁决 <1% 的效应**；
+这类小效应只能看**服务内内核 µs/call**（它跨 boot 极稳：route-tiled 四次独立 boot
+1.486 / 1.487 / 1.490 / 1.490，±0.3%）。定律②因此要补一句：*ITL 分布重叠性只适用于 ≥1% 量级的改动*。
+
+### D. 纠正我自己两处错误记录
+
+1. 上一轮我写"稠密 QPN2 内核无任何 Python 调用者 ⇒ 无时间可省"。**错了**：本轮 trace 显示
+   `qpn2::nvfp4_qpn2_sm70_kernel<16,2,1>` grid=(32,1,1) **39.8 次/步 × 9.0 µs = 0.358 ms/step**，确在 decode 热路。
+   我当时只 grep 了 `sm70_nvfp4_qpn2_gemm` 一个名字就下了结论 ⇒ **教训：判"某内核不在热路"要用 trace 反查，不能只 grep 符号名**。
+   ⇒ e2m1 折叠对它仍然适用，重新列为候选（它也是 nvfp4 反量化）。
+2. 本轮我又把 topk 改动当"位相同"就开工，实测 **ids 逐位相同但 weights 差 max 8.9e-08**
+   （softmax 分母 `tl.sum` 的归约树随 warp 数变），max rel 3.6e-7、行和仍恰为 1.0。
+   ⇒ 与 #12904/#12910 同一族：**凡改变归约/求值顺序者，先跑逐元素比对，再谈无损。**
+
+### E. topk 重写的期望值（已定量，暂不立项）
+
+K 扫描拟合（E=256/K=8，`sm70_tests/probe_topk_cost.py`）：**固定开销 1.95 µs + 每次 argmax 0.39 µs**。
+⇒ 把 8 次串行 argmax 换成更聪明的选择算法，上限省 ≈3.1 µs/call = **0.124 ms/step ≈ decode 1.3%**，
+且必须在服务内判（见 B）。相对本会话已否证的十条臂，这个期望值不算高，暂不立项；
+若要做，先按定律 B 用**非背靠背**的口径复现基线再谈。
+
+本轮无提速数字；服务已回到已验证态：**10K ITL 9.735/9.736/9.753、canary 7/7、recall 24/24**，工作区仅本文件与探针。
