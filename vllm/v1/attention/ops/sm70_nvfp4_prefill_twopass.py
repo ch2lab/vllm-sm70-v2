@@ -529,7 +529,25 @@ def _num(name, dflt):
         return dflt
 
 
-BN_DEF = _num("VLLM_SM70_TWOPASS_BN", 4096)
+# BN=8192 is the default; it was never swept before 2026-11-05 and the whole
+# sweep is three arms at TP1, same boot, 250K profiled + 3 unprofiled reps,
+# judged on the in-service kernel sums (the trace gate checks the QK^T grid
+# (BN/128, M/128, 1), so BN=2048/8192 no longer trip a 4096-only check):
+#
+#   BN     launches  attn bucket  gemm   softmax  update  bridge  GPU-busy  250K min/mean
+#   2048    469,427    117.26     81.23    26.08    8.12    1.83     147.4     -
+#   4096    275,607    114.94     81.19    27.90    4.08    1.77     145.3   144.45/145.29
+#   8192    179,367    113.03     77.66    31.72    2.08    1.57     144.2   143.58/144.30
+#
+# fused_update scales as kv_len/BN (8.12/4.08/2.08, exactly halving) and the
+# GEMMs improve with a wider/deeper score block; against them,
+# fused_softmax_reg is templated on <BN/32> and keeps the whole row in
+# registers, so at 8192 (PER=256) it spills and costs +3.8 s.  Net still favour
+# of 8192, and 65K/10K ttft are neutral-to-better (17871 vs 17902, 1819 vs
+# 1811).  Quality: canary 7/7, recall 24/24 on the identical hit set, secret
+# 2/2.  The softmax spill is the reason not to push BN to 16384 without first
+# reworking that kernel to stream the row instead of holding it.
+BN_DEF = _num("VLLM_SM70_TWOPASS_BN", 8192)
 
 # BM=4096 is the default; the sweep behind it (fresh boot per setting, prefill
 # ttft at 250K twice and at 64K once, 512 output tokens):
