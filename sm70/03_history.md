@@ -20127,3 +20127,27 @@ R=16 143.8→112.1 µs（PARTS=12，−22.0%）。PARTS≥span/85 各档同 np�
 (iv) 但离线 R=8=80.7 µs 仍解释不了服务内 418 µs/call（5.2×差）——服务侧 L2 冷
 （与 MoE/GDN 流交错）、bt 宽度、真实选中跨度未归因，**服务门是唯一裁判**：
 PARTS=24 drop-in 的同期 conc8/conc16+canary+recall 结果决定去留（本条目的判决见 (49)）。
+
+### (49) XQA PARTS=24 服务门 NO-GO；Xid 3 条全部归因 bench 契约错误；FlashNext TP4 备选配置入库（2026-11-05）
+
+**PARTS=24（同期门，锚=当晚 TP1 275/345）**：conc8 **265.6（−3.4%）**、conc16 **334.5（−3.0%）**，
+canary 7/7、recall 9/9（无害但无益）⇒ **NO-GO，drop-in 已回基线**（恢复三重验证
+READY/age170s/29970MiB）。离线 CUPTI 的 −16%（少发 216/240 空转 CTA）没有转化成服务收益——
+更少更大的 CTA 在真实负载（与其它内核流交错、L2 冷）下反而亏 3%。**教训：xqa 的
+"空转 CTA"不是可回收成本，PARTS 维持 240；勿再开此臂**。xqa16 的 418µs@conc8 归因
+仍开放（离线复现不出，见 (48) 更正 (iv)）。
+
+**Xid 归因**：20:00 后内核日志 3 条 Xid 全部为 **Xid 31（MMU PDE 读缺页）**，
+时间 22:43:36/22:43:46/22:45:13、pid 均为 python——对应 skinny 屏测把 fp16 权重喂给
+`sm70_nvfp4_qpn2_prepare`（契约应为 (n,k//2) uint8）触发的 IMA，发生在 GPU3 bench 进程；
+**生产路径 0 Xid**。契约已入 12978。
+
+**FlashNext TP4 备选配置**（用户指令：本机永久备选运行配置）：
+`/root/run/serve_flashnext_tp4.sh` + `/etc/systemd/system/vllm-flashnext.service`
+（disabled，手动起停，与 Q36 互斥占卡）。参数 = .129 chat2 全量逐条判定：仅
+TP8→TP4、port→8003、max-model-len 524288→262144（用户）、hf-overrides 整段删除
+（核实 config.json 已带 mrope_section/partial_rotary/theta，yarn 只为 >262144 服务）、
+固定 kv-cache-memory-bytes 删除 + util 0.83→0.9（用户"先设 0.9 看情况再改"，
+KV 按实际剩余自动分配，启动日志 KV-size 行为唯一调参依据）；EP/hc-sp/prefix-caching/
+MTP k=1/parsers/metrics/capture 阶梯全部照抄。模型 rsync 自 .129（109.2 GB safetensors，
+文件数+字节双校验）。启动判定只认 journal "Application startup complete"（禁 /health）。
