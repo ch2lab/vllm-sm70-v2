@@ -14,7 +14,10 @@ import re
 import sys
 
 path = sys.argv[1]
-bn_expected = int(sys.argv[2]) if len(sys.argv) > 2 else 4096
+bn_expected = int(sys.argv[2]) if len(sys.argv) > 2 else 8192
+# TP1-calibrated 100 s would falsely REFUSE a real TP2 (~73 s) or TP4 (~37 s)
+# prefill, since the point of TP is to cut that number.
+min_busy = float(sys.argv[3]) if len(sys.argv) > 3 else 100.0
 
 ev = [e for e in json.load(gzip.open(path, "rt"))["traceEvents"]
       if e.get("cat") == "kernel"]
@@ -51,14 +54,22 @@ for e in ev:
     elif "moe_wide_kernel" in n:
         fam["moe_wide"] += d
         cnt["moe_wide"] += 1
+    elif "nccl" in n.lower() or "allreduce" in n.lower():
+        # the cost TP introduces; invisible at TP1 and the first thing to watch
+        # when judging whether a larger TP is actually paying for itself
+        fam["nccl"] += d
+        cnt["nccl"] += 1
 
 sig = {"bridge_kv", "softmax", "update"} <= set(cnt)
+ok = busy >= min_busy and sig
 print(f"  GPU-busy {busy:6.1f} s / {len(ev)} launches   "
-      f"{'OK' if busy > 100 and sig else '*** REFUSED (not a real 250K prefill) ***'}")
-if busy > 100 and sig:
-    for k in ("attn_gemm", "softmax", "update", "bridge_kv", "moe_wide"):
+      f"{'OK' if ok else f'*** REFUSED (need >= {min_busy:.0f} s busy and the 3 signature kernels) ***'}")
+if ok:
+    for k in ("attn_gemm", "softmax", "update", "bridge_kv", "moe_wide", "nccl"):
+        # dur is microseconds, so per-call is ms here -- it was labelled us,
+        # which made a 1.35 ms softmax read as "1.4 us"
         avg = fam[k] / cnt[k] / 1e3 if cnt[k] else 0.0
-        print(f"    {k:11} {fam[k]/1e6:8.2f} s  n={cnt[k]:7}  {avg:7.1f} us/call")
+        print(f"    {k:11} {fam[k]/1e6:8.2f} s  n={cnt[k]:7}  {avg:8.3f} ms/call")
     print(f"    expected QK^T grid.x = BN/128 = {bn_expected // 128}")
     for k, c in sm_variants.most_common():
         print(f"    softmax variant {k:10} n={c:7}  {vard[k]/1e6:7.2f} s")
