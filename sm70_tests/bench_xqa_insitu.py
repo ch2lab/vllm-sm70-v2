@@ -83,7 +83,7 @@ def main() -> int:
         buf.zero_()  # 64 MB write >> 6 MB L2
 
     def stream_moe(buf):
-        torch.sum(buf, dim=(0, 1))  # read-only streaming ~ MoE weight pass
+        torch.sum(buf)  # read-only streaming ~ MoE weight pass
 
     l2 = torch.zeros(16, 1024 * 1024, dtype=torch.float32, device=dev)   # 64 MB
     moe = torch.randn(100 * 1024 * 1024 // 2, dtype=torch.float16, device=dev)  # 100 MB

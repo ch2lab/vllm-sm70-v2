@@ -20183,3 +20183,26 @@ spill、smem 30.4KB 按设计 3 CTA/SM。PARTS=24 的 NO-GO 同步解释：真�
 稀疏选页路线维持死刑（(46) 质量门 15/24 fact blocks），dense 是唯一合规形态。
 工具：`sm70_tests/bench_xqa_insitu.py`（真实 shape + 冷L2/MoE交错/散列bt 分臂复现器）。
 纪律更新：**屏测前必须用真 tokenizer 数一遍 harness 的 prompt token 数，词≠token。**
+
+### (52) 采纳：decode XQA 分区数按批缩放 nparts=clamp(240/R,15,120)（conc8 +5.6% / conc16 +3.5%，2026-11-06）
+
+**机制**：xqa16 的 ws 写回+combine 回读流量 = R*HQ*nparts*258*4B，随 nparts 线性增长（R=8/np=240
+时 31.7MB/call，与 92MB 的 KV 读取同量级，两者一起把 6MB L2 打穿）；而总 CTA 数 np*H2*R 只需
+~2 波即可掩盖 bt→kv 依赖链。真实 shape 离线 CUPTI（screens/xqa_true_shape.py，min-of-3）：
+R=8 kv20K 最优 np=30（361.6µs vs 240 的 498.7，−27%）；R=16 最优 np=15（697.7 vs 1115.4，−37%）；
+R=1 kv65K 最优 np=120（187.3 vs 220.4）。**下限悬崖**：R=16 np=8 → 1022µs（CTA 数 <~300 时
+in-flight 字节不足以盖住依赖链，退化为延迟受限）。公式 round(240/R) 命中全部三个实测最优点。
+
+**服务门（三明治，规则⑥）**：基线1 275.1/345.6 → **臂 290.5/357.8** → 基线2 275.7/346.0
+（conc8/conc16，salt 8300/8317/8334）：**conc8 +5.6%、conc16 +3.5%，双胜双基线，基线互差 ≤0.2%**。
+质量：recall 9/9、secret 6/6、canary 4 轮中 3 轮 7/7（1 轮 6/7 为偶发；短上下文用例 np=1 与基线
+逐位相同，长上下文 needle@8000/32000/65536 全过）；新增 Xid **0**；decode 期实测 SM 1530MHz 满频、
+160–272W（限 300W），非功率/时钟受限。**共享文件回归**：Flash-Next TP4 备选（同一 editable 安装）
+重新过启动门：startup complete、`Model loading 20.84 GiB`、KV 487,446 tokens、3/3 请求 200。
+
+**实现与回滚**：仅 Python 包装层（`try_paged_decode_cuda`），kernel/.so/csrc 零改动；阀
+`VLLM_SM70_DECODE_XQA_RSCALE` **默认关**（关时 nparts=_NPARTS_XQA，逐字节同旧行为）；
+本机 drop-in `zz-rscale.conf` 开启。**并行前科**：PARTS=24 的 NO-GO 是屏测 shape 错（词≠token，
+真 kvlen 20069 不是 2048）造成的误判，见 (51)；该臂死因不适用于本公式（R=1 保 120）。
+**合并安全**：TP8 几何不在 `VERIFIED_GEOMETRIES{(2,16),(1,8),(1,4)}`，`supported_decode` 直接
+False，.129 TP8 到不了该分支；且默认关。备份 `backups/sm70_nvfp4_decode_cuda.py.pre_rscale_20261106`。

@@ -917,9 +917,21 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                   f"kvlens={kv_lens.tolist()} splits={splits} "
                   f"window={window_left}", flush=True)
     if os.environ.get("VLLM_SM70_DECODE_XQA") == "1":
-        need = R * HQ * _NPARTS_XQA * 258
+        nparts = _NPARTS_XQA
+        if os.environ.get("VLLM_SM70_DECODE_XQA_RSCALE") == "1":
+            # Batch-scaled parts: ws write traffic (R*HQ*np*258 fp32) and the
+            # combine re-read grow with np, while total CTAs (np*H2*R) only
+            # need ~2 waves to hide the bt->kv dependent-load chain. Measured
+            # 2026-11-06 at the true conc shapes (screens/xqa_true_shape.py,
+            # CUPTI min-of-3): R=8 kv20K best np=30 (361.6us vs 498.7 at 240),
+            # R=16 kv20K best np=15 (697.7 vs 1115.4), R=1 kv65K best np=120
+            # (187.3 vs 220.4); below ~300 CTAs the kernel collapses to
+            # latency-bound (R=16 np=8: 1022us). round(240/R) hits every
+            # measured optimum; clamp [15,120] keeps low-R parallelism.
+            nparts = max(15, min(120, (240 + R // 2) // max(R, 1)))
+        need = R * HQ * nparts * 258
         _mod_xqa(H, HQ).run(q, kv_cache, block_table, kv_lens, _BUF[:need], out,
-                            k_scale, v_scale, sm_scale, _NPARTS_XQA,
+                            k_scale, v_scale, sm_scale, nparts,
                             int(window_left), R, None, None, 0, 0,
                             int(kv_cache.size(2)), int(q0), int(nqt))
         return True
