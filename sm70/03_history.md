@@ -20217,3 +20217,30 @@ False，.129 TP8 到不了该分支；且默认关。备份 `backups/sm70_nvfp4_
 四项全不劣且四项全优；**"R=1 长上下文 240→120 会回退"的担忧未复现**（combine ws 流量收益盖过
 分区数损失）。至此门的覆盖面：concat 20K（+5.6/+3.5%）、65K（+2.7% decode）、250K（+1.4% decode）、
 prefill 三档平坦不劣、recall/secret/canary/Xid/共享文件回归全过。
+
+### (53) Flash-Next TP4 本机（4×V100 全 NV2）性能找回：capture 阶梯缺 32 是 conc16 慢 5× 的真因；干净基线 65K prefill 5295.7（2026-11-06）
+
+**测量（fresh boot + 10K 预热 + 新 salt，脚本 /data/sm70_results/flashnext_tp4/{perf2,cg32_ab,cg32_confirm2}.sh）**
+
+| 指标 | 修前 capture `1 2 4 8 16` | 修后 `+24 32` | 判定 |
+|---|---|---|---|
+| conc16 decode_agg | 113.6 / 113.8 / 113.8（三次独立） | **583.8 / 557.2 / 576.5** | **≈5.1×** |
+| conc8 decode_agg | 342.1 | 385.5 / 394.4 | +15% |
+| 65K prefill | 5295.7 / 5293.2 | 5281.5 | 持平 |
+| 250K prefill | 4825.4 | 4826.6 / 4821.7 | 持平 |
+| decode 65K / 250K | 122.2 / 130.7 | 122.2 / 131.9 tok/s | 持平 |
+
+**根因**：MTP k=1 使 verify batch = 序列数×2；seqs=16 → 32 行 token，而 .129 的 TP4 测过配置
+（tp4_mtp_k.env 的 `TP4_CG_SIZES="1 2 4 8 16"`）没有 32 的图 → eager 回退。conc8（8×2=16）恰好有图
+所以正常，这也解释了"只有 conc16 崩"的形态。**修法 = 阶梯加 24 32**，与 .129 TP8 生产 chat2 的口径
+一致（`1 2 4 8 16 24 32 48 64 80`，seqs40×2=80），即"阶梯必须覆盖 seqs×(MTP k+1)"。
+**该规则对 TP8 同样适用**；TP8 生产已满足，任何新 TP 配置需先查这条。
+
+**冷启动教训**：同配置 boot 后首次 prefill 4369.6 tok/s，加 10K 预热后 5295.7/5293.2（重复差 0.05%）
+⇒ 屏测 prefill 必须先预热，否则会把 JIT/图捕获冷启动记成"性能回退"（本轮差点误判 −13%）。
+
+**与历史/TP8 对照**：.129 TP4 记录（2026-10-07，旧代模型、无 MTP）5006.7 tok/s / 82.1 tok/s ⇒ 本机
+prefill +5.8%、decode +49%（MTP）。TP8 当前锚 8687 / 109.6 / conc8 404.7（8 卡）⇒ 本机 TP4 每卡
+prefill +22%、decode +11%，conc8 总量 −4.7%（卡数减半下预期）。本机 4 卡为**全 NV2**（nvidia-smi
+topo 实测），无 NV1 瓶颈。主机脚本 `/root/run/serve_flashnext_tp4.sh`（备份 `.bak_pre_cg32_20261106`），
+未动任何 csrc/kernel，Q36 适配与 RSCALE 优化（52）不受影响。
