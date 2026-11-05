@@ -19784,3 +19784,53 @@ TP2、TP4、TP4+BM8192 三臂均 canary 7/7、recall **24/24 且命中集与 TP1
 4. 链式启动器 `while pgrep -f "上一臂脚本"` 会匹配**父 bash 自己的命令行**（其中含该字面量）⇒ 永不自消，
    候选臂白等；`pkill -f` 同样会杀自己 ⇒ **一律按 PID 杀**。
 5. `tp_arm.sh` 里引用了未赋值的 `$START_EPOCH` ⇒ journalctl 过滤失效（`--since @` 空值），改为 restart 前赋值。
+
+---
+
+## 2026-11-05 (39) conc8 聚合吞吐 vs TP：**每卡吞吐随 TP 单调下降 ⇒ "用满算力"的答案是 4×TP1 副本，不是 TP4**
+
+### 为什么必须测这一条
+
+(38) 给出单流口径下 TP4 全面最优（prefill 3.40×、ITL −21~−25%）。但"尽可能利用硬件算力"是**吞吐**命题，
+而单流数字会系统性误导：TP 用 allreduce 换并行度，并发一高，被摊薄的正是 TP 唯一买到的东西。
+用户指令里也明确要求每轮同时报单流与并发吞吐。用 `sm70_tests/qsa_conc_tput.py`
+（APC 免疫：逐槽逐轮独立 salt；prefill/decode 两相**分开**测，避免 chunked prefill 互相干扰）。
+salt-seed 4242（≠9502），conc=8，len=65536，rounds=2（1 热身 + 1 计时）。
+
+### 结果（同一台机器、同一份代码、三项收益在位）
+
+| 布局 | prefill 聚合 | **prefill 每卡** | decode 聚合 | **decode 每卡** |
+|---|---|---|---|---|
+| **TP1** | 3765.5 | **3765（1.00×）** | 275.1 | **275（1.00×）** |
+| TP2 | 5799.5 | 2900（**0.77×**） | 418.6 | 209（**0.76×**） |
+| TP4 | 10915.6 | 2729（**0.72×**） | 480.7 | 120（**0.44×**） |
+
+⇒ **每卡吞吐随 TP 单调下降**，decode 尤其惨：TP4 用 4 倍硬件只换来 1.75× 聚合（44% 效率），
+因为 8 路并发下每步仍是 40 层 × 4 路 allreduce 的延迟链，批太小摊不平。
+prefill 侧 TP4 用 4 倍硬件只换 2.90×（72% 效率）。
+
+### 与"单流已打满一张卡"互相印证
+
+TP1 conc8 prefill 聚合 **3765.5** vs 单流 65K = 65536/17.65 s = **3713** ⇒ 并发只多 **+1.4%**；
+而功率采样独立给出 prefill `sm 95.8%`。两条独立证据说明：**一条 prefill 流就把一张卡打满**，
+所以并发不增加吞吐、只瓜分延迟。由此：
+
+- **吞吐最优布局 = 4 个 TP1 实例**（每卡 3765 prefill / 275 decode）；
+- **延迟最优布局 = TP4**（250K 41.48 s、10K ITL 7.660 ms）；
+- 二者不可兼得，**必须按用途选**，不能笼统说"TP4 更好"。
+
+### 边界（诚实）
+
+"4×TP1 = 4×单实例"是**推断而非实测**：我没有真的起 4 个实例。支撑它的实测是"单流已打满一卡"
+（conc8 仅 +1.4%、sm 95.8%）⇒ 实例之间不会互相抢 GPU；显存也够（TP1 实例占 29.9 GB，每卡 32 GB）。
+真要做的是起 4 个 unit（各自 `--device-ids`、各自端口）直接测聚合，本轮未做。
+TP2 的 conc8 只测了单实例，2 副本是其 2 倍外推。
+
+### 仪表/流程
+
+`qsa_conc_tput.py` 属于另一条 Qwen3.8 战役，默认 `SM70_MODEL_PATH=/data/models/Qwen3.8-Flash-Next-FP4-Local-NVFP4`
+（本机不存在）⇒ 必须 `export SM70_MODEL_PATH=/data/models/Qwen3.6-35B-A3B-NVFP4-Fast`、
+`SM70_MODEL=Qwen3.6-35B-A3B`、`SM70_API_KEY=$(cat /root/.vllm_api_key)`、`SM70_BASE` 四项才能跑；
+缺 key 时 `common.api_key()` 直接退出。本轮新增 `/tmp/opencode/conc_arm.sh` 固化这套 env。
+服务最终恢复 TP1（`Environment` 只剩 `PYTHONUNBUFFERED=1 VLLM_TP_SIZE=1`），canary 7/7、
+10K ITL **9.696 ms**（本战役最好值）。
