@@ -20087,3 +20087,29 @@ trace 边界之外，不是内核间隙）。教训入定律：**占空比必须
 剩余问题——每序列线性增长的工作（GDN packed_decode 状态流、per-seq attention、
 MoE 槽位）在并发下成为主项。下一候选：抓一份 conc8 decode trace 做与 (43) 同款
 per-shape 归因（现有 bench 只测单流）。
+
+### (48) conc8 decode 归因（新靶命中）：QSA `decode_xqa16` 批缩放 17×（期望 8×），机制=按单序列 span 封顶的 nparts（2026-11-05）
+
+新工具 `sm70_tests/bench_decode_conc_profile.py`（8 路流式、全首 token 后 start/stop_profile
+4 s 窗；服务侧须带 VLLM_TORCH_PROFILER_DIR，否则 /start_profile 404——12971 教训复用）。
+trace `/data/sm70_results/tp1_prof/conc8_dec/t0/`，步数由 MoE 80 次/步反推 ≈183 步，
+busy 3.94 s ⇒ **21.5 ms busy/步**（无 profiler 步时 29 ms ⇒ duty ~74%）。与 m=1
+（11.3 ms busy/步）逐项对比：
+
+| 内核 | m=1 ms/步 | conc8 ms/步 | 倍数 |
+|---|---|---|---|
+| **decode_xqa16 (QSA)** | 0.25 | **4.21** | **17×**（期望 8×）|
+| nvfp4_qpn2_moe_wide | —(narrow 1.51) | 6.23 | launcher m=8 切 wide（权重流式，正常）|
+| fused_recurrent_gdn_decode | 0.30 | 1.48 | 4.9× 正常 |
+| fp8_qpn / nvfp4 dense / topk / align | 2.71/0.55/0.40/0.30 | 2.68/0.60/0.44/0.44 | 平 ✓ |
+
+**机制**（`vllm/v1/attention/ops/sm70_nvfp4_decode_cuda.py:365-368`）：
+`np = min(nparts, max(1, span0/kMinTokensPerPart))`——有效 split 数由**单序列**选中页
+跨度决定，与 batch 无关；grid=(np, H2, R)，R=8 时 CTA ×8 但每 CTA 大 smem
+（`prepare()` 动态 smem 公式）⇒ 每 SM 常驻 CTA 数有限，CTA 排队 ~8×；叠加
+combine 工作区 8×np×(HD+2) fp32 在 6 MB L2 上抖动 ⇒ 8×工作量 ×~2×缓存退化 ≈ 17×。
+**这是 conc8 29 ms 步时里第一杠杆**：xqa 若回到 m=1 的每序列效率（4.21→~1 ms），
+步时 29→~26 ms、conc8 聚合 275→~300（+9-12%）。候选修法（下一回合，离线先屏）：
+(a) QSA 路径 nparts 随 R 缩放（np_eff = clamp(nparts·k/R), k 调至 CTA 数 ≈ SM×常驻）；
+(b) 减小 xqa smem 提常驻；两者都要 CUPTI 同进程对测 + 服务门（同期 conc8/16 + canary +
+recall + 0 Xid）。基线已恢复验证（age 128s/29970 MiB/本 PID startup 行）。
