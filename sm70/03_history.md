@@ -20113,3 +20113,17 @@ combine 工作区 8×np×(HD+2) fp32 在 6 MB L2 上抖动 ⇒ 8×工作量 ×~2
 (a) QSA 路径 nparts 随 R 缩放（np_eff = clamp(nparts·k/R), k 调至 CTA 数 ≈ SM×常驻）；
 (b) 减小 xqa smem 提常驻；两者都要 CUPTI 同进程对测 + 服务门（同期 conc8/16 + canary +
 recall + 0 Xid）。基线已恢复验证（age 128s/29970 MiB/本 PID startup 行）。
+
+**(48) 更正（同日，服务路径核实后）**：上文机制段有错。(i) 服务实际走 **CUDA XQA 路径**
+（serve_qwen36.sh 设 `VLLM_SM70_DECODE_CUDA=1 + VLLM_SM70_DECODE_XQA=1 + XQA_PARTS=240`），
+调用方 `splits=ceil(SM·SF/(R·H))` 公式**只支配 Triton 回退路径**，对 CUDA 路径是死码——
+"R=8 时 splits=5、80/240 常驻"的算账作废。(ii) 真实机制：内核启动
+`dim3 g(nparts, H2, R)` 用的是**钳制前**的 nparts，而核内
+`np=min(nparts, span0/85)` 后 `sp>=np` 的 CTA 直接 return ⇒ **PARTS=240 每次调用
+空烧 216/240 的 CTA 发射/调度**。(iii) 离线同进程扫（/tmp/opencode/xqa_parts.py，
+CUPTI，min-of-5×20，真实几何 16q/2kv/D256/page16/kv2048）：
+R=1 30.2→24.6 µs（PARTS=24/48，−18.4%）；**R=8 80.7→67.7 µs（PARTS=24，−16.2%）**；
+R=16 143.8→112.1 µs（PARTS=12，−22.0%）。PARTS≥span/85 各档同 np、差异纯为发射浪费。
+(iv) 但离线 R=8=80.7 µs 仍解释不了服务内 418 µs/call（5.2×差）——服务侧 L2 冷
+（与 MoE/GDN 流交错）、bt 宽度、真实选中跨度未归因，**服务门是唯一裁判**：
+PARTS=24 drop-in 的同期 conc8/conc16+canary+recall 结果决定去留（本条目的判决见 (49)）。
