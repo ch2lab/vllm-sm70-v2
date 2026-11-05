@@ -36,14 +36,27 @@ for e in ev:
     a = e.get("args", {}) or {}
     g = tuple(a.get("grid", []) or [])
     d = float(e.get("dur", 0) or 0)
-    if "fused_softmax_reg" in n:
+    if "fused_softmax_reg" in n or "fused_softmax_gen" in n:
+        # fused_softmax_gen is the causal-diagonal three-pass variant; leaving it
+        # out of this bucket understated attention by 1.19 s at TP1.
         fam["softmax"] += d
         cnt["softmax"] += 1
         # effect proof: the template args name the variant that actually ran
         m = re.search(r"fused_softmax_reg<(\d+),\s*(\d+)>", n)
-        key = f"<{m.group(1)},{m.group(2)}>" if m else "?"
+        key = f"<{m.group(1)},{m.group(2)}>" if m else ("gen" if "gen" in n else "?")
         sm_variants[key] += 1
         vard[key] += d
+    elif "gdn_forward" in n:
+        # the DeltaNet recurrence: 30 of 40 layers, ~5% of prefill
+        fam["gdn_rec"] += d
+        cnt["gdn_rec"] += 1
+    elif "causal_conv1d" in n or "post_conv" in n:
+        fam["gdn_conv"] += d
+        cnt["gdn_conv"] += 1
+    elif "ConvertToFloat8E4M3" in n:
+        # the standalone fp8 cast pass a fused norm_quant would absorb
+        fam["fp8_cast"] += d
+        cnt["fp8_cast"] += 1
     elif "fused_update" in n:
         fam["update"] += d
         cnt["update"] += 1
@@ -60,7 +73,7 @@ for e in ev:
         fam["attn_gemm"] += d
         cnt["attn_gemm"] += 1
         if d > 200:                       # only the big attention GEMMs
-            gemm_grids[(g, n.split("(")[0][:34])] += 1
+            gemm_grids[(g, re.sub(r"\(.*", "", re.sub(r"^(void )|(\(anonymous namespace\)::)", "", n)).strip()[:34])] += 1
     elif "moe_wide_kernel" in n:
         fam["moe_wide"] += d
         cnt["moe_wide"] += 1
@@ -76,15 +89,19 @@ for e in ev:
         # produced the impossible conclusion that non-attention work *grew* with
         # TP. Anything left here is either an unmodelled stage or a name pattern
         # that stopped matching, so it must be printed, not dropped.
-        other[n.split("(")[0][:58]] += d
-        othern[n.split("(")[0][:58]] += 1
+        # Splitting at "(" lost the whole name of any kernel inside an anonymous
+        # namespace, which is exactly where the 6.99 s GDN core lives.
+        short = re.sub(r"\(.*", "", re.sub(r"^(void )|(\(anonymous namespace\)::)", "", n)).strip()[:58]
+        other[short] += d
+        othern[short] += 1
 
 sig = {"bridge_kv", "softmax", "update"} <= set(cnt)
 ok = busy >= min_busy and sig
 print(f"  GPU-busy {busy:6.1f} s / {len(ev)} launches   "
       f"{'OK' if ok else f'*** REFUSED (need >= {min_busy:.0f} s busy and the 3 signature kernels) ***'}")
 if ok:
-    for k in ("attn_gemm", "softmax", "update", "bridge_kv", "moe_wide", "nccl"):
+    for k in ("attn_gemm", "softmax", "update", "bridge_kv", "gdn_rec", "gdn_conv",
+              "fp8_cast", "moe_wide", "nccl"):
         # dur is microseconds, so per-call is ms here -- it was labelled us,
         # which made a 1.35 ms softmax read as "1.4 us"
         avg = fam[k] / cnt[k] / 1e3 if cnt[k] else 0.0
