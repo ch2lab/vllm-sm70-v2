@@ -20268,3 +20268,33 @@ M=4/8 图计时 3.7/4.7µs vs cuBLAS 11.2/19.8µs（3.0×/4.2×），位精确�
 **结论与边界**：Q36 decode 的这块余量（30×~15µs/step ≈ 1.6%@conc8）只有通过
 **为 Q36 单独扩展 contract + 只登记 (64,2048) 一个 plan** 才能拿到，上限 1.6%（conc16 无收益，
 rows=16 已落在 cublas 快路径）；属于"低收益、需新质量门"的候选，暂不启动。
+
+### (55) Q36 TP1 prefill 上限量化：mnbt=16384 不可行（OOM），dense GEMM 已到 cuBLAS 天花板，MoE 33.5% 峰值是唯一 >5% 杠杆（2026-11-06）
+
+**臂 1（chunk 8192→16384）：NO-GO（可行性）**。干净三明治（AET 锚定就绪、同序 sweep）：
+基线1 3790/3783/1798 tok/s、基线2 3778/3780/1791（65K/65K/250K，两次基线互差 ≤0.4%）；
+臂在 65K prefill 时 **GPU0 OOM**（`memory allocation failed with OOM on device 0`，
+日志 10:04:35），sweep 拿不到数字。⇒ 大 chunk 的激活内存与 2.6M-token KV 池不可共存，
+**8192 是当前 KV 规模下的最大可行 chunk**（解释了战役既定选择），此臂关闭。
+（首次尝试还被 `serve_wait_q36.sh` 的假 READY 污染并触发 systemd 停机超时 SIGKILL；
+重跑改用 AET 锚定 + 现 PID 年龄判定后才复现真因。）
+
+**prefill 绝对效率（离线，CUDA 图计时，V100 fp16 峰值 123 TF/s）**：
+| 形状 | cuBLAS | %peak |
+|---|---|---|
+| q_proj 8192×8192×2048 | 92.9 TF/s | 75.5% |
+| qkv_z 8192×12288×2048 | 89.4 | 72.7% |
+| o_proj 8192×2048×4096 | 87.9 | 71.5% |
+| shared_up 8192×1024×2048 | 72.6 | 59.0% |
+⇒ "dense GEMM 达同形状 cuBLAS 95–96%" = **峰值的 ~70%**，cuBLAS 自身只到 75%，
+这一块（占 prefill 55.6%）只剩 ~4% 相对空间 ≈ 全量 2%。
+
+**MoE prefill 效率曲线（bench_moe_wide，真实形状）**：chunk 1024/2048/4096/8192 →
+w13 32.8/34.2/40.4/**41.2 TF/s**（26.7/27.8/32.8/**33.5% peak**）。效率随 chunk 上升
+但在生产最大 chunk（8192）处平台化 ⇒ 不是单纯 fill/drain，是内核结构上限；
+MoE 占 prefill 12.7%，即使效率翻倍也只剩 **~6% 全量 prefill**。
+
+**结论（prefill 硬件极限）**：现有内核栈下 prefill 剩余理论空间合计 **~8%**
+（dense 2% + MoE 6% + 其它），且全部需要内核重写；**唯一 >5% 的单项是 MoE
+weight-major megakernel**，属多小时的架构级工程，需单独立项与质量门。decode 侧
+已在上限附近（MoE 80% HBM 地板、fp8 95–96% cuBLAS、xqa 已优化 5.6%）。
