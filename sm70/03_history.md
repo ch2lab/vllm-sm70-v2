@@ -20356,3 +20356,17 @@ cooperative 16B 向量化装载。形状 = 真实 chunk 8192/top8/E=256 的每�
 手写 `mma.sync` + `ldmatrix` + swizzled smem（cuBLAS 级），wmma 的 fragment load 开销无法消除。
 结论：**原型证实"调度可行、但 wmma 实现达不到生产内核"**；要 >41.2×1.1 必须换手写 mma 路线，
 这是数天级工程且仍需质量门。
+
+### (57) MoE prefill 占用率假设被否证：launch_bounds(256,2) 让内核慢 9.2×（2026-11-06）
+
+生产 wide 内核无 `__launch_bounds__`，nvcc 自选 **160 寄存器 → 1 CTA/SM**（13% 占用，trace 实测）。
+单变量实验：加 `__launch_bounds__(256, 2)` 强制 2 CTA/SM（寄存器上限 128）。
+**结果：w13 6.686ms → 61.689ms（9.2× 慢），w2 5.27 → 34.129ms**；注册数实际降到 74/61
+（编译器放弃了寄存器分块）。回滚后重建验证 **6.681ms / 41.1 TF/s** 完全复原。
+
+⇒ **160 寄存器是内核寄存器分块的刚需，占用率不是可回收的旋钮**；13% 占用是这套 tiling 的结果
+而非瓶颈。结合 (56)：weight-major wmma 原型 23.5→33.5 TF/s 封顶、低于生产 41.2；cuBLAS 66–67
+是调度上界但需要 cuBLAS 级手写 mma（sm70 **没有 ldmatrix**，只有 mma.m8n8k4 + 手工片段装配，
+而生产内核本就已用手写 mma.sync.m8n8k4）。**prefill 侧至此 6 条路径全部实测关闭**：
+chunk 16384 OOM / GDN Triton 启动失败 / 启动器旋钮 ≤3.7% / GEMV 合约门（decode-only）/
+weight-major wmma 封顶 / 占用率强压 9.2× 劣化。剩余只有多天级 cuBLAS 级内核重写。
