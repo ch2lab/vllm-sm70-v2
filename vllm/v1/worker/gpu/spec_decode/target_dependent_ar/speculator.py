@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -529,6 +531,14 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
+
+        # Measurement-only switch: cap the number of draft passes while the
+        # scheduler keeps the full verify width (num_speculative_tokens), so
+        # the per-pass cost and the per-verify-row cost can be separated.
+        # Default 0 = disabled.
+        _cap = int(os.environ.get("VLLM_SM70_DRAFT_STEPS", "0") or 0)
+        if _cap > 0:
+            num_speculative_steps = min(num_speculative_steps, _cap)
 
         attn_metadata = None
         slot_mappings_by_layer = None
