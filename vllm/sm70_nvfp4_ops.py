@@ -89,7 +89,7 @@ def dequant_from_qpn2(codes, scales, global_scale):
 
 def gemm_dispatch(out, input, qpn2_codes, qpn2_scales, qpn2_global_scale,
                   split_k=8, nacc=1):
-    """Single-op dispatch: QPN2 for m<=32, dequant+cuBLAS for m>32.
+    """Single-op dispatch: QPN2 for a bounded m, dequant+cuBLAS above it.
     The m-based decision is inside C++ (concrete int)."""
     if torch.is_tensor(qpn2_global_scale):
         qpn2_global_scale = float(qpn2_global_scale.item())

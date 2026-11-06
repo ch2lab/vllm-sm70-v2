@@ -369,7 +369,9 @@ def sm70_nvfp4_paged_decode(
         ):
             return
     RP = triton.next_power_of_2(HQ // H)
-    assert R * H * splits * RP * (D + 2) <= workspace.numel()
+    assert R * H * splits * RP * (D + 2) <= workspace.numel(), (
+        f"SM70WS R={R} H={H} splits={splits} RP={RP} D={D} "
+        f"need={R * H * splits * RP * (D + 2)} have={workspace.numel()}")
     # Head-dim slice per combine program: keeps the [splits, DC] tile small
     # enough to stay in registers at any head width.
     DC = 64
