@@ -21164,3 +21164,23 @@ Python 侧现在是 `base + p`（`base = kv_lens - (nqt-1)`），每个位置单
 
 已在动手阶段停止并**完整回退**（`decode_xqa16_pair` 计数 0，`git status` 干净），
 没有把半成品留在树里。估计若继续，仍需 3–5 轮编译/校验，且上限仍是 +5~8%。
+
+### (96) 双位置内核：编译通过，但校验出现非法访存，已回退（2026-11-07 05:0x）
+
+按 (95) 的修正实现完成：
+- `kv_len = kvlens[r] + 1`（用最大长度算 `nst/t1/np`）；
+- softmax mask 改逐位置 `gtok_t < kv_len-1+pp` / `at < t1-1+pp`；
+- 2× `sQ`、2× `sP/sM/sL/sA`、`o[2][2]`、写回槽位 `r*nqt+q0+pp`；
+- `run_pair`（成对发射 + 用展开的 `kvlens_rows` 调一次 combine）；
+- smem 40.3 KB/block（2 blocks/SM）。
+
+**编译**：先因提取内核文本时漏掉 `__global__ __launch_bounds__` 行导致原内核变 host 函数（27 个错误），
+补上后编译通过。
+
+**校验**：单位置 loop path 正常（`loop OK`）；pair path 在 4 行 / kv_len 8000 / splits 40 下
+**非法访存**，即使把 workspace 按 `nqt*H*G*splits*(D+2)` 放大仍然存在 ⇒ 内核内仍有越界，
+需要 compute-sanitizer 才能定位。另外发现 `run_pair` 里每对未把 `kvlens` 偏移 `p0`
+（第二对会用到错误的最大长度），是已知但未修的正确性缺陷。
+
+**已完整回退**（`decode_xqa16_pair`/`run_pair` 计数 0，`git status` 干净）。
+继续需要：sanitizer 定位越界 + 修 p0 偏移 + 元素级对齐，预计还要 3–5 轮；上限仍是 +5~8%。
