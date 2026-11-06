@@ -20821,3 +20821,24 @@ all-reduce / MoE permute 路径（即 #1369 那一类），需要 profiler 定�
 
 **M=128 判定**：QPN2 0.500 ms vs dequant+cuBLAS 0.606 ms（1.21×）；M=256 时 QPN2 0.995
 已慢于 0.618 ⇒ 阈值最多提到 128。
+
+### (79) 27B decode 的 nsys 分解：延迟受限（73% 空转），AR ~18%，GEMM 6–23%（2026-11-07 00:40）
+
+**方法**：`/data/sm70_results/quasar_27b/profile_decode.sh`（nsys 包住 serve，8K 提示 + 1024 输出，
+`cuda_gpu_trace` 导出后按时间窗聚合）。踩过的坑：报告在杀进程后约 2 分钟才落盘、且报告 0 字节＝nsys 被
+一起 SIGTERM；只杀被测进程即可。
+
+**单流 decode 窗口（44–55 s，4 卡）**：
+```
+GPU 利用率 27%（11 s × 4 = 44 GPU·s，内核总和 11.7 s）→ 73% 空转
+AR   8.2 s（17.6%/卡）   median 137 µs/次, mean 437 µs, p90 1088 µs, 17660 次
+GEMM 2.7 s（6%/卡）
+attn 0.12 s, gdn 0.14 s, norm 0.06 s
+```
+⇒ **单流 decode 是延迟受限**：不是算力/带宽，而是 64 层 ×（GEMM→AR→GEMM）的依赖链与发射延迟；
+AR 本身只占 ~18%，但有 1 ms 级长尾。
+
+**注意口径**：nsys 的 "NCCL 占 70% 内核时间" 是**跨 4 卡求和**的错觉；按 wall 折算只有 ~18%。
+
+**conc8 的 nsys** 被 prefill 淹没（`fmha_cutlassF` 21–26 s，占总内核 96%），不能用于 decode 归因——
+decode 测量必须让输出 token 数 ≫ prefill（如 8K+1024）。
