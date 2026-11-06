@@ -20952,3 +20952,26 @@ k=3（nqt=4）时同一段 KV 被读 4 遍，且每次只有 1 行 query / 1 个
 
 **下一步内核改动**：把 nqt 行合并进一次发射（q0 循环进 kernel），KV 读取 4×→1×，
 预期 7.2 ms → ~2 ms，步时间 26→~21 ms，单流 152→~188 tok/s。
+
+### (86) 更正 (85)：verify 注意力的 GPU 时间只有 197 µs/次，另 0.25 ms 是 Python 开销（2026-11-07 03:02）
+
+用 `torch.profiler` 直接读 kernel 时间（同一形状：kv_len 8000, nqt=4, splits=40）：
+
+```
+decode_xqa16      41.99 µs × 800 次 (81.9%)
+combine_decode     5.72 µs × 800 次
+Memcpy DtoD        1.51 µs × 800 次
+cudaLaunchKernel   8.69 µs × 2600 次 (CPU)
+```
+
+- 每次 `paged_decode_fp8`（4 行）= 4 × 49.2 µs ≈ **197 µs GPU**；
+- ×16 层 = **3.15 ms/步（12%）**，不是 (85) 写的 7–10 ms；
+- wall 0.45 ms 与 GPU 0.20 ms 之差 ≈ **0.25 ms/次是纯 Python**（切片/LUT/prepare/launch）。
+
+**关键推论**：若 verify 路径未进 CUDA graph，16 × 0.25 ms ≈ **4 ms/步的 CPU 开销**，
+profiler 里看不到，但会直接抬高步时间。这解释了 (83) 里"GPU 忙但利用率低"的一部分。
+
+**修正后的 26 ms 预算**：GEMM ~11 (42%) · verify-attn 3.2 (12%) · GDN 0.6 (2%) ·
+AR 2–5 · **其余 6–9 ms 仍未归因**（lm_head/采样/draft 前传/CPU 空隙）。
+⇒ (85) 中"verify attention 是最大非 GEMM 项"不成立，它只有 12%；下一步应查 CPU 空隙与 draft 前传，
+而不是重写这个内核。
