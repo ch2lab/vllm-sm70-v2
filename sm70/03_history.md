@@ -21347,3 +21347,35 @@ torch.compile 在 fake-tensor 传播阶段崩溃：
 **已回退**（`qwen3_5_mtp.py` 恢复、`sm70_rtn.py` 删除，`git status` 干净）。
 下一步若要继续，需要把 RTN 量化做成一个**正式的 quant method**（在 `LinearMethodBase.create_weights`
 阶段声明 uint8 weight/scales，让 compile 看到与其它 NVFP4 层相同的算子），而不是后置替换 forward。
+
+### (104) MTP + draft lm_head 的 NVFP4 量化：零收益，已回退（2026-11-07 07:00–07:43）
+
+**做法**：RTN NVFP4（e2m1 码表修正后，真实 `mtp.fc.weight` 上 cosine 0.9946），
+经 `layer.quant_method` 扩展点接入（不是替换 forward，后者会破坏 torch.compile 的 fake-tensor 传播）。
+先量化 MTP 的 5 个 linear，再追加量化草稿的 `lm_head`（只有草稿用，target 输出不受影响）。
+
+**测量**（同 harness，k=12 默认）：
+
+| 配置 | AL | 8K 单流 | 64K | conc8 |
+|---|---|---|---|---|
+| 基线（全 fp16） | **13.00** | **243.8** | 155.2 | 288.4 |
+| 5 linear 量化 | 11.92 / 12.70 | 231.5 | 160.5 | 286.8 |
+| + 草稿 lm_head 量化 | 11.92 / 12.80 | 232.6 | 160.6 | 286.5 |
+
+**决定性的是斜率测量**（`VLLM_SM70_DRAFT_STEPS` cap=0 vs 12，verify 宽度固定 13 行）：
+
+```
+fp16      : (52.39 − 31.10)/12 = 1.77 ms / extra draft pass
+quantized : (51.10 − 30.90)/12 = 1.68 ms / extra draft pass
+```
+
+即：把每次前传的权重从 **1.06 GB fp16 换成 0.27 GB NVFP4**（块级微基准 1.632 → 0.433 ms，
+3.77×），**端到端每次前传只省 0.09 ms**。8K 的 −5% 全部来自 AL 从 13.0 掉到 12.3。
+
+**结论（重要，影响后续方向）**：草稿前传在真实图里**不是权重带宽受限**，而是
+**串行依赖/内核延迟受限**——12 次前传构成一条 10+ 个内核的依赖链，减少字节数几乎不改变时长。
+⇒ 继续在草稿上做"量化/换格式"没有意义。要把边际成本压下去，只能**减少前传次数**
+（block-parallel drafting，即 DFlash2 的 `sampler_graph`/`lookup` 那套），或把前传里的
+多个小内核融合成一个。
+
+已回退（`qwen3_5_mtp.py` 恢复、`sm70_rtn.py` 删除，`git status` 干净）。
