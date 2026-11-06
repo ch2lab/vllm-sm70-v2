@@ -125,9 +125,13 @@ def qpn2_moe_gemm(out, input, codes, scales, global_scale, sorted_token_ids,
     # 128-col tile) that stages the expert's dequantized B panel into shared
     # memory once and walks all its route rows. Measured 5.83 vs 7.81 ms
     # (1.34x) on the chunk-8192 w13 shape. Only the non-fused path is wired.
+    # Prefill only: decode (m<=32) keeps the production kernel — the
+    # weight-major CTA wants ~256 contiguous rows per expert and collapsed
+    # decode to 34.8 tok/s when it was applied there (03_history (65)).
     if (
         os.environ.get("VLLM_SM70_MOE_PREFILL_WMAJOR") == "1"
         and not fuse_act
+        and input.shape[0] >= 2048
     ):
         torch.ops._C.sm70_nvfp4_qpn2_moe_gemm_wmajor(
             out, input, codes, scales, global_scale, sorted_token_ids,
