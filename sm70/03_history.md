@@ -20789,3 +20789,35 @@ all-reduce / MoE permute 路径（即 #1369 那一类），需要 profiler 定�
   `num_speculative_tokens_per_batch_size=[[1,2,4],[3,16,1]]`（bs≤2 用 k=4，≥3 用 k=1）——
   预期单流 150.9、conc8 ≈394，代价是 3–8 并发这一段拿不到 k=4 的好处；
 - **B**：修 `_accumulate_kernel` 的 `observed` 掩码 / steps≥2 的特征，让深位 p̂ 收敛到真实值。
+
+### (78) 27B dense NVFP4 GEMM：按 M 分档（参考 1cat batch_gemm 思路），conc16 +17.4%（2026-11-07）
+
+**微基准**（`sm70_tests/bench_nvfp4_dense_gemm.py`，GPU1，27B TP4 的 6 组 (N,K)）：
+我们的 QPN2 在 M=1–8 达到 HBM 地板的 **45–73%**，M=16 降到 29–45%，**M=32 只剩 16–21%**，
+而 `gemm_dispatch` 在 M>32 会切到 `dequant+cuBLAS`（整层反量化 + 再读一遍 fp16），**只剩 5.2%**。
+1cat 的做法（`mxfp4_qpn_m1` / `nvfp4_qpn4` / `batch_gemm` 分档）正是补这一段。
+
+**改动 1（保留）**：`kQpn2MaxM 32 → 64`。
+- 数值验证：M=33/48/64 两路径最大相对差 4e-4 ~ 8.8e-4（fp16 舍入级）；
+- 微基准：M=64 的 8704×5120 从 **0.540 ms（5.2%）→ 0.256 ms（10.9%）= 2.11×**。
+
+**改动 2（实测回滚）**：把 `RowTiles` 扩到 4、17≤m≤64 用 32 行/CTA。
+- 理由本是"减少每多一个 row-CTA 就重复读一遍权重"；
+- 实测 **M=32 反而从 0.133 变成 0.240 ms**（共享内存 8KB→32KB 压 occupancy），已回滚。
+- 结论：该内核在 M>8 后不是权重带宽受限，而是指令/占用率受限；真正的解法是换 dequant/MMA 结构。
+
+**端到端（27B TP4 / fp8_e4m3 / MTP3 / seqs16 → M=64 / NCCL）**：
+| | 旧库（阈值32） | 新库（阈值64） |
+|---|---|---|
+| conc16 agg | 176.1 | **206.8（+17.4%）** |
+| 8K 单流（对照 M=4） | 153.4 tok/s | 151.4（噪声内） |
+
+**运维教训**：第一次 A/B 无效——两臂加载了同一个旧 `.so`（md5 `ac1b9ca`），
+新构建是 `be5ed57`。现在所有 A/B 脚本在 boot 前用 md5 断言库身份。
+
+**构建**：`.deps/triton_kernels-src` 是空目录，CMake configure 会去 `git fetch` 并挂住；
+用 `cmake -DFETCHCONTENT_FULLY_DISCONNECTED=ON build/temp.linux-x86_64-cpython-312`
+后 `ninja -C ... _C_stable_libtorch` 即可增量重编（ccache 命中，~1 分钟）。
+
+**M=128 判定**：QPN2 0.500 ms vs dequant+cuBLAS 0.606 ms（1.21×）；M=256 时 QPN2 0.995
+已慢于 0.618 ⇒ 阈值最多提到 128。
