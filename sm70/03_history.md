@@ -20914,3 +20914,19 @@ coll  240.7 ms  7.1%   (AllReduce n=528)
 **结论**：nsys + cudaProfilerApi 这条路径在本引擎上无法给出可信的 per-op decode 分解。
 上面这组 51/26/12.5/7 的分法**不可用**，不得据此改内核。下一步需要换工具
 （引擎内 torch.profiler，或对 GDN/verify-attention 做独立微基准），而不是继续调 nsys 参数。
+
+### (84) GDN 独立微基准：2.1 ms/次是假象，实际 13–48 µs（2026-11-07 03:0x）
+
+nsys 内核表里 `gdn_forward_vlk_varlen` 显示 192 次 × 2.1 ms，是最大非 GEMM 嫌疑。
+用独立微基准（`sm70_tests/bench_gdn_decode.py`，27B TP4 形状 Hq=4/Hv=12/K=V=128，
+state [N,Hv,V,K] fp32）直接测该内核：
+
+| reqs | nqt | T | ms/次 | 占 state 读写地板 | 48 层合计 |
+|---|---|---|---|---|---|
+| 1 | 4 | 4 | 0.013 | 13.7% | 0.6 ms |
+| 2 | 4 | 8 | 0.012 | 28.6% | 0.6 ms |
+| 8 | 4 | 32 | 0.028 | 50.2% | 1.3 ms |
+| 16 | 4 | 64 | 0.048 | 58.7% | 2.3 ms |
+
+⇒ GDN 在 decode 步里只占 **2–9%**，**不是瓶颈**；nsys 的 2.1 ms/次属于被 prefill 污染的读数。
+（这也再次说明 (83) 的结论：那份 nsys 分解不可用。）
