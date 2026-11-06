@@ -20687,3 +20687,30 @@ cuBLAS 天花板、weight-major 转化失败、稠密注意力（质量必需）
 
 **注**：本次只覆盖 w13（`fuse_act=False`）；w2 融合路径仍走生产内核。若要再扩，需把融合 A 载入
 接进 wmajor（已实现且与镜像一致，但生产融合语义未对齐，见 (67)），上限再 +≈0.5%。
+
+### (74) 与 1cat-vLLM 1.5.1 的同机 TP1 对比（速度 + 质量，2026-11-06）
+
+**口径**：同一 checkpoint、同一 harness、同一配置（TP1 / util 0.90 / mnbt 8192 / seqs 32 /
+max-model-len 262144 / chunked-prefill / 同 parsers 与 API 面），**唯一差异 = KV dtype**
+（我们 nvfp4；1cat 只支持 fp8_e5m2，它的所有 SM70 attention backend 在 head=256 时拒绝 nvfp4）。
+脚本固化：`/root/run/serve_1cat_aligned.sh` + `/data/sm70_results/stack_vs_1cat/compare_fixed.sh`。
+（1cat CLI 缺 `--enable-per-request-metrics` 与 `--device-ids`，后者用 CUDA_VISIBLE_DEVICES 等效。）
+
+| 指标 | 1cat (fp8_e5m2) | 我们 (nvfp4) | 差距 |
+|---|---|---|---|
+| prefill 65K | 3337.9 tok/s | **3924.2** | **+17.6%** |
+| prefill 150K | 1971.4 | **2580.5** | **+30.9%** |
+| decode 65K | 61.1 tok/s | **97.4** | **+59%** |
+| decode 150K | 45.5 | **85.1** | **+87%** |
+| KV 池（mlen 262144） | 331,651 tokens | 更大（nvfp4，见启动日志） | 结构性优势 |
+
+**质量（同门同 harness）**：
+| 门 | 1cat | 我们 |
+|---|---|---|
+| canary | **6/7（determinism 失败，3 次里复现 2 次：61 vs 67）** | **7/7（3/3 连跑全过）** |
+| recall（长文真实语料检索） | 9/9 | 9/9 |
+| secret | 6/6 | 6/6 |
+
+⇒ **速度全面领先（prefill +17.6%/+30.9%，decode +59%/+87%）且质量至少持平**；1cat 的
+temperature=0 确定性不通过（同 prompt 两次输出 61 vs 67 token）——这对可复现性是硬伤，
+我们的栈 3/3 稳定。
