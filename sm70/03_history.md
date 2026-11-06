@@ -21330,3 +21330,20 @@ lm_head 也在 ignore 列表里（fp16），主模型每步可再省 ~0.46 ms。
    `nvfp4/sm70.py` 的 gemm_dispatch 路径）；
 2. 过质量三门（canary 7/7、recall 9/9、secret 6/6）与 0 新 Xid；
 3. 同 harness 复测 8K/64K/conc8。
+
+### (103) MTP 块 RTN NVFP4：打包器验证通过，但接线破坏 torch.compile（已回退）
+
+**已完成且可复用的部分**（数值验证）：
+- RTN NVFP4 打包器（低半字节=偶数 k、高半字节=奇数 k、每 16 元素一个 e4m3 块缩放）
+  经生产内核 `dequant_from_qpn2` 回环：**rms_rel 10.3%**，max_rel 12.3% —— 与格式一致；
+- 速度上限（块级）：同一批 MTP 形状 fp16 1.632 ms → NVFP4 0.433 ms = **3.77×**。
+
+**失败点**：把 fp16 Linear 直接 monkey-patch 到 `Sm70NvFp4LinearKernel.apply_weights` 后，
+torch.compile 在 fake-tensor 传播阶段崩溃：
+`RuntimeError when making fake tensor call ... call_function vllm_ir.rms_norm`。
+现有 NVFP4 层之所以能在图里跑，是因为它们走完整的 `quant_method` 管线（含 custom op 的 fake impl 注册），
+而不是替换 `forward`。
+
+**已回退**（`qwen3_5_mtp.py` 恢复、`sm70_rtn.py` 删除，`git status` 干净）。
+下一步若要继续，需要把 RTN 量化做成一个**正式的 quant method**（在 `LinearMethodBase.create_weights`
+阶段声明 uint8 weight/scales，让 compile 看到与其它 NVFP4 层相同的算子），而不是后置替换 forward。
