@@ -20842,3 +20842,19 @@ AR 本身只占 ~18%，但有 1 ms 级长尾。
 
 **conc8 的 nsys** 被 prefill 淹没（`fmha_cutlassF` 21–26 s，占总内核 96%），不能用于 decode 归因——
 decode 测量必须让输出 token 数 ≫ prefill（如 8K+1024）。
+
+### (80) 27B：投机 K 按 batch size 调度——单流保持，conc8 +21.8%（2026-11-07 01:35–01:53）
+
+同 harness、同 profile（TP4 / fp8_e4m3 / seqs8 / mnbt4096 / util0.83 / NCCL）只改 K：
+
+| 场景 | k=3 | k=1 | **调度 bs≤2→3, bs≥3→1** |
+|---|---|---|---|
+| 8K 单流 | 151.4 | 97.9 | **152.3** |
+| 64K 单流 | 116.0 | 79.8 | **115.4** |
+| conc8 agg | 207.1 | 253.6 | **252.2（+21.8%）** |
+
+结论：**并发下投机解码是负收益**（8 请求 × 4 行 = 32 行，多出的 verify 行比多接受的 token 更贵），
+而单流是正收益。用原生 `num_speculative_tokens_per_batch_size` 分档即可两全，零代码改动。
+已设为 `/root/run/serve_27b_quasar.sh` 的默认 spec。
+
+测量中 `mtp1` 的 AL 为 1.69–1.81（上限 2.0），`mtp3` 单流 AL 4.00（100%）、conc8 AL 2.99。
