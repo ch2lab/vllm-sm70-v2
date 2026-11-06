@@ -334,6 +334,282 @@ __device__ __forceinline__ void deq8(__half* dst, uint2 raw, __half2 sc,
 constexpr int kMinTokensPerPart = 85;
 
 __global__ __launch_bounds__(THREADS, 3)
+void decode_xqa16_pair(const __half* __restrict__ q, const unsigned char* __restrict__ kv,
+                  const int* __restrict__ bt, const int* __restrict__ kvlens,
+                  float* __restrict__ ws, float k_scale, float v_scale,
+                  float sm_scale, int bt_cols, int nparts, int window,
+                  long page, long side_off, const int* __restrict__ page_list,
+                  int npages_list, const __half* __restrict__ lut, int hstride,
+                  int tstride, int npg, int q0, int nqt) {
+  extern __shared__ char smem[];
+  __half* sQ = reinterpret_cast<__half*>(smem);
+  __half* sK = sQ + 2 * 16 * QS;
+  __half* sV = sK + BN * KVS;
+  float* sSp = reinterpret_cast<float*>(sV + BN * KVS);        /* 4 x 16 x 16 */
+  __half* sP = reinterpret_cast<__half*>(sSp + 4 * 16 * 16);   /* 16 x SS */
+  float* sM = reinterpret_cast<float*>(sP + 2 * 16 * SS);
+  float* sL = sM + 32;
+  float* sA = sL + 32;
+  __half2* sLUT = reinterpret_cast<__half2*>(sA + 32);   /* 256 x half2 = 1 KB */
+
+  const int r = blockIdx.z, sp = blockIdx.x, kvh = blockIdx.y;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int kv_len = kvlens[r] + 1;
+
+  /* How many partitions actually carry work for this request.  Computed here
+     and identically in combine_decode, so the two agree on which rows of ws
+     are live without any device-side handshake (which would not be safe under
+     CUDA-graph capture). */
+  const int lo0 = (window >= 0) ? max(kv_len - 1 - window, 0) : 0;
+  const int span0 = max(kv_len - lo0, 0);
+  const int np = (page_list != nullptr)
+                     ? nparts
+                     : min(nparts, max(1, span0 / kMinTokensPerPart));
+  if (page_list == nullptr && sp >= np) return;
+
+  for (int pp = 0; pp < 2; ++pp) {
+    for (int i = tid; i < 16 * (HD / 8); i += THREADS) {
+      int row = i / (HD / 8), c8 = (i % (HD / 8)) * 8;
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (row < G) {
+        long off = ((long)(r * nqt + q0 + pp) * HQ + kvh * G + row) * HD + c8;
+        v = *reinterpret_cast<const uint4*>(q + off);
+      }
+      *reinterpret_cast<uint4*>(&sQ[pp * 16 * QS + row * QS + c8]) = v;
+    }
+    if (tid < 16) { sM[pp * 16 + tid] = -1e30f; sL[pp * 16 + tid] = 0.f; sA[pp * 16 + tid] = 1.f; }
+  }
+#if !KVFP8
+  sLUT[tid] = fp4_pair(tid);
+#endif
+  for (int i = tid; i < 16 * SS; i += THREADS) sP[i] = __float2half(0.f);
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[2][2];
+  for (int pp = 0; pp < 2; ++pp) {
+    wmma::fill_fragment(o[pp][0], 0.f);
+    wmma::fill_fragment(o[pp][1], 0.f);
+  }
+  /* wmma m16n16 accumulator row of element pair i: this is the mapping that
+     validated at rel=4e-4 in the 32-token kernel (not lane>>2). */
+  const int rbase = (lane & 1) + 4 * ((lane >> 4) & 1) + 8 * ((lane >> 2) & 1);
+
+  const int lo = lo0;
+  int t0, t1, nst;
+  int ip0 = 0, ip1 = 0;
+  if (page_list != nullptr) {
+    /* bounded read: the partition is a slice of the selected page list, one
+       16-token page per stage (the last page is clamped by kv_len).  Split over
+       the pages the table actually holds, not its capacity: the caller passes
+       the whole buffer width, and the unused tail used to give every part
+       stages that could only produce zeros (measured 4x wasted work at 250K). */
+    const int nsel = min(npages_list, (kv_len + BN - 1) / BN);
+    ip0 = (int)((long)nsel * sp / nparts);
+    ip1 = (int)((long)nsel * (sp + 1) / nparts);
+    nst = ip1 - ip0;
+    t0 = 0;
+    t1 = kv_len;
+  } else {
+    const int span = span0;
+    t0 = lo + (int)((long)span * sp / np);
+    t1 = lo + (int)((long)span * (sp + 1) / np);
+    nst = (t1 > t0) ? ((t1 - t0 + BN - 1) / BN) : 0;
+  }
+
+  const long kdata0 = (long)kvh * (npg * KDD);
+  const long ksf0 = (long)H * npg * KDD + (long)kvh * (npg * KSD);
+  const int stok = tid >> 4, ssub = tid & 15;   /* 16 tokens x 16 dims */
+
+  uint2 pk, pv;
+  unsigned char kb0 = 0, kb1 = 0, vb0 = 0, vb1 = 0;
+#if KVFP8
+  uint4 pk4 = make_uint4(0, 0, 0, 0), pv4 = make_uint4(0, 0, 0, 0);
+#endif
+#if KVFP16
+  const unsigned char* kp16 = nullptr;
+  const unsigned char* vp16 = nullptr;
+#endif
+  auto fetch = [&](int st) {
+    const int gtok = t0 + st * BN + stok;
+    if (page_list != nullptr ? (ip0 + st < ip1) : (gtok < t1)) {
+      const int pg = (page_list != nullptr) ? page_list[ip0 + st]
+                                            : (gtok / npg);
+      const int nn = (page_list != nullptr) ? stok : (gtok % npg);
+#if KVFP16
+      const long po = (long)bt[r * bt_cols + pg] * page;
+      kp16 = kv + po + (long)kvh * hstride + (long)nn * tstride + ssub * 32;
+      vp16 = kp16 + HD * 2;
+#elif KVFP8
+      const long po = (long)bt[r * bt_cols + pg] * page;
+      const unsigned char* kp =
+          kv + po + (long)kvh * hstride + (long)nn * tstride + ssub * 16;
+      pk4 = *reinterpret_cast<const uint4*>(kp);
+      pv4 = *reinterpret_cast<const uint4*>(kp + HD);
+#else
+      const long po = (long)bt[r * bt_cols + pg] * page;
+      const unsigned char* kd = kv + po + kdata0 + nn * KDD + ssub * 8;
+      const unsigned char* ks = kv + po + ksf0 + nn * KSD + ssub;
+      pk = *reinterpret_cast<const uint2*>(kd);
+      kb0 = ks[0];
+      pv = *reinterpret_cast<const uint2*>(kd + side_off);
+      vb0 = ks[side_off];
+#endif
+    }
+  };
+  auto commit = [&](int st) {
+    const int gtok = t0 + st * BN + stok;
+    const int pgc = (page_list != nullptr) ? page_list[ip0 + st]
+                                           : (gtok / npg);
+    const int nnc = (page_list != nullptr) ? stok : (gtok % npg);
+    const bool live = (page_list != nullptr)
+                          ? (pgc * BN + nnc < kv_len)
+                          : (gtok < t1);
+    __half* kd = sK + stok * KVS;
+    __half* vd = sV + stok * KVS;
+    if (live) {
+#if KVFP16
+      deq16h(kd + ssub * 16, kp16, k_scale);
+      deq16h(vd + ssub * 16, vp16, v_scale);
+#elif KVFP8
+      deq16(kd + ssub * 16, pk4, k_scale, lut);
+      deq16(vd + ssub * 16, pv4, v_scale, lut);
+#else
+      deq8(kd + ssub * 16, pk, __float2half2_rn(e4m3(kb0) * k_scale), sLUT);
+      deq8(vd + ssub * 16, pv, __float2half2_rn(e4m3(vb0) * v_scale), sLUT);
+#endif
+    } else {
+#if KVFP16
+      const __half zero = __float2half(0.f);
+      __half2* kdz = reinterpret_cast<__half2*>(kd + ssub * 16);
+      __half2* vdz = reinterpret_cast<__half2*>(vd + ssub * 16);
+#pragma unroll
+      for (int k = 0; k < 8; k++) {
+        kdz[k] = __half2half2(zero);
+        vdz[k] = __half2half2(zero);
+      }
+#elif KVFP8
+      deq16(kd + ssub * 16, make_uint4(0, 0, 0, 0), 0.f, lut);
+      deq16(vd + ssub * 16, make_uint4(0, 0, 0, 0), 0.f, lut);
+#else
+      deq8(kd + ssub * 16, make_uint2(0, 0), __float2half2_rn(0.f), sLUT);
+      deq8(vd + ssub * 16, make_uint2(0, 0), __float2half2_rn(0.f), sLUT);
+#endif
+    }
+  };
+
+  fetch(0);
+  // sLUT is written by all 256 threads but commit() reads entries written by
+  // other warps; without this barrier the first block can dequant with an
+  // uninitialised LUT (observed as intermittent non-finite logits under
+  // concurrency, 2026-11-03).
+  __syncthreads();
+  commit(0);
+  __syncthreads();
+
+  for (int st = 0; st < nst; ++st) {
+    if (st + 1 < nst) fetch(st + 1);   /* LDGs overlap QK/softmax/PV */
+
+    for (int pp = 0; pp < 2; ++pp) {
+    /* QK: 4 warps, each 4 of the 16 k-steps -> partial score tiles */
+    if (warp < 4) {
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> sa;
+      wmma::fill_fragment(sa, 0.f);
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        const int kk = warp * 4 + k;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qf;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kf;
+        wmma::load_matrix_sync(qf, &sQ[pp * 16 * QS + kk * 16], QS);
+        wmma::load_matrix_sync(kf, &sK[kk * 16], KVS);
+        wmma::mma_sync(sa, qf, kf, sa);
+      }
+      wmma::store_matrix_sync(&sSp[warp * 256], sa, 16, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    /* softmax: one warp per two heads (lanes 0-15 = head 2w, 16-31 = head 2w+1)
+       so no lane sits idle and the warp count halves. */
+    if (warp < 4) {
+      const int head = 2 * warp + (lane >> 4);
+      const int tl = lane & 15;
+      const int at = t0 + st * BN + tl;
+      const int pgt = (page_list != nullptr) ? page_list[ip0 + st]
+                                             : (at / npg);
+      const int nnt = (page_list != nullptr) ? tl : (at % npg);
+      const int gtok_t = pgt * BN + nnt;
+      float sc = -1e30f;
+      /* t1 is this partition's end, not the request's kv_len: only the
+         final partition needs the per-position shortening. */
+      const int t1p = (page_list != nullptr)
+                          ? min(kv_len - 1 + pp, kv_len)
+                          : min(t1, kv_len - 1 + pp);
+      if ((page_list != nullptr) ? (gtok_t < t1p) : (at < t1p)) {
+        sc = (sSp[head * 16 + tl] + sSp[256 + head * 16 + tl] +
+              sSp[512 + head * 16 + tl] + sSp[768 + head * 16 + tl]) * sm_scale;
+      }
+      float mx = sc;
+#pragma unroll
+      for (int off = 8; off; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+      const float m_old = sM[pp * 16 + head];
+      const float m_new = fmaxf(m_old, mx);
+      const float p = __expf(sc - m_new);
+      float lsum = p;
+#pragma unroll
+      for (int off = 8; off; off >>= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
+      sP[(pp * 16 + head) * SS + tl] = __float2half(p);
+      if (tl == 0) {   /* running stats are per head, so only lane 0 needs alpha */
+        const float alpha = (m_old <= -1e29f) ? 0.f : __expf(m_old - m_new);
+        sM[pp * 16 + head] = m_new;
+        sL[pp * 16 + head] = sL[pp * 16 + head] * alpha + lsum;
+        sA[pp * 16 + head] = alpha;
+      }
+    }
+    __syncthreads();
+
+    /* PV: 8 warps x 2 accumulators (16 dims each), one 16-token k-step */
+    {
+      const float a0 = sA[pp * 16 + rbase], a2 = sA[pp * 16 + rbase + 2];
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pf;
+      wmma::load_matrix_sync(pf, sP + pp * 16 * SS, SS);   /* the same P serves both halves */
+#pragma unroll
+      for (int t = 0; t < 2; t++) {
+        float* acc = o[pp][t].x;
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[j] *= ((j & 2) ? a2 : a0);
+        const int nd = warp * 2 + t;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vf;
+        wmma::load_matrix_sync(vf, &sV[nd * 16], KVS);
+        wmma::mma_sync(o[pp][t], pf, vf, o[pp][t]);
+      }
+    }
+    __syncthreads();
+    }  /* pp */
+    if (st + 1 < nst) { commit(st + 1); }
+    __syncthreads();
+  }
+
+  for (int pp = 0; pp < 2; ++pp) {
+    float* scr = reinterpret_cast<float*>(sK);
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < 2; t++)
+      wmma::store_matrix_sync(scr + (warp * 2 + t) * 256, o[pp][t], 16, wmma::mem_row_major);
+    __syncthreads();
+    const int rr = r * nqt + q0 + pp;
+    for (int i = tid; i < G * HD; i += THREADS) {
+      const int row = i / HD, d = i % HD;
+      const int wsrc = d / 32, tsrc = (d % 32) / 16, c = d % 16;
+      const long rb = (long)(((rr * H + kvh) * G + row) * nparts + sp) * (HD + 2);
+      ws[rb + d] = scr[(wsrc * 2 + tsrc) * 256 + row * 16 + c];
+    }
+    if (tid < G) {
+      const long rb = (long)(((rr * H + kvh) * G + tid) * nparts + sp) * (HD + 2);
+      ws[rb + HD] = sM[pp * 16 + tid];
+      ws[rb + HD + 1] = sL[pp * 16 + tid];
+    }
+  }
+}
+
+__global__ __launch_bounds__(THREADS, 3)
 void decode_xqa16(const __half* __restrict__ q, const unsigned char* __restrict__ kv,
                   const int* __restrict__ bt, const int* __restrict__ kvlens,
                   float* __restrict__ ws, float k_scale, float v_scale,
@@ -709,7 +985,54 @@ void run(torch::Tensor q, torch::Tensor kv, torch::Tensor bt, torch::Tensor kvle
       page_list.has_value() ? 1 : 0);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &run); m.def("prepare", &prepare); }
+static bool g_attr_pair = false;
+
+void run_pair(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
+              torch::Tensor kvlens, torch::Tensor kvlens_rows,
+              torch::Tensor ws, torch::Tensor out, double k_scale,
+              double v_scale, double sm_scale, int nparts, int window, int R,
+              c10::optional<torch::Tensor> page_list,
+              c10::optional<torch::Tensor> lut = c10::nullopt,
+              int64_t hstride = 0, int64_t tstride = 0, int64_t npg = 0,
+              int64_t q0 = 0, int64_t nqt = 1) {
+#if KVFP8 || KVFP16
+  const int H2 = kv.size(1);
+#else
+  const int H2 = kv.size(1) / 2;
+#endif
+  const long page = kv.stride(0);
+  const int smem = (2 * 16 * QS + 2 * BN * KVS) * 2 + 4 * 16 * 16 * 4
+                   + 2 * 16 * SS * 2 + 2 * 16 * 12 + 1024;
+  if (!g_attr_pair) {
+    cudaFuncSetAttribute(decode_xqa16_pair,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    g_attr_pair = true;
+  }
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 g(nparts, H2, R);
+  for (int p0 = 0; p0 + 1 < (int)nqt; p0 += 2) {
+    torch::Tensor kvl = kvlens + p0;   // this pair's longest KV
+    decode_xqa16_pair<<<g, THREADS, smem, stream>>>(
+        reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+        kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
+        kvl.data_ptr<int>(), ws.data_ptr<float>(), (float)k_scale,
+        (float)v_scale, (float)sm_scale, bt.size(1), nparts, window, page,
+        page / 2,
+        page_list.has_value() ? page_list->data_ptr<int>() : nullptr,
+        page_list.has_value() ? (int)page_list->numel() : 0,
+        lut.has_value()
+            ? reinterpret_cast<const __half*>(lut->data_ptr<at::Half>())
+            : nullptr,
+        (int)hstride, (int)tstride, (int)npg, (int)q0 + p0, (int)nqt);
+  }
+  dim3 gc(R * (int)nqt, H2, G);
+  combine_decode<<<gc, 256, 0, stream>>>(
+      ws.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+      nparts, 0, 1, kvlens_rows.data_ptr<int>(), window,
+      page_list.has_value() ? 1 : 0);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &run); m.def("run_pair", &run_pair); m.def("prepare", &prepare); }
 """
 
 _MODS_XQA = {}
@@ -817,6 +1140,25 @@ def paged_decode_fp8(q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,
     if nqt > 1:
         R = q.shape[0] // nqt
         base = kv_lens - (nqt - 1)
+        if os.environ.get("VLLM_SM70_XQA_PAIR") == "1" and nqt % 2 == 0:
+            from vllm.v1.attention.ops.sm70_nvfp4_dequant import _fp8_lut
+
+            R_, HQ_, D_ = q.shape[0] // nqt, q.shape[1], q.shape[2]
+            H_ = int(kv_cache.shape[1])
+            kv_u8_ = (kv_cache if kv_cache.dtype == torch.uint8
+                      else kv_cache.view(torch.uint8))
+            lut_ = _fp8_lut(kv_u8_.device, kv_dtype)
+            rows = (base[:, None]
+                    + torch.arange(nqt, device=base.device)[None, :]
+                    ).reshape(-1).to(torch.int32)
+            mod = _mod_xqa_fp8(H_, HQ_)
+            mod.prepare()
+            mod.run_pair(q.contiguous(), kv_u8_, block_table, base, rows,
+                         workspace, out, float(k_scale), float(v_scale),
+                         float(sm_scale), int(splits), int(window), R_, None,
+                         lut_, kv_u8_.stride(1), kv_u8_.stride(2),
+                         int(kv_u8_.size(2)), 0, nqt)
+            return
         for p in range(nqt):
             out_p = torch.empty(R, q.shape[1], q.shape[2], dtype=out.dtype,
                                 device=out.device)
