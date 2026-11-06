@@ -21123,3 +21123,24 @@ nqt=4: 0.1908 ms  (x3.98)
 **更高价值的目标**：draft 前传每次 4.25 ms 中有 **2.6 ms 非 GEMM**（×3 次 = 7.8 ms/步），
 比整个 verify 注意力（3.05 ms）还大，且来源未明（AR 仅 ~0.28 ms，疑为发射/图覆盖）。
 下一步应对这 2.6 ms 做同样的逐项剥离，而不是重写注意力。
+
+### (94) 归因的第三条路也封死：V1 引擎在子进程里，进程内 profiler 看不到内核（2026-11-07 04:18–04:33）
+
+用 torch.profiler 做 k=3 vs 无投机的内核级差分（同提示、同输出长度），两次都只得到表头：
+
+```
+prof_k3.csv:   kernel,count,cuda_us      (0 行)
+prof_none.csv: kernel,count,cuda_us      (0 行)
+```
+
+原因：TP=4 时引擎在 worker 子进程；**改 TP=1 重试仍然为空**，日志显示 V1 始终起独立的
+`EngineCore pid=3258592`。父进程不执行任何 CUDA kernel，profiler 自然看不到。
+
+至此三条路都已封死，且都有证据：
+1. nsys 按秒切窗 → 混入 prefill/阶段边界（(83)）；
+2. nsys + cudaProfilerApi → 图内 worker 内核捕获不全，68 次 vs 预期 544 次（(83)）；
+3. 进程内 torch.profiler（TP4 与 TP1）→ 引擎在子进程，表为空（本条）。
+
+⇒ decode 的 per-kernel 归因在本环境**不可得**。后续只能在两条项目级路线里选：
+**多行 verify 注意力**（上限 +8.5%，需 ~300 行 WMMA 重写，风险已由 RowTiles=4 证明）
+或 **DFlash2 speculator 移植**（~1500 行，决定 487 的上限）。
