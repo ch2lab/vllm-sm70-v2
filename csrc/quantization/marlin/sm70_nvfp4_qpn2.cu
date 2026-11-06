@@ -1840,6 +1840,220 @@ void sm70_nvfp4_qpn2_moe_gemm_fp16b(torch::stable::Tensor& out,
                                      num_shards, moe_block_size, fuse_act);
 }
 
+
+// ---------------------------------------------------------------------------
+// Weight-major large-tile MoE prefill kernel (default off: separate op, so the
+// production dispatch is untouched). One CTA per (expert, 128-col tile, 256-row
+// tile): the expert's dequantized B panel is staged into shared memory ONCE per
+// k-tile and shared by all 16 warps (the per-warp dequant version was 8x
+// redundant and measured 37.5 TF/s vs 51.3 here). Hand-written mma.m8n8k4.
+// ---------------------------------------------------------------------------
+#define WMAJ_BM 256
+#define WMAJ_BN 128
+#define WMAJ_BK 64
+#define WMAJ_PAD 24
+#define WMAJ_THREADS 512
+
+#define WMAJ_MMA(C, A0, A1, B0, B1)                                      \
+  asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "        \
+               "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "         \
+               "{%0,%1,%2,%3,%4,%5,%6,%7};\n"                            \
+               : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]),         \
+                 "+f"(C[4]), "+f"(C[5]), "+f"(C[6]), "+f"(C[7])          \
+               : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
+
+__global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
+    const half* __restrict__ input, half* __restrict__ output,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_past_padded,
+    const float* __restrict__ topk_weights, const float* __restrict__ global_scale,
+    int n, int k, int m, int top_k, bool mul_topk_weights, int block_m) {
+  extern __shared__ char smem_raw[];
+  __half (*sA)[WMAJ_BK + WMAJ_PAD] =
+      reinterpret_cast<__half (*)[WMAJ_BK + WMAJ_PAD]>(smem_raw);
+  __half (*sB)[WMAJ_BK + WMAJ_PAD] = reinterpret_cast<__half (*)[WMAJ_BK + WMAJ_PAD]>(
+      smem_raw + (size_t)WMAJ_BM * (WMAJ_BK + WMAJ_PAD) * sizeof(__half));
+  __shared__ int s_sid[WMAJ_BM];
+  __shared__ float s_w[WMAJ_BM];
+  __shared__ int s_row0, s_row1, s_tok[WMAJ_BM];
+
+  const int e = blockIdx.z;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int wm = warp >> 1, wn = warp & 1;
+  const int quadpair = (lane >> 2) & 3;
+  const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int b_col = (lane & 3) + (((lane >> 4) & 1) << 2) + (((lane >> 2) & 3) << 3);
+
+  const int padded = num_tokens_past_padded[0];
+  const int blocks = padded / block_m;
+  // binary search this expert's route-block range in the sorted expert_ids
+  if (tid == 0) {
+    int lo = 0, hi = blocks;
+    while (lo < hi) { const int mid = (lo + hi) >> 1;
+      if (expert_ids[mid] < e) lo = mid + 1; else hi = mid; }
+    int b0 = lo;
+    hi = blocks;
+    while (lo < hi) { const int mid = (lo + hi) >> 1;
+      if (expert_ids[mid] <= e) lo = mid + 1; else hi = mid; }
+    s_row0 = b0 * block_m;
+    s_row1 = lo * block_m;
+  }
+  __syncthreads();
+  if (s_row0 >= s_row1) return;
+  const int base0 = s_row0 + blockIdx.y * WMAJ_BM;
+  if (base0 >= s_row1) return;
+
+  for (int base = base0; base < s_row1; base += gridDim.y * WMAJ_BM) {
+    for (int r = tid; r < WMAJ_BM; r += WMAJ_THREADS) {
+      const int rr = base + r;
+      if (rr < s_row1 && rr < padded) {
+        const int sid = sorted_token_ids[rr];
+        s_sid[r] = sid;
+        s_tok[r] = (sid >= 0 && sid < m * top_k) ? sid / top_k : 0;
+        s_w[r] = (sid >= 0 && mul_topk_weights) ? topk_weights[sid] : 1.0f;
+      } else {
+        s_sid[r] = -1;
+        s_tok[r] = 0;
+        s_w[r] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    const int n0 = blockIdx.x * WMAJ_BN;
+    const int groups = k / 16;
+    const int nb0 = n0 / 32;
+    const unsigned char* codeE =
+        codes + (size_t)e * (size_t)(n / 32) * groups * 32 * 8;
+    const unsigned char* scaleE = group_scales + (size_t)e * (size_t)(n / 32) * groups * 32;
+    const float gs = global_scale[e * 1];
+
+    float acc[4][2][8];
+  #pragma unroll
+    for (int i = 0; i < 4; ++i)
+      for (int j = 0; j < 2; ++j)
+        for (int q = 0; q < 8; ++q) acc[i][j][q] = 0.f;
+
+    for (int k0 = 0; k0 < k; k0 += WMAJ_BK) {
+      for (int i = tid; i < WMAJ_BM * WMAJ_BK / 8; i += WMAJ_THREADS) {
+        const int r = (i * 8) / WMAJ_BK, c = (i * 8) % WMAJ_BK;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (s_sid[r] >= 0)
+          v = *reinterpret_cast<const uint4*>(
+              &input[(size_t)s_tok[r] * k + k0 + c]);
+        *reinterpret_cast<uint4*>(&sA[r][c]) = v;
+      }
+      {  // cooperative nvfp4 -> fp16 dequant of this CTA's B panel (once)
+        const int nb = tid / 128, rem = tid % 128;
+        const int g = k0 / 16 + rem / 32, lane_t = rem % 32;
+        if (nb < WMAJ_BN / 32) {
+          const int nbk = nb0 + nb;
+          const long off = ((long)nbk * groups + g) * 32 + lane_t;
+          const uint2 packed = *reinterpret_cast<const uint2*>(codeE + off * 8);
+          const half2 sc = qpn2::nvfp4_effective_scale_biased(scaleE[off], gs);
+          half2 wv[8];
+          qpn2::dequant_e2m1x8_biased(packed.x, sc, wv);
+          qpn2::dequant_e2m1x8_biased(packed.y, sc, wv + 4);
+          const int bc = (lane_t & 3) + (((lane_t >> 4) & 1) << 2) +
+                         (((lane_t >> 2) & 3) << 3);
+          __half* dst = &sB[nb * 32 + bc][(g - k0 / 16) * 16];
+          const unsigned* ws = reinterpret_cast<const unsigned*>(wv);
+  #pragma unroll
+          for (int q = 0; q < 8; ++q)
+            *reinterpret_cast<unsigned*>(dst + q * 2) = ws[q];
+        }
+      }
+      __syncthreads();
+
+      for (int g = k0 / 16; g < k0 / 16 + WMAJ_BK / 16; ++g) {
+        uint4 a0v[4], a1v[4], b0v[2], b1v[2];
+        const int kk = (g - k0 / 16) * 16;
+  #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int r = wm * 32 + i * 8 + local_row;
+          a0v[i] = *reinterpret_cast<const uint4*>(&sA[r][kk]);
+          a1v[i] = *reinterpret_cast<const uint4*>(&sA[r][kk + 8]);
+        }
+  #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const int c = wn * 64 + j * 32 + b_col;
+          b0v[j] = *reinterpret_cast<const uint4*>(&sB[c][kk]);
+          b1v[j] = *reinterpret_cast<const uint4*>(&sB[c][kk + 8]);
+        }
+  #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const unsigned* a0 = reinterpret_cast<const unsigned*>(&a0v[i]);
+          const unsigned* a1 = reinterpret_cast<const unsigned*>(&a1v[i]);
+  #pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            const unsigned* b0 = reinterpret_cast<const unsigned*>(&b0v[j]);
+            const unsigned* b1 = reinterpret_cast<const unsigned*>(&b1v[j]);
+            WMAJ_MMA(acc[i][j], a0[0], a0[1], b0[0], b0[1]);
+            WMAJ_MMA(acc[i][j], a0[2], a0[3], b0[2], b0[3]);
+            WMAJ_MMA(acc[i][j], a1[0], a1[1], b1[0], b1[1]);
+            WMAJ_MMA(acc[i][j], a1[2], a1[3], b1[2], b1[3]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    for (int i = 0; i < 4; ++i) {
+      const int r = wm * 32 + i * 8 + (0);
+      (void)r;
+      for (int j = 0; j < 2; ++j)
+        for (int idx = 0; idx < 8; ++idx) {
+          const int lr = wm * 32 + i * 8 + (idx & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+          if (lr >= WMAJ_BM || s_sid[lr] < 0) continue;
+          const int col = wn * 64 + j * 32 + quadpair * 8 +
+                          ((idx & 1) | (((lane >> 1) & 1) << 1) | ((idx >> 2) << 2));
+          output[(size_t)s_sid[lr] * n + n0 + col] =
+              __float2half(acc[i][j][idx] * s_w[lr]);
+        }
+    }
+  }
+}
+
+
+void sm70_nvfp4_qpn2_moe_gemm_wmajor(
+    torch::stable::Tensor& out, torch::stable::Tensor& input,
+    torch::stable::Tensor& codes, torch::stable::Tensor& scales,
+    torch::stable::Tensor& global_scale, torch::stable::Tensor& sorted_token_ids,
+    torch::stable::Tensor& expert_ids, torch::stable::Tensor& num_tokens_past_padded,
+    torch::stable::Tensor& topk_weights, int64_t top_k, bool mul_topk_weights,
+    int64_t num_shards, int64_t moe_block_size, bool fuse_act) {
+  torch::stable::accelerator::DeviceGuard device_guard(input.get_device_index());
+  const int n = static_cast<int>(out.size(1));
+  const int k = static_cast<int>(input.size(1));
+  const int m = static_cast<int>(input.size(0));
+  STD_TORCH_CHECK(!fuse_act, "wmajor kernel does not fuse act yet");
+  // Each CTA walks the expert's row-tiles with a grid-stride loop, so the grid
+  // stays small no matter how skewed the routing is (a full-slot upper bound
+  // here would launch ~500k mostly-idle CTAs and measured 0.47x).
+  const int mtiles = 4;
+  const int smem = (int)(((size_t)WMAJ_BM + WMAJ_BN) * (WMAJ_BK + WMAJ_PAD) * sizeof(__half));
+  static bool attr_done = false;
+  if (!attr_done) {
+    cudaFuncSetAttribute(nvfp4_qpn2_moe_wmajor_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    attr_done = true;
+  }
+  dim3 grid(n / WMAJ_BN, mtiles, (int)codes.size(0));
+  cudaStream_t wm_stream = get_current_cuda_stream(input.get_device_index());
+  nvfp4_qpn2_moe_wmajor_kernel<<<grid, WMAJ_THREADS, smem, wm_stream>>>(
+      reinterpret_cast<const uint8_t*>(codes.data_ptr()),
+      reinterpret_cast<const uint8_t*>(scales.data_ptr()),
+      reinterpret_cast<const half*>(input.data_ptr()),
+      reinterpret_cast<half*>(out.mutable_data_ptr()),
+      reinterpret_cast<const int32_t*>(sorted_token_ids.data_ptr()),
+      reinterpret_cast<const int32_t*>(expert_ids.data_ptr()),
+      reinterpret_cast<const int32_t*>(num_tokens_past_padded.data_ptr()),
+      reinterpret_cast<const float*>(topk_weights.data_ptr()),
+      reinterpret_cast<const float*>(global_scale.data_ptr()),
+      n, k, m, (int)top_k, mul_topk_weights, (int)moe_block_size);
+}
+
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, sm70_nvfp4_qpn2_ops) {
   sm70_nvfp4_qpn2_ops.def(
       "sm70_nvfp4_qpn2_prepare(Tensor weight, Tensor weight_scale) -> Tensor[]");
@@ -1855,6 +2069,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, sm70_nvfp4_qpn2_ops) {
       "Tensor expert_ids, Tensor num_tokens_past_padded, "
       "Tensor topk_weights, int top_k, bool mul_topk_weights, "
       "int num_shards, int moe_block_size, bool fuse_act) -> ()");
+  sm70_nvfp4_qpn2_ops.def(
+      "sm70_nvfp4_qpn2_moe_gemm_wmajor(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor scales, Tensor global_scale, Tensor sorted_token_ids, "
+      "Tensor expert_ids, Tensor num_tokens_past_padded, Tensor topk_weights, "
+      "int top_k, bool mul_topk_weights, int num_shards, int moe_block_size, "
+      "bool fuse_act) -> ()");
   sm70_nvfp4_qpn2_ops.def(
       "sm70_nvfp4_qpn2_moe_gemm_fp16b(Tensor(a!) out, Tensor input, "
       "Tensor b_weights, Tensor scales_ignored, Tensor global_scale, "
@@ -1872,6 +2092,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, sm70_nvfp4_qpn2_ops) {
                           TORCH_BOX(&sm70_nvfp4_qpn2_prepare_moe));
   sm70_nvfp4_qpn2_ops.impl("sm70_nvfp4_qpn2_moe_gemm",
                           TORCH_BOX(&sm70_nvfp4_qpn2_moe_gemm));
+  sm70_nvfp4_qpn2_ops.impl("sm70_nvfp4_qpn2_moe_gemm_wmajor",
+                           TORCH_BOX(&sm70_nvfp4_qpn2_moe_gemm_wmajor));
   sm70_nvfp4_qpn2_ops.impl("sm70_nvfp4_qpn2_moe_gemm_fp16b",
                           TORCH_BOX(&sm70_nvfp4_qpn2_moe_gemm_fp16b));
 }

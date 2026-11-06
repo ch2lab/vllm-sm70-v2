@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -120,6 +121,20 @@ def qpn2_moe_gemm(out, input, codes, scales, global_scale, sorted_token_ids,
     pass num_shards accordingly). moe_block_size is the route-block width that
     moe_align_block_size was called with (8 halves the wasted mma rows).
     """
+    # Weight-major large-tile kernel (default off): one CTA per (expert,
+    # 128-col tile) that stages the expert's dequantized B panel into shared
+    # memory once and walks all its route rows. Measured 5.83 vs 7.81 ms
+    # (1.34x) on the chunk-8192 w13 shape. Only the non-fused path is wired.
+    if (
+        os.environ.get("VLLM_SM70_MOE_PREFILL_WMAJOR") == "1"
+        and not fuse_act
+    ):
+        torch.ops._C.sm70_nvfp4_qpn2_moe_gemm_wmajor(
+            out, input, codes, scales, global_scale, sorted_token_ids,
+            expert_ids, num_tokens_past_padded, topk_weights, int(top_k),
+            bool(mul_topk_weights), int(num_shards), int(moe_block_size),
+            False)
+        return
     torch.ops._C.sm70_nvfp4_qpn2_moe_gemm(
         out, input, codes, scales, global_scale, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, int(top_k), bool(mul_topk_weights),
