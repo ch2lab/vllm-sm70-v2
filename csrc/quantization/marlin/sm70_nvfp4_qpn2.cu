@@ -1862,6 +1862,36 @@ void sm70_nvfp4_qpn2_moe_gemm_fp16b(torch::stable::Tensor& out,
                  "+f"(C[4]), "+f"(C[5]), "+f"(C[6]), "+f"(C[7])          \
                : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
+__global__ void wmajor_offsets_kernel(
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_past_padded, int block_m, int E,
+    int BM, int* __restrict__ rows_off, int* __restrict__ rows_end,
+    int* __restrict__ tile_off) {
+  const int e = threadIdx.x;
+  const int blocks = num_tokens_past_padded[0] / block_m;
+  int b0 = 0, b1 = 0;
+  if (e < E) {
+    int lo = 0, hi = blocks;
+    while (lo < hi) { const int mid = (lo + hi) >> 1;
+      if (expert_ids[mid] < e) lo = mid + 1; else hi = mid; }
+    b0 = lo; hi = blocks;
+    while (lo < hi) { const int mid = (lo + hi) >> 1;
+      if (expert_ids[mid] <= e) lo = mid + 1; else hi = mid; }
+    b1 = lo;
+  }
+  __syncthreads();
+  if (e < E) {
+    rows_off[e] = b0 * block_m;
+    rows_end[e] = b1 * block_m;
+    tile_off[e + 1] = ((b1 - b0) * block_m + BM - 1) / BM;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    tile_off[0] = 0;
+    for (int i = 0; i < E; ++i) tile_off[i + 1] += tile_off[i];
+  }
+}
+
 __global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
     const half* __restrict__ input, half* __restrict__ output,
@@ -1870,7 +1900,9 @@ __global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
     const int32_t* __restrict__ num_tokens_past_padded,
     const float* __restrict__ topk_weights, const float* __restrict__ global_scale,
     int n, int k, int m, int top_k, bool mul_topk_weights, int block_m,
-    bool fuse_act) {
+    bool fuse_act, const int* __restrict__ rows_off,
+    const int* __restrict__ rows_end, const int* __restrict__ tile_off,
+    int codes_n_experts, int* __restrict__ counter) {
   extern __shared__ char smem_raw[];
   __half (*sA)[WMAJ_BK + WMAJ_PAD] =
       reinterpret_cast<__half (*)[WMAJ_BK + WMAJ_PAD]>(smem_raw);
@@ -1878,9 +1910,8 @@ __global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
       smem_raw + (size_t)WMAJ_BM * (WMAJ_BK + WMAJ_PAD) * sizeof(__half));
   __shared__ int s_sid[WMAJ_BM];
   __shared__ float s_w[WMAJ_BM];
-  __shared__ int s_row0, s_row1, s_tok[WMAJ_BM];
+  __shared__ int s_tok[WMAJ_BM];
 
-  const int e = blockIdx.z;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int wm = warp >> 1, wn = warp & 1;
   const int quadpair = (lane >> 2) & 3;
@@ -1888,28 +1919,29 @@ __global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
   const int b_col = (lane & 3) + (((lane >> 4) & 1) << 2) + (((lane >> 2) & 3) << 3);
 
   const int padded = num_tokens_past_padded[0];
-  const int blocks = padded / block_m;
-  // binary search this expert's route-block range in the sorted expert_ids
-  if (tid == 0) {
-    int lo = 0, hi = blocks;
-    while (lo < hi) { const int mid = (lo + hi) >> 1;
-      if (expert_ids[mid] < e) lo = mid + 1; else hi = mid; }
-    int b0 = lo;
-    hi = blocks;
-    while (lo < hi) { const int mid = (lo + hi) >> 1;
-      if (expert_ids[mid] <= e) lo = mid + 1; else hi = mid; }
-    s_row0 = b0 * block_m;
-    s_row1 = lo * block_m;
-  }
+  const int ntiles = tile_off[codes_n_experts];
+  __shared__ int s_slot;
+  if (tid == 0) s_slot = atomicAdd(counter + blockIdx.x, 1);
   __syncthreads();
-  if (s_row0 >= s_row1) return;
-  const int base0 = s_row0 + blockIdx.y * WMAJ_BM;
-  if (base0 >= s_row1) return;
+  const int slot = s_slot;
+  if (slot >= ntiles) return;
+  int lo = 0, hi = codes_n_experts;
+  while (lo + 1 < hi) { const int mid = (lo + hi) >> 1;
+    if (tile_off[mid] <= slot) lo = mid; else hi = mid; }
+  const int e = lo;
+  const int base0 = rows_off[e] + (slot - tile_off[e]) * WMAJ_BM;
+  const int row_end = rows_end[e];
+  if (base0 >= row_end) return;
+  // Skewed routing leaves many experts far below BM rows; a warp whose 32-row
+  // band lies entirely past the expert's end skips its mma work.
+  const int valid_rows = min(WMAJ_BM, row_end - base0);
+  const bool warp_active = (wm * 32) < valid_rows;
 
-  for (int base = base0; base < s_row1; base += gridDim.y * WMAJ_BM) {
+  {
+    const int base = base0;
     for (int r = tid; r < WMAJ_BM; r += WMAJ_THREADS) {
       const int rr = base + r;
-      if (rr < s_row1 && rr < padded) {
+      if (rr < row_end && rr < padded) {
         const int sid = sorted_token_ids[rr];
         s_sid[r] = sid;
         s_tok[r] = (sid >= 0 && sid < m * top_k) ? sid / top_k : 0;
@@ -1993,6 +2025,7 @@ __global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
         }
   #pragma unroll
         for (int i = 0; i < 4; ++i) {
+          if (!warp_active) break;
           const unsigned* a0 = reinterpret_cast<const unsigned*>(&a0v[i]);
           const unsigned* a1 = reinterpret_cast<const unsigned*>(&a1v[i]);
   #pragma unroll
@@ -2044,7 +2077,19 @@ void sm70_nvfp4_qpn2_moe_gemm_wmajor(
   // Each CTA walks the expert's row-tiles with a grid-stride loop, so the grid
   // stays small no matter how skewed the routing is (a full-slot upper bound
   // here would launch ~500k mostly-idle CTAs and measured 0.47x).
-  const int mtiles = 4;
+  const int experts = (int)codes.size(0);
+  const int tiles_upper = (m * (int)top_k + WMAJ_BM - 1) / WMAJ_BM + experts;
+  static int* wm_scratch = nullptr;
+  static int wm_scratch_e = 0;
+  if (wm_scratch == nullptr || wm_scratch_e < experts + 1) {
+    if (wm_scratch != nullptr) cudaFree(wm_scratch);
+    cudaMalloc(&wm_scratch, sizeof(int) * (3 * (experts + 1) + 256));
+    wm_scratch_e = experts + 1;
+  }
+  int* rows_off = wm_scratch;
+  int* rows_end = rows_off + experts + 1;
+  int* tile_off = rows_end + experts + 1;
+  int* wm_counter = tile_off + experts + 1;  // one counter per n-tile
   const int smem = (int)(((size_t)WMAJ_BM + WMAJ_BN) * (WMAJ_BK + WMAJ_PAD) * sizeof(__half));
   static bool attr_done = false;
   if (!attr_done) {
@@ -2052,8 +2097,15 @@ void sm70_nvfp4_qpn2_moe_gemm_wmajor(
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     attr_done = true;
   }
-  dim3 grid(n / WMAJ_BN, mtiles, (int)codes.size(0));
   cudaStream_t wm_stream = get_current_cuda_stream(input.get_device_index());
+  const int n_tiles = n / WMAJ_BN;
+  STD_TORCH_CHECK(n_tiles <= 256, "wmajor counter array too small");
+  cudaMemsetAsync(wm_counter, 0, sizeof(int) * n_tiles, wm_stream);
+  wmajor_offsets_kernel<<<1, 256, 0, wm_stream>>>(
+      reinterpret_cast<const int32_t*>(expert_ids.data_ptr()),
+      reinterpret_cast<const int32_t*>(num_tokens_past_padded.data_ptr()),
+      (int)moe_block_size, experts, WMAJ_BM, rows_off, rows_end, tile_off);
+  dim3 grid(n / WMAJ_BN, tiles_upper, 1);
   nvfp4_qpn2_moe_wmajor_kernel<<<grid, WMAJ_THREADS, smem, wm_stream>>>(
       reinterpret_cast<const uint8_t*>(codes.data_ptr()),
       reinterpret_cast<const uint8_t*>(scales.data_ptr()),
@@ -2064,7 +2116,8 @@ void sm70_nvfp4_qpn2_moe_gemm_wmajor(
       reinterpret_cast<const int32_t*>(num_tokens_past_padded.data_ptr()),
       reinterpret_cast<const float*>(topk_weights.data_ptr()),
       reinterpret_cast<const float*>(global_scale.data_ptr()),
-      n, k, m, (int)top_k, mul_topk_weights, (int)moe_block_size, fuse_act);
+      n, k, m, (int)top_k, mul_topk_weights, (int)moe_block_size, fuse_act,
+      rows_off, rows_end, tile_off, experts, wm_counter);
 }
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, sm70_nvfp4_qpn2_ops) {
