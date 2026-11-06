@@ -20737,3 +20737,22 @@ temperature=0 确定性不通过（同 prompt 两次输出 61 vs 67 token）—�
 decode 单流 +19%/+34%；吞吐 conc32 +66%/+107%；**KV 池 TP2 6.4×、TP4 9.1×**（权重摊薄）。
 ⇒ 面向吞吐部署选 **TP4**（并发 777 agg、单流 130 tok/s）；单卡场景 TP1 保留 837K token 池。
 全部臂均以当前生产内核（含 wmajor）跑出，TP2/TP4 的 canary 7/7 说明 wmajor 在 TP>1 也正常。
+
+### (76) 1cat-vLLM v1.5.2 代码通读（2026-11-06）：哪些是真新增、哪些我们已有
+
+来源：`/data/src/1cat-vllm-152`（worktree，HEAD `2bb8c2b9cd`，v1.5.1..v1.5.2 = 1840 commits /
+1968 文件 / +399k−43k）。逐条对照我们的 `vllm-v2`：
+
+| 1.5.2 条目 | 它做了什么 | 我们的状态 |
+|---|---|---|
+| **#1297** 混合 Mamba 部分前缀命中 | `partial_prefix_cache.py` 新文件：以「最后一个整块哈希 + 块内尾部 token」为键，缓存**精确位置 P** 所需的半满 KV 页 + 递推态副本，写入用 CoW；LRU 上限 1/4 KV 块；chat API 额外传两个位置（最后一条消息结尾、system 结尾），各向下取整到 64-token GDN chunk。八轮 agent：命中 28%→68%（仅 2048 块）→ 部分命中后 **99–100%**，每轮重算从 ~1000 token 降到 30–60，四并发 TTFT 中位 1.07→0.71 s | **已有等价实现**：`partial_hash_hits_enabled()`（aligned Mamba 亚块命中）+ `single_type_kv_cache_manager._partial_hit_reqs` 的 CoW 部分尾重定向 + boundary-state offload 钩子。运行时 `Mamba cache mode = align`，attn/mamba block = **3728 token**（mamba page pad +0.05%）。⇒ 不是缺口；缺的是**我们从未测过 agent 多轮命中率** |
+| **#1394** 不再按 prompt 长度编译 | `_qk_norm_rope` 加 `do_not_specialize=["POS_ROW","POS_COL","NUM_SLOTS"]`、`_sm70_qwen35_gdn_split_kernel` 的 `num_rows` 由 `tl.constexpr` 改 `tl.int64`；每种新 chunk 长度原本要编译 2 个 Triton kernel ≈0.34 s TTFT，且 RSS 持续涨 | **不适用**：我们的 GDN prefill 是 CUDA kernel（`qwen_gdn_linear_attn.py` 中 `@triton.jit` 计数为 0），qk-norm/rope 也不走它那条 Triton |
+| **#1298** 长前缀上的短块 prefill 用 split-KV | FA2 d256 split-KV 改为**运行时 split 数**（N-way merge，`kMaxKVSplits=64`，3-split 与原实现 bit-identical）；修掉 Q<1024 / <32 token / 非对齐回退到慢速 paged BM32 | **已移植**：`sm70_splitd_prefill`（op `sm70_d256_splitd_n32_paged_fwd`，策略 `sm70_splitd_admit`）。但 gate 要求 qo/kv 头比 = **6**（TP2 12/2、TP4 6/1），**TP1 是 16/2 = 8 ⇒ 我们的生产配置被 gate 关掉**（日志：`SM70 splitd prefill gate on but disabled: ratio`） |
+| **#1369** MTP4 并发验证 | custom all-reduce 接受「5 行 × 2560 × 2B × 多请求」的 verify 批载荷；新增 `qwen38_moe_permute_sm70.cu`；hcx_batch 的 group 数改编译期常量 | **未覆盖**：`csrc/custom_all_reduce.{cu,cuh}` 中无任何 verify-batch 特判。与我们实测吻合：Flash-Next TP4 k=1→k=4 单流 65K 122→**150.9**，但 conc8 **394→190.3** |
+| **#1263** 每步不重发 token 历史 | `all_token_ids[req_id] = req.all_token_ids.copy()` 只在 V1 runner 下做（PP 时每 pp_size 步一次，287k 上下文 ≈4 ms/步） | **已有**（`use_v2_model_runner` 分支已存在） |
+| **#1287** Q4096 原生 prefill | 4096-token 块的原生 Q4096 注意力 79 TF/s + 预留长前缀 workspace | **无**（`csrc/attention/` 无 79T 目录）；我们 chunk=8192，且 16384 已实测 OOM |
+
+**Flash-Next TP4 MTP k=4 复测（补 capture size 40 后，2026-11-06 17:41–17:43）**：
+8K prefill 5736.7 tok/s、decode 112.8；65K prefill 5060.5、decode **150.9**；**conc8 仍 190.3**
+（k=1 为 394.2）。⇒ 崩塌**不是** cudagraph capture 阶梯（1..80 全含仍复现），指向并发 verify 的
+all-reduce / MoE permute 路径（即 #1369 那一类），需要 profiler 定位而非继续加 capture size。
