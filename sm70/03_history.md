@@ -21215,3 +21215,19 @@ loop 0.1910 ms -> pair 0.1355 ms  = 1.41x
 
 **正确性**：同一 greedy 请求 pair on/off 输出 **IDENTICAL**。
 已设为 `serve_27b_quasar.sh` 默认（`VLLM_SM70_XQA_PAIR=1`，可 0 关闭）。
+
+### (98) 双位置内核模板化；4 位置实测更慢（0.1406 vs 0.1355 ms），保留 2（2026-11-07 05:10–05:25）
+
+把 `decode_xqa16_pair` 改成 `template <int NPOS>`（注意不能叫 `NP`——源码里已有 `#define NP 16`），
+同时实例化 2/4，按 nqt 选择；4 位置的逐元素校验通过（rel 1.4e-04）。
+
+**实测（nqt=4, kv_len 8000, splits 40）**：
+```
+loop            0.1914 ms
+NPOS=2          0.1355 ms   (1.41x)
+NPOS=4          0.1406 ms   (1.36x, 比 2 慢 4%)
+```
+原因与预算一致：NPOS=4 的 smem 57.3 KB → 1 block/SM，且 `o[4][2]` 累加器翻倍。
+⇒ 判据不通过，强制 `NPOS = 2`（代码保留模板，便于以后在不同形状上再试）。
+
+**重构后端到端复测（无回归）**：8K 155.7 / 64K 123.1 / conc8 287.7 agg。

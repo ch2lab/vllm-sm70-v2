@@ -333,8 +333,9 @@ __device__ __forceinline__ void deq8(__half* dst, uint2 raw, __half2 sc,
    (249936/85 >> 240, so the cap is inactive there and 240 still wins). */
 constexpr int kMinTokensPerPart = 85;
 
+template <int NPOS>
 __global__ __launch_bounds__(THREADS, 3)
-void decode_xqa16_pair(const __half* __restrict__ q, const unsigned char* __restrict__ kv,
+void decode_xqa16_multi(const __half* __restrict__ q, const unsigned char* __restrict__ kv,
                   const int* __restrict__ bt, const int* __restrict__ kvlens,
                   float* __restrict__ ws, float k_scale, float v_scale,
                   float sm_scale, int bt_cols, int nparts, int window,
@@ -343,14 +344,14 @@ void decode_xqa16_pair(const __half* __restrict__ q, const unsigned char* __rest
                   int tstride, int npg, int q0, int nqt) {
   extern __shared__ char smem[];
   __half* sQ = reinterpret_cast<__half*>(smem);
-  __half* sK = sQ + 2 * 16 * QS;
+  __half* sK = sQ + NPOS * 16 * QS;
   __half* sV = sK + BN * KVS;
   float* sSp = reinterpret_cast<float*>(sV + BN * KVS);        /* 4 x 16 x 16 */
   __half* sP = reinterpret_cast<__half*>(sSp + 4 * 16 * 16);   /* 16 x SS */
-  float* sM = reinterpret_cast<float*>(sP + 2 * 16 * SS);
-  float* sL = sM + 32;
-  float* sA = sL + 32;
-  __half2* sLUT = reinterpret_cast<__half2*>(sA + 32);   /* 256 x half2 = 1 KB */
+  float* sM = reinterpret_cast<float*>(sP + NPOS * 16 * SS);
+  float* sL = sM + NPOS * 16;
+  float* sA = sL + NPOS * 16;
+  __half2* sLUT = reinterpret_cast<__half2*>(sA + NPOS * 16);   /* 256 x half2 = 1 KB */
 
   const int r = blockIdx.z, sp = blockIdx.x, kvh = blockIdx.y;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -367,7 +368,7 @@ void decode_xqa16_pair(const __half* __restrict__ q, const unsigned char* __rest
                      : min(nparts, max(1, span0 / kMinTokensPerPart));
   if (page_list == nullptr && sp >= np) return;
 
-  for (int pp = 0; pp < 2; ++pp) {
+  for (int pp = 0; pp < NPOS; ++pp) {
     for (int i = tid; i < 16 * (HD / 8); i += THREADS) {
       int row = i / (HD / 8), c8 = (i % (HD / 8)) * 8;
       uint4 v = make_uint4(0, 0, 0, 0);
@@ -384,8 +385,8 @@ void decode_xqa16_pair(const __half* __restrict__ q, const unsigned char* __rest
 #endif
   for (int i = tid; i < 16 * SS; i += THREADS) sP[i] = __float2half(0.f);
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[2][2];
-  for (int pp = 0; pp < 2; ++pp) {
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[NPOS][2];
+  for (int pp = 0; pp < NPOS; ++pp) {
     wmma::fill_fragment(o[pp][0], 0.f);
     wmma::fill_fragment(o[pp][1], 0.f);
   }
@@ -508,7 +509,7 @@ void decode_xqa16_pair(const __half* __restrict__ q, const unsigned char* __rest
   for (int st = 0; st < nst; ++st) {
     if (st + 1 < nst) fetch(st + 1);   /* LDGs overlap QK/softmax/PV */
 
-    for (int pp = 0; pp < 2; ++pp) {
+    for (int pp = 0; pp < NPOS; ++pp) {
     /* QK: 4 warps, each 4 of the 16 k-steps -> partial score tiles */
     if (warp < 4) {
       wmma::fragment<wmma::accumulator, 16, 16, 16, float> sa;
@@ -587,7 +588,7 @@ void decode_xqa16_pair(const __half* __restrict__ q, const unsigned char* __rest
     __syncthreads();
   }
 
-  for (int pp = 0; pp < 2; ++pp) {
+  for (int pp = 0; pp < NPOS; ++pp) {
     float* scr = reinterpret_cast<float*>(sK);
     __syncthreads();
 #pragma unroll
@@ -1001,18 +1002,27 @@ void run_pair(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
   const int H2 = kv.size(1) / 2;
 #endif
   const long page = kv.stride(0);
-  const int smem = (2 * 16 * QS + 2 * BN * KVS) * 2 + 4 * 16 * 16 * 4
-                   + 2 * 16 * SS * 2 + 2 * 16 * 12 + 1024;
+  // Measured: NPOS=4 costs 0.1406 ms vs 0.1355 ms for NPOS=2 at nqt=4 /
+  // kv_len 8000 (57 KB of shared memory drops the kernel to 1 block/SM and
+  // doubles the accumulator registers), so two positions per scan is kept.
+  const int NPOS = 2;
+  const int smem_max = (4 * 16 * QS + 2 * BN * KVS) * 2 + 4 * 16 * 16 * 4
+                       + 4 * 16 * SS * 2 + 4 * 16 * 12 + 1024;
   if (!g_attr_pair) {
-    cudaFuncSetAttribute(decode_xqa16_pair,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(decode_xqa16_multi<2>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+    cudaFuncSetAttribute(decode_xqa16_multi<4>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
     g_attr_pair = true;
   }
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 g(nparts, H2, R);
-  for (int p0 = 0; p0 + 1 < (int)nqt; p0 += 2) {
-    torch::Tensor kvl = kvlens + p0;   // this pair's longest KV
-    decode_xqa16_pair<<<g, THREADS, smem, stream>>>(
+  for (int p0 = 0; p0 + NPOS - 1 < (int)nqt; p0 += NPOS) {
+    torch::Tensor kvl = kvlens + p0;   // this group's longest KV
+    const int smem = (NPOS * 16 * QS + 2 * BN * KVS) * 2 + 4 * 16 * 16 * 4
+                     + NPOS * 16 * SS * 2 + NPOS * 16 * 12 + 1024;
+    if (NPOS == 4)
+      decode_xqa16_multi<4><<<g, THREADS, smem, stream>>>(
         reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
         kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
         kvl.data_ptr<int>(), ws.data_ptr<float>(), (float)k_scale,
@@ -1023,7 +1033,20 @@ void run_pair(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
         lut.has_value()
             ? reinterpret_cast<const __half*>(lut->data_ptr<at::Half>())
             : nullptr,
-        (int)hstride, (int)tstride, (int)npg, (int)q0 + p0, (int)nqt);
+          (int)hstride, (int)tstride, (int)npg, (int)q0 + p0, (int)nqt);
+    else
+      decode_xqa16_multi<2><<<g, THREADS, smem, stream>>>(
+          reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+          kv.data_ptr<unsigned char>(), bt.data_ptr<int>(),
+          kvl.data_ptr<int>(), ws.data_ptr<float>(), (float)k_scale,
+          (float)v_scale, (float)sm_scale, bt.size(1), nparts, window, page,
+          page / 2,
+          page_list.has_value() ? page_list->data_ptr<int>() : nullptr,
+          page_list.has_value() ? (int)page_list->numel() : 0,
+          lut.has_value()
+              ? reinterpret_cast<const __half*>(lut->data_ptr<at::Half>())
+              : nullptr,
+          (int)hstride, (int)tstride, (int)npg, (int)q0 + p0, (int)nqt);
   }
   dim3 gc(R * (int)nqt, H2, G);
   combine_decode<<<gc, 256, 0, stream>>>(
