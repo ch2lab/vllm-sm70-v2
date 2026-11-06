@@ -20322,3 +20322,23 @@ KV 池算不出来），随即 `Engine core initialization failed`。⇒ GDN 9.6
 A/B 路径，CUDA 内核是唯一形态。**流程教训**：屏测脚本在臂启动失败时 `exit 1` 会跳过回滚，
 把坏的 drop-in 留在服务上（本次服务卡在重启循环，手工清除后恢复 READY/29970MiB）；
 屏测脚本必须"先回滚再退出"。
+
+### (56) MoE prefill weight-major 原型实测：调度上界真实存在（1.63×），但朴素实现（23.5 TF/s）反而慢于生产内核（41.2）——差距是实现工程不是调度（2026-11-06）
+
+**原型**（`/data/sm70_results/screens/wm_moe_proto2.py`，load_inline CUDA，fp16 权重以隔离调度因素）：
+CTA=(expert, 128 列块, 128 行块)，8 warp × (2×4) wmma 累加器，K 分块 32 进 smem 单缓冲，
+cooperative 16B 向量化装载。形状 = 真实 chunk 8192/top8/E=256 的每专家切片（M=256,N=1024,K=2048）。
+
+| 实现 | ms | TF/s | %峰值 |
+|---|---|---|---|
+| 生产内核 nvfp4_qpn2_moe_wide | 6.686 | 41.2 | 33.5% |
+| **本原型（weight-major, fp16）** | **11.677** | **23.5** | **19.1%** |
+| cuBLAS 分批 GEMM（调度上界） | 4.091 | 67.2 | 54.6% |
+
+正确性：`max|d|=0`（与 cuBLAS bmm 位等）。BK=64 变体更差（15.6ms）⇒ 瓶颈不是 staging 尺寸，
+而是无流水线（每 K 块 __syncthreads 串行化）+ 无 cp.async（Volta 只能手工双缓冲/寄存器预取）。
+
+**结论**：weight-major 的 **1.63× 上界是真实的**（cuBLAS 在同调度下达 67 TF/s），但
+**朴素手写实现打不过现有生产内核**——差距在 cuBLAS 级工程（双缓冲、swizzle 防 bank 冲突、
+更深的 K 流水、寄存器分块），这正是 megakernel 项目的真实工作量与风险所在。
+结合 (55)：该项目的全量收益上限 ≈9% prefill（尺子形状 MoE 占 23.4%），需要 cuBLAS 级实现质量才能兑现。
