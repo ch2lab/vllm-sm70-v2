@@ -20858,3 +20858,21 @@ decode 测量必须让输出 token 数 ≫ prefill（如 8K+1024）。
 已设为 `/root/run/serve_27b_quasar.sh` 的默认 spec。
 
 测量中 `mtp1` 的 AL 为 1.69–1.81（上限 2.0），`mtp3` 单流 AL 4.00（100%）、conc8 AL 2.99。
+
+### (81) DFlash2 为何 AL=1.00：我们的 speculator 是 265 行桩实现，缺 4 个核心组件（2026-11-07 02:00–02:16）
+
+三条排除实验（同一 27B、TP4、fp8_e4m3、seqs8，只改一个变量）：
+
+| 变量 | 结果 |
+|---|---|
+| aux hidden 层接线 | **正确**：日志 `Using Eagle3 auxiliary layers from config: (6,20,34,48,62)`，正是 dflash `target_layer_ids [5,19,33,47,61]` +1 |
+| `draft_sample_method`：probabilistic → greedy | 两者都 **AL=1.00 / 0 接受**（329 drafts） |
+| 草稿：NVFP4(1.3 G) → 未量化(3.6 G) | 两者都 **0/329** ⇒ 不是量化加载 |
+
+**根因**：我们的 `vllm/v1/worker/gpu/spec_decode/dflash2/` 只有 `speculator.py`（265 行），
+1cat 的实现是 1356 行 + 四个我们完全没有的组件：
+`lookup.py`(336) / `ngram_assist.py`(162) / `sampler_graph.py`(434) / `sparse_rejection.py`(559)。
+即 DFlash2 的 lookup 表、采样图、稀疏拒绝链路都没实现，草稿输出因此系统性错误。
+
+**结论**：DFlash 要可用 ≈ 移植 ~1500 行，不是配置/小修能解决的；即使修好，AL 4.0→~5.9 也只是
+单流 152→~225 tok/s（仍距 487 约 2.2×）。⇒ 该路线按"大工程"立项，不作为近期小步快跑项。
