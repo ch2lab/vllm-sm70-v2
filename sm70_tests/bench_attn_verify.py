@@ -56,7 +56,7 @@ def main() -> None:
     print(f"verify attention (fp8 XQA) | H={H} HQ={HQ} D={D} page={PAGE} | HBM {HBM_GBS:.0f} GB/s")
     print(f"{'kv_len':>7} {'nqt':>4} {'ms':>8} {'GB/s':>9} {'%floor':>7} {'x16 layers':>11}")
     for kv_len in (2048, 8000, 32000):
-        for nqt in (4,):
+        for nqt in (1, 2, 4):
             ms, gbs = bench(kv_len, nqt)
             print(f"{kv_len:>7} {nqt:>4} {ms:8.4f} {gbs:9.1f} "
                   f"{gbs/HBM_GBS*100:6.1f}% {ms*16:9.2f} ms", flush=True)
