@@ -20524,3 +20524,25 @@ n 列 ⇒ **8× 冗余反量化**。改为**每 CTA 协作反量化一次 B 面�
 ⇒ 阀门保持默认关（`VLLM_SM70_MOE_PREFILL_WMAJOR` 未启用），服务已回基线。若要继续：先按 m 门控
 （仅 prefill）、再把 silu 融合移植进 wmajor（覆盖 w13 那 55%），并解决 gather 开销——但收益上限
 已从 "−9%" 收窄到 "−2.6%×实际转化率"。
+
+### (66) 生产 fuse_act 语义未能对齐 + wmajor 路线定格（2026-11-06）
+
+**形状/stride 已确认为原文**：`marlin_moe.py:266` 传 `intermediate_cache1.view(-1, 2*N)[:, :N]`
+（`N = w1.size(1)//2`，即 gate 宽度；行 stride = 2N），内核 `ACT_INPUT` 分支按
+`input_row + group*16`（gate）与 `+act_half + group*16`（up，act_half=k）取数——与我的实现一致。
+
+**但实测三点不一致**（同一 codes/scales/路由，N=2048/K=512）：
+| 对照 | max\|d\| |
+|---|---|
+| wmajor 融合 vs Python mirror(`silu(gate)*up`, 双舍入) | **0.0**（我的实现与该语义完全一致） |
+| production 融合 vs 同一 mirror | 289.6 |
+| production 融合 vs 交换版(`silu(up)*gate`) | 279.4 |
+
+⇒ 生产融合的 A 语义**既不是**`silu(gate)*up`**也不是**交换版——真实布局还与 w1 的融合/分片顺序
+（`w13_num_shards=2`）相关，需要读权重融合侧的排列才能钉死。
+
+**定格决策**：wmajor 路线**停在 NO-GO**。理由不是"没试"，而是：
+① 隔离 1.34×（w13 形状）**已在服务三明治门实测为 −1.8%/−1.1%**（真实路由间接 gather）；
+② w2 融合语义未对齐，且即便对齐，其隔离增益也只有 1.03×；
+③ 继续的上限 ≈−4~6% prefill，且已有一次"隔离收益未兑现"的反例。
+阀门 `VLLM_SM70_MOE_PREFILL_WMAJOR` **保持默认关**，代码留档（`d95e7783cc`），生产内核不变。
