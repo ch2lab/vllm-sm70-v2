@@ -20427,3 +20427,18 @@ weight-major wmma(33.5 封顶)、形状(chunk 8K↔32K 平坦 41.1–41.5)、反
 + 高效 smem staging"的从零 GEMM**。这需要：自写 A/B 片段布局（sm70 无 ldmatrix）、swizzle 防
 bank 冲突、双缓冲深流水、k-split 收尾。生产内核的 vema 原型与本次全部有界实验都无法在此会话内
 完成该工程量（数天级），且完成后仍需过同场质量门（canary/recall/secret/0-Xid）。
+
+### (61) 手写 mma.m8n8k4 weight-major 原型：跑通（28.8 TF/s）但**未位等**，片段装配需校准（2026-11-06）
+
+`/data/sm70_results/screens/wm_mma_proto.py`：CTA=128×128，8 warp（4×2），每 warp 32×64=8 组
+`mma.sync.aligned.m8n8k4` 累加器（64 float/lane），smem staging（A/B 各 [128][32+pad]，16B 向量化），
+epilogue 直接抄 `sm70_nvfp4_qpn2.cu:963-1000` 的 lane→(row,col) 映射。
+
+**实测**：`9.558 ms / 28.8 TF/s（23.4% 峰值）`，`max|d| = 19.3`（对 cuBLAS bmm）——**非位等**。
+最小探针（E=1,M=N=128,K=16）显示输出与参考既非行/列置换也非转置，数值量级相近但位置错乱
+⇒ **A/B 片段装配语义有误**：生产内核的用法（每 lane 持一整行 16 个 k、4 次 mma 共享 8 个累加器、
+quadpair 决定列组）与 PTX 标准 m8n8k4 的"2 行 × 2 k/lane"布局不同，需以生产内核为唯一参考逐位校准。
+
+**结论**：原型骨架（大 M tile + 手写 mma + smem staging + 正确 epilogue）已就位，卡在片段映射校准；
+这正是 (60)/`sm70/28_moe_prefill_rewrite_plan.md` 里预估的核心工作量。当前状态**不可用**（不位等），
+已留在 screens/ 未接入任何生产路径。
