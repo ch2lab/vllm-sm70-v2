@@ -20876,3 +20876,19 @@ decode 测量必须让输出 token 数 ≫ prefill（如 8K+1024）。
 
 **结论**：DFlash 要可用 ≈ 移植 ~1500 行，不是配置/小修能解决的；即使修好，AL 4.0→~5.9 也只是
 单流 152→~225 tok/s（仍距 487 约 2.2×）。⇒ 该路线按"大工程"立项，不作为近期小步快跑项。
+
+### (82) decode 归因：进程内 + cudaProfilerApi 的精确取窗（2026-11-07 02:43–02:51）
+
+按秒切窗不可信（阶段边界会把 prefill/capture 混进来）。改为：
+`profile_inproc.py`（进程内 LLM API）+ `nsys --capture-range=cudaProfilerApi`，
+只捕获被 `cudaProfilerStart/Stop` 包住的那一次 `generate`。
+
+**首次结果仍被 prefill 污染**：窗口内出现 `BatchPrefillWithPagedKVCacheKernel`、
+`gdn_forward_vlk_varlen`（prefill 变体）、`cutlass_...s884gemm`，而
+**没有任何 decode 注意力/XQA 内核**（只有 `_prepare_decode_inputs_kernel` 0.9 ms）。
+⇒ 第二次 `generate` 没命中前缀缓存（`cached_tokens=0`），窗口里是一次完整 prefill。
+
+**已加校验**：脚本现在打印 `cached_prompt_tokens`，为 0 时显式告警，禁止把该 trace
+当作 decode 归因。下一次必须先看到 `cached_prompt_tokens > 0` 再读数。
+（构建期的坑：进程内脚本需要手工 export `FLASHINFER_ALLOW_SM70=1`、`VLLM_KV_CACHE_LAYOUT=HND`，
+否则在 sm70 上重演 `FlashInfer requires sm75`。）
