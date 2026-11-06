@@ -837,10 +837,13 @@ def paged_decode_fp8(q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,
     lut = _fp8_lut(kv_u8.device, kv_dtype)
     mod = _mod_xqa_fp8(H, HQ)
     mod.prepare()
+    # The pybind binding does not expose C++ default arguments, so every
+    # parameter must be passed: q0 and nqt close the 19-argument signature
+    # (the fp16 caller already does this).
     mod.run(q.contiguous(), kv_u8, block_table, kv_lens, workspace, out,
             float(k_scale), float(v_scale), float(sm_scale), int(splits),
             int(window), R, None, lut, kv_u8.stride(1), kv_u8.stride(2),
-            int(kv_u8.size(2)))
+            int(kv_u8.size(2)), 0, 1)
 
 
 def paged_decode_fp16(q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,

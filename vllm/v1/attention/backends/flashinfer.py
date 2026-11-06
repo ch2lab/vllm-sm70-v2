@@ -1536,12 +1536,23 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             _ratio = self.num_qo_heads // self.num_kv_heads
             _rp = 1 << (_ratio - 1).bit_length()
             # The split count is ceil(SM*SF/(R*H)); the small-R regime needs
-            # ~SM*SF entries (plus rounding slack R*H <= max_num_reqs*H), so
-            # the sm_count term must be scaled by the split factor.
+            # ~SM*SF entries (plus rounding slack R*H <= R_max*H), so the
+            # sm_count term must be scaled by the split factor.
+            # R is the decode query row count. Cudagraph padding can raise it
+            # above max_num_reqs (an explicit --cudagraph-capture-sizes ladder
+            # is not bounded by max_num_seqs), and spec decode multiplies it
+            # by the verify width.
+            _row_bound = max_num_reqs
+            _cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
+            if _cg_sizes:
+                _row_bound = max(_row_bound, max(_cg_sizes))
+            _spec = self.vllm_config.speculative_config
+            if _spec is not None:
+                _row_bound *= _spec.num_speculative_tokens + 1
             self._sm70_ws = torch.empty(
                 (
                     self._sm70_sm_count * _SM70_FD_SPLIT_FACTOR
-                    + max_num_reqs * self.num_kv_heads
+                    + _row_bound * self.num_kv_heads
                 )
                 * _rp
                 * (self.head_dim + 2),

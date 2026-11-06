@@ -162,27 +162,20 @@ def _shadow_block_maps(
     ``ceil(kv_len_r / N)`` blocks starting at ``indptr[r]`` (identity block
     table, see ``sm70_shadow_plan_tensors``).
     """
-    if not hasattr(_shadow_block_maps, "_cache"):
-        _shadow_block_maps._cache = {}
-    key = (B_s, tuple(kv_lens.tolist()), N)
-    hit = _shadow_block_maps._cache.get(key)
-    if hit is not None and hit[0].device == device:
-        return hit
-    if len(_shadow_block_maps._cache) > 64:
-        _shadow_block_maps._cache.clear()
+    # Device-only: this runs inside CUDA graph capture for the decode and for
+    # the DFlash2 draft, where a host loop (kv_lens.tolist()/.item()) is
+    # illegal. Block j belongs to the request whose cumulative block count
+    # first exceeds j, and its first token is j minus that request's block
+    # base, times N.
+    dev = kv_lens.device
+    nb = (kv_lens + (N - 1)) // N
+    cum = torch.cumsum(nb, 0)
     num_reqs = kv_lens.shape[0]
-    sreq = torch.zeros(B_s, dtype=torch.int32)
-    st0 = torch.zeros(B_s, dtype=torch.int32)
-    base = 0
-    for r in range(num_reqs):
-        nb = (int(kv_lens[r].item()) + N - 1) // N
-        if nb > 0:
-            sreq[base : base + nb] = r
-            st0[base : base + nb] = torch.arange(nb, dtype=torch.int32) * N
-        base += nb
-    entry = (sreq.to(device), st0.to(device))
-    _shadow_block_maps._cache = {key: entry}
-    return entry
+    j = torch.arange(B_s, dtype=torch.int64, device=dev)
+    sreq = torch.searchsorted(cum, j, right=True).clamp_(max=num_reqs - 1)
+    starts = torch.where(sreq > 0, cum[sreq - 1], torch.zeros_like(j))
+    st0 = ((j - starts) * N).to(torch.int32)
+    return sreq.to(torch.int32), st0
 
 
 def sm70_nvfp4_paged_dequant(
@@ -214,6 +207,11 @@ def sm70_nvfp4_paged_dequant(
 
     B_s = out.shape[0]
     sreq, st0 = _shadow_block_maps(B_s, kv_lens, N, kv_cache.device)
+    if sreq.device != kv_cache.device:
+        # Host kv lengths (prefill metadata): stage through pinned memory so
+        # the copy stays legal inside CUDA graph capture.
+        sreq = sreq.pin_memory().to(kv_cache.device, non_blocking=True)
+        st0 = st0.pin_memory().to(kv_cache.device, non_blocking=True)
     if os.environ.get("VLLM_SM70_SHADOW_DEBUG") == "1":
         try:
             _bmax = int(block_table.max().item())
@@ -726,10 +724,18 @@ def sm70_fp8_paged_dequant(
         base = torch.cumsum(nb, 0) - nb
         sreq, st0 = _shadow_block_maps(B_s, kv_lens, PAGE, kv_cache.device)
         last = torch.where(kv_lens % PAGE == 0, PAGE, kv_lens % PAGE)
-        toks = torch.full((B_s,), PAGE, dtype=torch.int32)
+        toks = torch.full((B_s,), PAGE, dtype=torch.int32,
+                          device=kv_lens.device)
         _has = nb > 0
-        toks[(base + nb - 1)[_has]] = last[_has]
-        toks = toks.to(kv_cache.device)
+        toks[(base + nb - 1)[_has]] = last[_has].to(torch.int32)
+        # The prefill metadata hands us host kv lengths, and this helper is
+        # reached inside CUDA graph capture by the DFlash2 draft. A plain
+        # .to(device) is refused there, but a pinned source is the sanctioned
+        # async path, so stage through pinned memory when the maps are host.
+        if toks.device != kv_cache.device:
+            toks = toks.pin_memory().to(kv_cache.device, non_blocking=True)
+            sreq = sreq.pin_memory().to(kv_cache.device, non_blocking=True)
+            st0 = st0.pin_memory().to(kv_cache.device, non_blocking=True)
 
     if os.environ.get("VLLM_SM70_SHADOW_PTR") == "1":
         import sys as _psys

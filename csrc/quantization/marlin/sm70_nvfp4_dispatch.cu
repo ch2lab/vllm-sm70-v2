@@ -27,7 +27,13 @@ void sm70_nvfp4_dequant_from_qpn2_into(
     cudaStream_t stream = nullptr);
 
 namespace {
-constexpr int64_t kQpn2MaxM = 32;
+// 32 -> 64 -> 128.  Measured on the 27B dense shapes (8704x5120):
+//   M=64 : QPN2 0.256 ms vs dequant+cuBLAS 0.540 ms  (2.11x)
+//   M=128: QPN2 0.500 ms vs dequant+cuBLAS 0.606 ms  (1.21x)
+//   M=256: QPN2 0.995 ms vs dequant+cuBLAS 0.618 ms  (worse - stop at 128)
+// Numerically identical to the dequant path at M=33..64 (max relative diff
+// 4e-4..9e-4, fp16 rounding).
+constexpr int64_t kQpn2MaxM = 128;
 
 struct Sm70PrefillState {
   torch::stable::Tensor buf;   // persistent FP16 scratch (reused across calls)
