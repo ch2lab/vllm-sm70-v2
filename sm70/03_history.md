@@ -20607,3 +20607,23 @@ n 列 ⇒ **8× 冗余反量化**。改为**每 CTA 协作反量化一次 B 面�
 3. 修完后再看上限：w13 占 MoE 55%、MoE 占 prefill 23.4% ⇒ **上限 ≈ −9% × 转化率**。
 
 `mtiles` 已回滚为 4（阀门默认关，不影响生产）。
+
+### (70) 平坦 tile 工作队列尝试：均匀 1.27×、偏斜仍 0.94× 且正确性回归 → 回滚（2026-11-06）
+
+按 (69) 的归因实现"每专家 tile 数 ceil(rows_e/BM) + 前缀和 offsets + CTA 用 blockIdx 直接索引"：
+- `wmajor_offsets_kernel`（256 线程：每专家二分出其 route 行区间、算 tile 数、线程 0 前缀和）
+- 主内核改为 `grid=(n_tiles, tiles_upper)`，`blockIdx.y` → 二分 offsets → (expert, tile)，无 grid-stride
+- 静态 scratch（3×(E+1) int，cudaMalloc 一次）规避 stable-ABI 无 tensor 工厂
+
+**结果**（同进程、同形状）：
+| 路由 | production | wmajor(平坦队列) | 比 | parity |
+|---|---|---|---|---|
+| 均匀 | 7.383 | 5.831 | **1.27×** | 0.125 ✓ |
+| 偏斜 skew=2 | 6.915 | 7.262 | 0.95× | **348.8 ✗** |
+| 偏斜 skew=3 | 6.928 | 7.400 | 0.94× | **424.9 ✗** |
+
+⇒ 平坦队列在偏斜下**正确性回归**（多 tile 专家的 t→(e,tile) 映射或行区间有误）**且速度仍未改善**
+（0.94–0.95×）。已 `git checkout` 回滚到 (69) 的已知良好版本（mtiles=4 + grid-stride，parity 0.125）。
+
+**结论**：偏斜路由下的负载不均是这套 per-expert 设计的内生缺陷；加上此前 3 次服务门与 11 条关闭路径，
+**prefill 的 weight-major 路线到此终结**（阀门默认关、代码留档、生产内核不变）。
