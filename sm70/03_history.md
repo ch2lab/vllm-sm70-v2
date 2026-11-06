@@ -20411,3 +20411,19 @@ nvfp4 路径未做到位等，`max|d|` 非零，但两条路径执行的是同�
 weight-major wmma(33.5 封顶)、形状(chunk 8K↔32K 平坦 41.1–41.5)、反量化(Fp16B 更慢)。
 生产内核在 sm70 上已是这套算法族的实用上限，剩余 1.6×（cuBLAS 66 vs 41）需要 cuBLAS 级
 从零 GEMM（sm70 无 ldmatrix，多天工程）。
+
+### (60) MoE prefill 33.5% 的机制解释（收口）：**16 行的 M 维 tile 太小**，B 的装载/发射摊不掉（2026-11-06）
+
+把已测数据拼起来可得一致解释：
+- 生产内核每个 CTA 处理 **16 个 token**（kMoeBlockM=16）× WIDE=256 列。每个 k-group（16 个 k）里，
+  B 面板要供 16 行用 → **B 的复用次数只有 16**；mma:load 比 ≈ 2（4 次 mma 换 8 个 B 寄存器/组）。
+- 我按"weight-major + 128 行 tile"写的 wmma 原型把 M 提到 128（复用 8×），但 wmma 的
+  `load_matrix_sync` 把收益吃回去（33.5 vs 41.2）。
+- 形状维度已排除：chunk 8K→32K（每专家 256→1024 token）效率**完全平坦**（41.1→41.5），
+  说明**不是 L2 复用不足**，而是**每个 CTA 内部的 B 装载/发射开销**（16 行时 B 摊到每行的成本最高）。
+- 反量化路径已排除（Fp16B 更慢）；占用率已排除（9.2× 劣化）；tiling/启动器已排除（≤3.7%）。
+
+⇒ 唯一自洽的结论：**要拿到 cuBLAS 的 66 TF/s，必须是"大 M tile（128/256 行）+ 手写 mma.m8n8k4
++ 高效 smem staging"的从零 GEMM**。这需要：自写 A/B 片段布局（sm70 无 ldmatrix）、swizzle 防
+bank 冲突、双缓冲深流水、k-split 收尾。生产内核的 vema 原型与本次全部有界实验都无法在此会话内
+完成该工程量（数天级），且完成后仍需过同场质量门（canary/recall/secret/0-Xid）。
