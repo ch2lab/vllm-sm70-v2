@@ -1163,7 +1163,7 @@ def paged_decode_fp8(q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,
     if nqt > 1:
         R = q.shape[0] // nqt
         base = kv_lens - (nqt - 1)
-        if os.environ.get("VLLM_SM70_XQA_PAIR") == "1" and nqt % 2 == 0:
+        if os.environ.get("VLLM_SM70_XQA_PAIR") == "1":
             from vllm.v1.attention.ops.sm70_nvfp4_dequant import _fp8_lut
 
             R_, HQ_, D_ = q.shape[0] // nqt, q.shape[1], q.shape[2]
@@ -1181,6 +1181,15 @@ def paged_decode_fp8(q, kv_cache, block_table, kv_lens, out, k_scale, v_scale,
                          float(sm_scale), int(splits), int(window), R_, None,
                          lut_, kv_u8_.stride(1), kv_u8_.stride(2),
                          int(kv_u8_.size(2)), 0, nqt)
+            if nqt % 2:   # odd verify width: the last row is not in a pair
+                tail = torch.empty(R, q.shape[1], q.shape[2],
+                                   dtype=out.dtype, device=out.device)
+                paged_decode_fp8(
+                    q[nqt - 1::nqt].contiguous(), kv_cache, block_table,
+                    base + (nqt - 1), tail, k_scale, v_scale, sm_scale,
+                    window, splits, workspace, kv_dtype=kv_dtype,
+                )
+                out[nqt - 1::nqt] = tail
             return
         for p in range(nqt):
             out_p = torch.empty(R, q.shape[1], q.shape[2], dtype=out.dtype,
