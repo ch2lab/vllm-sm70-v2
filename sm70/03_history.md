@@ -21144,3 +21144,23 @@ prof_none.csv: kernel,count,cuda_us      (0 行)
 ⇒ decode 的 per-kernel 归因在本环境**不可得**。后续只能在两条项目级路线里选：
 **多行 verify 注意力**（上限 +8.5%，需 ~300 行 WMMA 重写，风险已由 RowTiles=4 证明）
 或 **DFlash2 speculator 移植**（~1500 行，决定 487 的上限）。
+
+### (95) 双位置 verify 注意力的实现尝试：发现"每位置 kv_len 不同"，非单纯复制状态（2026-11-07 04:4x）
+
+按 reviewer 判据实际动手：从 `decode_xqa16` 派生 `decode_xqa16_pair`（2× sQ、2× sSp/sP/sM/sL/sA、
+`o[2][2]`、写回槽位 `r*nqt+q0+pp`），并加 `run_pair` 绑定；smem 40.3 KB/block → 2 blocks/SM ✓。
+
+**实现中发现设计漏项**：verify 的每个位置有**不同的因果长度**——
+Python 侧现在是 `base + p`（`base = kv_lens - (nqt-1)`），每个位置单独传一个 kv 长度张量。
+内核只读一次 `kvlens[r]`，并由它推导 `t0/t1/nst`（扫描块数与 mask 上界）。
+
+两位置合并后必须：
+1. 用**最大**长度（`kv_len+1`）算 `nst/t1`，否则第二个位置漏最后一个 token；
+2. commit（`gtok < t1`）与 softmax（`at < t1`）的边界改成**逐位置** `t1 - 1 + pp`；
+3. `np`（活跃分区数）也要按最大长度取，避免 pp=1 的尾块被跳过。
+
+这不是"加第二份 sQ 与 score 状态"能覆盖的：mask/循环边界要参数化到 pp，
+属于内核语义改动；做错会静默算错（元素级校验能抓到，但需要多轮编译-验证）。
+
+已在动手阶段停止并**完整回退**（`decode_xqa16_pair` 计数 0，`git status` 干净），
+没有把半成品留在树里。估计若继续，仍需 3–5 轮编译/校验，且上限仍是 +5~8%。
