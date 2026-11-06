@@ -20314,3 +20314,11 @@ weight-major megakernel**，属多小时的架构级工程，需单独立项与�
 GEMM 66.9 TF/s=54.4% 峰值，实测）对应 **≈9% 全量 prefill**，比按 250K 构成估的 6% 更大。
 Triton 在本机 sm70 上比 cuBLAS 慢 10.4×（3.1 vs 32.5 TF/s），**原型必须用 CUDA**；
 现有启动器旋钮（含 `--ab` 两遍臂）最多 3.7%，已扫尽。
+
+**(55) 追加：GDN prefill 的 Triton 回退臂也不可用**。`VLLM_SM70_GDN_CUDA=0`（回退 FLA Triton）
+在本机**启动即失败**：`To serve at least one request with the model's max seq len (262144),
+1.54 GiB KV cache is needed, which is larger than the ...`（Triton GDN 路径改变了显存画像，
+KV 池算不出来），随即 `Engine core initialization failed`。⇒ GDN 9.6% 的切片没有可用的
+A/B 路径，CUDA 内核是唯一形态。**流程教训**：屏测脚本在臂启动失败时 `exit 1` 会跳过回滚，
+把坏的 drop-in 留在服务上（本次服务卡在重启循环，手工清除后恢复 READY/29970MiB）；
+屏测脚本必须"先回滚再退出"。
