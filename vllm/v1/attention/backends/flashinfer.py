@@ -1559,13 +1559,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 dtype=torch.float32,
                 device=self.device,
             )
-            if self.enable_cuda_graph:
-                self._sm70_kvlens_pinned = torch.zeros(
-                    max_num_reqs, dtype=torch.int32, pin_memory=True
-                )
-                self._sm70_kvlens_dev = torch.zeros(
-                    max_num_reqs, dtype=torch.int32, device=self.device
-                )
+            # Allocated unconditionally: the eager decode path refreshes the
+            # same buffers (with --enforce-eager they used to be missing and
+            # every decode raised AttributeError).
+            self._sm70_kvlens_pinned = torch.zeros(
+                max_num_reqs, dtype=torch.int32, pin_memory=True
+            )
+            self._sm70_kvlens_dev = torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=self.device
+            )
 
         # SM70 NVFP4 shadow decode keeps all per-step state device-side
         # (kv lens buffer + static block table), so draft steps can refresh

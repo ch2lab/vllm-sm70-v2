@@ -20975,3 +20975,21 @@ profiler 里看不到，但会直接抬高步时间。这解释了 (83) 里"GPU 
 AR 2–5 · **其余 6–9 ms 仍未归因**（lm_head/采样/draft 前传/CPU 空隙）。
 ⇒ (85) 中"verify attention 是最大非 GEMM 项"不成立，它只有 12%；下一步应查 CPU 空隙与 draft 前传，
 而不是重写这个内核。
+
+### (87) eager vs CUDA graph：图是必需的（6.4×），CPU 假设被否定（2026-11-07 03:08–03:16）
+
+顺手修了一个真 bug：`--enforce-eager` 在本栈里**从来跑不起来**——
+`_sm70_kvlens_dev/_pinned` 只在 `if self.enable_cuda_graph:` 分支分配，eager 的 decode 路径却无条件使用，
+每个请求都抛 `AttributeError: 'FlashInferMetadataBuilder' object has no attribute '_sm70_kvlens_dev'`。
+已改为无条件分配（Python 侧，无需重编）。
+
+单变量对照（同 27B/TP4/fp8_e4m3/seqs8/调度 K）：
+
+| 场景 | 有图 | eager | 比值 |
+|---|---|---|---|
+| 8K 单流 | **152.3 tok/s** | 23.9 | **6.4×** |
+| 64K 单流 | 115.4 | 24.3 | 4.7× |
+| conc8 agg | 252.2 | 93.3 | 2.7× |
+
+⇒ 图捕获有效，decode **不是** CPU/发射受限；(86) 里"0.25 ms/次 Python 开销可能是 4 ms/步"的假设不成立。
+剩下的 6–9 ms 只能是 GPU 侧工作量，最大嫌疑是 **MTP draft 每步 3 次前传**（k=1→k=3 的步时间差 8.5 ms 支持这一点）。
