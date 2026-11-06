@@ -20892,3 +20892,25 @@ decode 测量必须让输出 token 数 ≫ prefill（如 8K+1024）。
 当作 decode 归因。下一次必须先看到 `cached_prompt_tokens > 0` 再读数。
 （构建期的坑：进程内脚本需要手工 export `FLASHINFER_ALLOW_SM70=1`、`VLLM_KV_CACHE_LAYOUT=HND`，
 否则在 sm70 上重演 `FlashInfer requires sm75`。）
+
+### (83) decode 归因仍未成功：命中缓存后，捕获窗口里依然没有 decode 注意力内核（2026-11-07 02:52–02:58）
+
+第二次 in-process profile 已确认缓存命中：`warm 1: cached_prompt_tokens=4800`、
+`PROFILED_DONE tokens=137 cached_prompt_tokens=4800`，报告也是新生成的（02:54:49，3.9 MB）。
+
+但窗口内容与上一次（prefill）**几乎逐项相同**：
+
+```
+gemm 1730.0 ms 51.0%   (s884gemm n=780, dequant n=1216)
+attn  872.2 ms 25.7%   (BatchPrefillWithPagedKVCacheKernel n=68)
+gdn   423.0 ms 12.5%   (gdn_forward_vlk_varlen n=192)
+coll  240.7 ms  7.1%   (AllReduce n=528)
+```
+
+且**仍然没有任何 decode 注意力内核**（只有 `_prepare_decode_inputs_kernel` 0.9 ms）。
+137 token ≈ 34 步 × 16 个全注意力层 = 544 次调用，而实际只有 68 次 —— 差 8 倍，
+说明捕获窗口并不覆盖完整 decode（或 nsys 未捕获 worker 的图内内核）。
+
+**结论**：nsys + cudaProfilerApi 这条路径在本引擎上无法给出可信的 per-op decode 分解。
+上面这组 51/26/12.5/7 的分法**不可用**，不得据此改内核。下一步需要换工具
+（引擎内 torch.profiler，或对 GDN/verify-attention 做独立微基准），而不是继续调 nsys 参数。
