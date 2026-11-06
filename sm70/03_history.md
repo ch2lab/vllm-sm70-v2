@@ -20244,3 +20244,27 @@ prefill +5.8%、decode +49%（MTP）。TP8 当前锚 8687 / 109.6 / conc8 404.7�
 prefill +22%、decode +11%，conc8 总量 −4.7%（卡数减半下预期）。本机 4 卡为**全 NV2**（nvidia-smi
 topo 实测），无 NV1 瓶颈。主机脚本 `/root/run/serve_flashnext_tp4.sh`（备份 `.bak_pre_cg32_20261106`），
 未动任何 csrc/kernel，Q36 适配与 RSCALE 优化（52）不受影响。
+
+### (54) Q36 decode 余量普查：gemmSN 归因（cuBLAS 小 M GEMV 走 fp32）但被 Flash-Next-only contract 挡住 → 臂空转，NO-GO 回滚（2026-11-06）
+
+**归因（trace 精确计数）**：`gemmSN_TN_kernel<float,128,16,...>` 5490 次与
+`fused_recurrent_gated_delta_rule_packed_decode_kernel` **1:1**（每 GDN 层一次）。
+离线复现：fp16 输入的 (8,2048)×(64,2048) `F.linear` 也走该内核——cuBLAS 对小 M
+的 fp16 矩阵乘选 **GEMV 路径并内部转 fp32**（`cublasGemvTen...`），图计时 19.8µs(M=8)，
+而 M≥16 才换快内核（7.2µs）。对象 = GDN 的 `in_proj_ba`（Q36 为 64×2048 fp16，
+仓内 plan 表只有 Flash-Next 的 24×2560）。
+
+**离线原型**：4 行/程序的 Triton fp16 GEMV（grid (N, ceil(R/4))，一次权重读取喂 4 行），
+M=4/8 图计时 3.7/4.7µs vs cuBLAS 11.2/19.8µs（3.0×/4.2×），位精确；M=16/32 cublas 反超
+（7.2/6.4µs）→ 窗口只取 4..8。
+
+**服务门结果（空转，NO-GO）**：臂 conc8 288.4 / conc16 361.3 vs 基线1 289.7/370.3、
+基线2 290.6/366.1（双失）；recall 9/9、secret 6/6、0 新 Xid。**根因**：
+`enable_qwen38_sm70_fp16_gemv` 的 `_exact_runtime_contract` 只接受 Flash-Next 架构
+（hidden 2560/48L/512E/top10/moe640/tp4-8），Q36（2048/40L/256E/top8/TP1）被拒 →
+模块补丁未打上 → 阀开也无人调用，对比为空转。**已回滚**（备份
+`backups/sm70_fp16_gemv.py.pre_batchrows_20261106`），无残留。
+
+**结论与边界**：Q36 decode 的这块余量（30×~15µs/step ≈ 1.6%@conc8）只有通过
+**为 Q36 单独扩展 contract + 只登记 (64,2048) 一个 plan** 才能拿到，上限 1.6%（conc16 无收益，
+rows=16 已落在 cublas 快路径）；属于"低收益、需新质量门"的候选，暂不启动。

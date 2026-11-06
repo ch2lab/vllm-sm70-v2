@@ -9,12 +9,13 @@ Requires VLLM_TORCH_PROFILER_DIR in the service env (else /start_profile 404).
 import json
 import statistics
 import threading
+import os
 import time
 import urllib.request
 
 BASE = "http://127.0.0.1:8001"
 KEY = open("/root/.vllm_api_key").read().strip()
-CONC = 8
+CONC = int(os.environ.get("CONC", "8"))
 PROMPT_TOK = 2048
 MAX_TOK = 512
 WINDOW_S = 4.0
