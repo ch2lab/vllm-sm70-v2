@@ -1869,7 +1869,8 @@ __global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
     const int32_t* __restrict__ expert_ids,
     const int32_t* __restrict__ num_tokens_past_padded,
     const float* __restrict__ topk_weights, const float* __restrict__ global_scale,
-    int n, int k, int m, int top_k, bool mul_topk_weights, int block_m) {
+    int n, int k, int m, int top_k, bool mul_topk_weights, int block_m,
+    bool fuse_act) {
   extern __shared__ char smem_raw[];
   __half (*sA)[WMAJ_BK + WMAJ_PAD] =
       reinterpret_cast<__half (*)[WMAJ_BK + WMAJ_PAD]>(smem_raw);
@@ -1939,9 +1940,18 @@ __global__ __launch_bounds__(WMAJ_THREADS, 1) void nvfp4_qpn2_moe_wmajor_kernel(
       for (int i = tid; i < WMAJ_BM * WMAJ_BK / 8; i += WMAJ_THREADS) {
         const int r = (i * 8) / WMAJ_BK, c = (i * 8) % WMAJ_BK;
         uint4 v = make_uint4(0, 0, 0, 0);
-        if (s_sid[r] >= 0)
-          v = *reinterpret_cast<const uint4*>(
-              &input[(size_t)s_tok[r] * k + k0 + c]);
+        if (s_sid[r] >= 0) {
+          const size_t base = (size_t)s_tok[r] * (fuse_act ? 2 * k : k) + k0 + c;
+          const uint4 g = *reinterpret_cast<const uint4*>(&input[base]);
+          if (fuse_act) {
+            // Same helper as the production kernel: fp32 silu rounded to fp16,
+            // then multiplied by up and rounded once more (bit-exact).
+            const uint4 u = *reinterpret_cast<const uint4*>(&input[base + k]);
+            v = qpn2::qpn2_act_pair(g, u);
+          } else {
+            v = g;
+          }
+        }
         *reinterpret_cast<uint4*>(&sA[r][c]) = v;
       }
       {  // cooperative nvfp4 -> fp16 dequant of this CTA's B panel (once)
@@ -2027,7 +2037,10 @@ void sm70_nvfp4_qpn2_moe_gemm_wmajor(
   const int n = static_cast<int>(out.size(1));
   const int k = static_cast<int>(input.size(1));
   const int m = static_cast<int>(input.size(0));
-  STD_TORCH_CHECK(!fuse_act, "wmajor kernel does not fuse act yet");
+  if (fuse_act) {
+    STD_TORCH_CHECK(input.stride(0) == 2 * static_cast<int64_t>(k),
+                    "wmajor fused activation needs a 2k row stride");
+  }
   // Each CTA walks the expert's row-tiles with a grid-stride loop, so the grid
   // stays small no matter how skewed the routing is (a full-slot upper bound
   // here would launch ~500k mostly-idle CTAs and measured 0.47x).
@@ -2051,7 +2064,7 @@ void sm70_nvfp4_qpn2_moe_gemm_wmajor(
       reinterpret_cast<const int32_t*>(num_tokens_past_padded.data_ptr()),
       reinterpret_cast<const float*>(topk_weights.data_ptr()),
       reinterpret_cast<const float*>(global_scale.data_ptr()),
-      n, k, m, (int)top_k, mul_topk_weights, (int)moe_block_size);
+      n, k, m, (int)top_k, mul_topk_weights, (int)moe_block_size, fuse_act);
 }
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, sm70_nvfp4_qpn2_ops) {
