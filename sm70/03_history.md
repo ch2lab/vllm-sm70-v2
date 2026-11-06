@@ -20298,3 +20298,19 @@ MoE 占 prefill 12.7%，即使效率翻倍也只剩 **~6% 全量 prefill**。
 （dense 2% + MoE 6% + 其它），且全部需要内核重写；**唯一 >5% 的单项是 MoE
 weight-major megakernel**，属多小时的架构级工程，需单独立项与质量门。decode 侧
 已在上限附近（MoE 80% HBM 地板、fp8 95–96% cuBLAS、xqa 已优化 5.6%）。
+
+**(55) 追加：65K 尺子 prefill 真实构成（不是 250K 的构成）** —— 80.3K-token prefill 的 torch profile
+（`/data/sm70_results/q36_prefill65`，GPU busy 22.95s）：
+
+| 内核 | 65K 占比 | 250K 占比（旧） |
+|---|---|---|
+| **nvfp4_qpn2_moe_wide** | **23.4%**（960 次 × 5.60ms） | 12.7% |
+| dense GEMM（cutlass 128×128 + volta 128×128 + 256×128 + tn 合计） | 42.7% | 55.6% |
+| fused_softmax（reg 12.0% + gen 1.7%） | 13.7% | 21% |
+| **gdn_forward_vlk_varlen** | **9.6%**（360 次 × 6.10ms） | 4.7% |
+| 其余（fused_update/conv1d/moe_sum…） | ~5.5% | ~5% |
+
+⇒ **MoE 在官方尺子形状上是第一大内核**（23.4%），weight-major 调度上界 1.63×（cuBLAS 分批
+GEMM 66.9 TF/s=54.4% 峰值，实测）对应 **≈9% 全量 prefill**，比按 250K 构成估的 6% 更大。
+Triton 在本机 sm70 上比 cuBLAS 慢 10.4×（3.1 vs 32.5 TF/s），**原型必须用 CUDA**；
+现有启动器旋钮（含 `--ab` 两遍臂）最多 3.7%，已扫尽。
