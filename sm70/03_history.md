@@ -21033,3 +21033,24 @@ fp16 = 1.56 GB）。每步 3 次 draft 前传 ⇒ 这个 1.56 GB 的头被**三�
 ⇒ 下一步唯一正确的内核方向不是主模型，而是**受限候选头**：draft 只对少量候选（如 top-128）打分，
 而不是每次跑完整 151936 词表。这正是 1cat DFlash2 的 `selector_top_k=16` 设计；
 我们缺的四个组件（lookup/ngram_assist/sampler_graph/sparse_rejection）也正是这条链路。
+
+### (90) 更正 (89)：lm_head 在 TP4 下是分片的，候选头的前提不成立；测量再次受阻（2026-11-07 03:43–03:57）
+
+(89) 说"共享 lm_head 1.56 GB 被 3 次重读 ≈5.2 ms/步"是**错的**：TP4 下 lm_head 按词表分片，
+每卡 37984×5120 fp16 ≈ 390 MB ≈ 0.43 ms/次，3 次 ≈1.3 ms。因此**不能用这个数字去驱动"候选头"改造**。
+
+为了拿到 draft 前传的内部分解，改用短提示（1778 token）让前缀缓存 100% 命中，结果缓存始终不命中：
+
+```
+warm 0..5: cached_prompt_tokens=0
+prompt_tokens=1778 cached=0
+PARTIAL_CACHE - window still contains prefill, refusing
+```
+
+脚本按设计**拒绝**在含 prefill 的窗口上出数（这次没有产生任何错误结论）。
+
+**当前可信状态**：
+- 无投机 12.84 ms/步 ≈ 1cat 折算的 12.1 ms（可信）；
+- k=3 26.4 ms/步，投机开销 13.6 ms（可信）；
+- 单次 draft 前传 4.25 ms（由 k=1/k=3 斜率得出，可信）；
+- **draft 前传内部构成（lm_head vs 1 层 vs AR）未知** —— 候选头改造必须等这个数。
