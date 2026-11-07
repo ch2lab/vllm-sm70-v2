@@ -21903,3 +21903,28 @@ AR 侧同样接近地板，切片数 S 扫描（16 行，160 KB 载荷）：
 **结论**：conc8 剩下的 ~11 ms/步既不在 GEMM 也不在 AR。要继续收敛，需要
 (a) 进程内 profiler / nsys（本引擎均不可用），或 (b) 移植 1cat 的 V100 后端与 kernel 栈。
 在没有 (a) 的情况下继续盲改 kernel 属于猜，不再进行。
+
+### (124) 清理 1cat 移植 + nvfp4 KV 的真实状态（2026-11-07 15:00–16:10）
+
+**清理**：整块回退 1cat 的 DFlash/DFlash2 移植，回到 `99f01dacf1`；删除移植新增的 6 个模块；
+保留独立有价值的 3 项（flat AR 信封、逐形状回归测试、harness `--decode-no-prefix`）。
+相对移植前只剩 4 个文件（+398/−2）。回退后 27B + fp8_e4m3 + MTP 正常：**ready=1，AL 5.22**。
+
+为什么放弃移植：用"我们的 speculator + 唯一可移植件（bf16 模拟内核）"实测 **AL 1.04**，
+而整块移植是 3.62 ⇒ 收益来自整文件替换（及其 200 行适配、9 个共享文件耦合），
+不是来自某个可独立验证的技术点。与"最小化修改"冲突，故移除。
+
+**nvfp4 KV 的三条实测事实**（这是目标要求的默认口径）：
+
+| 配置 | 结果 |
+|---|---|
+| nvfp4 + `--enforce-eager` | **可用**：ready=1，AL 4.70 |
+| nvfp4 + FULL graph（默认） | **崩溃**：dmesg Xid 31 MMU fault ×4，日志 CUBLAS_STATUS_INTERNAL_ERROR |
+| nvfp4 + PIECEWISE graph | **挂起**：worker 无响应，EngineCore `dequeue` 超时 → `RuntimeError: cancelled` |
+
+⇒ 树里唯一验证过 nvfp4 的启动脚本 `run_sm70_nvfp4kv.sh` 正是 `--enforce-eager`。
+**nvfp4 KV 与 CUDA graph 从未一起工作过**，这是 nvfp4 默认口径的头号阻塞。
+
+**flat AR 回退**：引擎内（graph 显存 profile 阶段）在 n=409600（80 行）触发
+`flat AR launch rc=700` 并伴随 Xid 31；微基准复现不出。它只值 +2.9%（conc8 无缓存），
+故默认改回 NCCL（`QUASAR_NCCL_AR=0` 可opt-in），信封 `VALIDATED_N_MAX` 保留作二道防线。
