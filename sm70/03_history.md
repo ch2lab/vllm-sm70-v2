@@ -21783,3 +21783,28 @@ Python 侧 metadata 重建。尝试打开策略里的 `context_kv_graph`（把 c
 结论：DFlash2 在本树只有 **eager 草稿**这一条可用路径。要走 FULL graph 必须补
 `vllm/v1/attention/backends/flash_v100/`（1cat 树里 **10,728 行 / 23 文件**，另依赖
 `config/execution_policy.py` 878 行等），属于独立的移植周期，不在本次范围。
+
+### (120) DFlash2 移植后的全量回归：mtp / ngram 无退化（2026-11-07 13:23–13:37）
+
+整轮移植改动了共享文件（`spec_decode/speculator.py`、`cudagraph_utils.py`、
+`attention.py`、`vocab_parallel_embedding.py`、`models/utils.py`、`config/vllm.py`、
+`input_batch.py`、`block_table.py`、`config/speculative.py`），必须验证主路径未受影响。
+同一 harness、同一 salt、连续两臂：
+
+| 臂 | 8K | 64K | conc8 | 旧基线 |
+|---|---|---|---|---|
+| mtpsched | 243.4 | 156.0 | 288.1 | 243.6 / 155.2 / 287.9 |
+| ng32 | 696.2 | 422.3 | 174.9 | 698.9 / 417.0 / 173.0 |
+
+三项全部落在噪声内 ⇒ **移植无回归**。这也是当前可交付的基线：
+
+- **8K 单流 696.2 > 1cat 487**（lookup 友好内容 + 对方 70% 归一化口径，已注明）
+- **64K 单流 422.3 > 1cat 409**（微弱领先）
+- **conc8 288.1 vs 1cat 1224（4.25×，未达成）**
+
+**conc8 差距的定性归因**（本轮新增证据）：在 conc8 无缓存 A/B 中，DFlash2 每步约 81 ms，
+其中草稿侧仅约 13 ms（context KV 0.9 / metadata 1.3 / 前向+选择器 11.4），
+其余 ~68 ms 在目标模型的 verify 路径；而 DFlash2 每步提交 8 行只换来 AL 2.72，
+MTP 提交 2 行就有 AL 1.76。⇒ conc8 的瓶颈是**每行 verify 成本**，不是草稿质量。
+1cat 的 8 并发优势来自其 `FLASH_ATTN_V100` 长上下文后端（10,728 行），
+本树未移植，属独立周期。
