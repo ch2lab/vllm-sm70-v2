@@ -1289,6 +1289,11 @@ void sm70_nvfp4_qpn2_gemm(torch::stable::Tensor& out,
       qpn2::launch_qpn2<SPLIT, NACC, ROWS>(code_ptr, scale_ptr, input_ptr, \
                                           output_ptr, partials_ptr, n, k, m, \
                                           gs, ksplit, stream)
+  // Reverted from m<=32: with RowTiles=2 covering 17..32 rows the microbench
+  // still showed M24/M8 = 2.83 and M32/M8 = 3.37 (M16/M8 = 1.90), i.e. cost is
+  // linear in rows whether or not the row tiles share a CTA.  The kernel is
+  // therefore bound by per-row work (A loads + mma.sync.m8n8k4 issue), not by
+  // weight re-reads, so widening the tile buys nothing.
   bool two_tile = (m > qpn2::kQpn2RowsPerCta) && (m <= 16);
   if (two_tile && split_k == 8 && accumulator_chains == 1) {
     LAUNCH_QPN2(2, 8, 1);
