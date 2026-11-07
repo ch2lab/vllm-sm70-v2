@@ -21379,3 +21379,31 @@ quantized : (51.10 − 30.90)/12 = 1.68 ms / extra draft pass
 多个小内核融合成一个。
 
 已回退（`qwen3_5_mtp.py` 恢复、`sm70_rtn.py` 删除，`git status` 干净）。
+
+### (105) ngram（prompt-lookup）投机：8K 单流 243.2 → 550.3 tok/s，首次超过 1cat 的 487（2026-11-07 07:54–08:15）
+
+(104) 证明 MTP 草稿前传是延迟受限、每次 1.77 ms。1cat 的 `ngram_assist.py` 注释明确说它用的是
+"和 standalone vLLM ngram proposer 相同的 reverse-KMP 策略（最长后缀匹配、最早出现位置）"——
+而本树已有该实现：`vllm/v1/worker/gpu/spec_decode/ngram/speculator.py`（`NgramGPUSpeculator`，
+两个 Triton 内核，无模型前传、无需图捕获）。所以不必移植 1cat 的 500 行，直接用它。
+
+**配置**：`{"method":"ngram","num_speculative_tokens":k,
+"num_speculative_tokens_per_batch_size":[[1,2,k],[3,8,1]],"prompt_lookup_min":2,"prompt_lookup_max":5}`
+
+**同 harness 实测（27B/TP4/fp8_e4m3/seqs8，8K 提示为重复段落）**：
+
+| k | AL | 8K 单流 | 64K | conc8 |
+|---|---|---|---|---|
+| 12 | **13.00** | **526.0**（1.90 ms/token） | 350.4 | 177.1 |
+| 24 | **25.00** | **550.3**（1.82 ms/token） | 325.9 | 175.9 |
+
+⇒ **8K 单流 550.3 > 1cat 公布的 487**（同口径：单流、贪心、8K 上下文；我们在 4×V100 TP4 上）。
+
+**为什么这么快**：AL = k+1（每个草稿都被接受），而草稿成本≈0，所以
+`step = 12.84 + 1.36·k`；k=24 时 45.5 ms / 25 token = 1.82 ms/token，与实测完全吻合。
+理论上 k→∞ 时收敛到 1/1.36 = 735 tok/s（受每行 verify 成本限制）。
+
+**必须说清的口径**：该收益依赖"提示内容可被 lookup 命中"（8K 臂是重复段落，AL 100%）。
+在**随机词**提示上 ngram 的 AL 只有 1.0，conc8 因此从 MTP 的 287.9 掉到 175.9。
+⇒ 纯 ngram 不适合通用负载，正确形态是**混合**：低并发（bs≤2）用 ngram、高并发（bs≥3）用 MTP，
+用同一条 `num_speculative_tokens_per_batch_size` 调度（bs≤2→24、bs≥3→1）即可分派。
