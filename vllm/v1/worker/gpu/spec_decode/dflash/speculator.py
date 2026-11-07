@@ -141,11 +141,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_kv_cache_group_id: int = -1
         self._context_only_prefill_logged = False
         self._query_slot_mappings: torch.Tensor | None = None
-        self._debug_proposal_stages = bool(
-            vllm_config.observability_config.runtime_trace.dflash.value(
-                "proposal_stages"
-            )
-        )
+        _rt = getattr(vllm_config.observability_config, "runtime_trace", None)
+        _dflash_trace = getattr(_rt, "dflash", None)
+        if _dflash_trace is None:
+            # This tree has no observability_config.runtime_trace; use the
+            # standalone one, which reads QUASAR_TRACE_* for opt-in tracing.
+            from vllm.config.sm70_runtime import capture_runtime_trace
+
+            _dflash_trace = capture_runtime_trace().dflash
+        self._debug_proposal_stages = bool(_dflash_trace.value("proposal_stages"))
         self._debug_real_proposal = False
         self._debug_input_dump_count = 0
         self._tensor_dump = diagnostic_channel(
