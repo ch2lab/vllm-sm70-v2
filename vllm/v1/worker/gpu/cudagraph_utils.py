@@ -507,8 +507,12 @@ class CudaGraphManager:
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
-                    # Prepare inputs and get forward function
+                    # Prepare inputs and get forward function. A manager may
+                    # also return the attention state it captured; the graph
+                    # forward closes over it, so only the callable is needed.
                     forward_fn = create_forward_fn(desc, warmup=True)
+                    if isinstance(forward_fn, tuple):
+                        forward_fn = forward_fn[0]
 
                     # Warmup
                     forward_fn(CUDAGraphMode.NONE)
@@ -527,6 +531,8 @@ class CudaGraphManager:
                     else:
                         # Capture with fresh attention state.
                         forward_fn = create_forward_fn(desc, warmup=False)
+                        if isinstance(forward_fn, tuple):
+                            forward_fn = forward_fn[0]
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
                             continue

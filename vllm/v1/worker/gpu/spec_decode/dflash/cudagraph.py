@@ -96,6 +96,9 @@ class DFlashCudaGraphManager(CudaGraphManager):
     ) -> None:
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
+            # This tree's CudaGraphManager.capture() distinguishes warmup from
+            # capture; the DFlash path builds identical state either way.
+            warmup: bool = False,
         ) -> tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
