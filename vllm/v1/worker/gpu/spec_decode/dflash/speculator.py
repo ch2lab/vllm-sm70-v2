@@ -817,7 +817,16 @@ class DFlashSpeculator(DraftModelSpeculator):
                 )
 
             self._debug_proposal_stage("query preparation end")
-            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # The FULL graph replays metadata frozen at capture time. It is only
+            # usable when _refresh_draft_graph_metadata updated that state for
+            # this step; otherwise (e.g. FLASHINFER cannot update in place) the
+            # rebuilt metadata below would be ignored and the draft would attend
+            # to a stale context, accepting nothing.
+            if (
+                batch_desc.cg_mode == CUDAGraphMode.FULL
+                and draft_attn_metadata is None
+                and draft_slot_mappings_by_layer is None
+            ):
                 assert self.query_cudagraph_manager is not None
                 self.query_cudagraph_manager.run_fullgraph(batch_desc)
             else:
@@ -827,7 +836,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     draft_attn_metadata,
                     draft_slot_mappings_by_layer,
                     num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 )
 
         self._debug_proposal_stage("query and selector end")
