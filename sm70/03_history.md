@@ -21492,3 +21492,28 @@ selector，验证侧**复用我们已有的双位置 XQA（已支持 nqt=7/11/13
 暂不移植 `sparse_rejection`/`sampler_graph`。风险：32 行/请求在并发下按我们实测
 2.56 ms/行会变成 ~176 ms/步，AL 必须 ≥5.5 才可能追平；所以**先等 1.5.2 同机基线的
 step/AL 实测**，用它反推他们的行成本，再决定是否值得这 4400 行。
+
+### (110) 1cat 1.5.2 同机基线：6 次尝试后停止，退回公布口径（2026-11-07 09:09–09:30）
+
+**结论：在我们这台机器上，用我们的 checkpoint 无法把他们的 1.5.2 跑起来**，六次尝试各自被一层配置错配挡住：
+
+| # | 原始报错 | 根因 | 处理 |
+|---|---|---|---|
+| a | `ImportError: /data/src/vllm-v2/vllm/_C_stable_libtorch.abi3.so: undefined symbol: torch_from_blob` | serve 在 `/data/src/vllm-v2` 下启动，`sys.path[0]` 把我们的树当 `vllm` 包 | `cd /root; unset PYTHONPATH` |
+| b | `nvfp4_gemm_sm70: input must be float16` | 目标 checkpoint 声明 bf16 | 目标 fp16 config 镜像 |
+| c | 同上 | `--hf-overrides` 不传给 draft model | — |
+| d | 同上 | 草稿模型也声明 bf16 | 草稿 fp16 config 镜像 |
+| e/f | 同上 | checkpoint 是 **W4A4**（`input_activations num_bits=4`），对方是 **W4A16** | 镜像里 `input_activations=None` |
+
+即使把目标与草稿都改成 fp16 + W4A16 镜像，**同一个错仍在 profile run 复现**，栈是
+`vllm/_sm70/linear.py: nvfp4 -> policy.call_n -> torch.ops nvfp4_gemm_sm70_out`：
+该 op 拿到的 `input` 仍然不是 fp16（我们无法在不改他们源码的前提下定位是哪个上游算子输出的 dtype）。
+
+**决定**：停止在对方栈上耗轮次。487 / 1224 继续按**公布口径**使用，并保留两条已知限定：
+① 它们按"接受率 70%"折算；② 与我们自己的数字不是同 harness 产出（我们 8K 698.9 是原始测量、~100% 接受率）。
+
+**副产物（可复用）**：
+- `/data/models/Qwen3.8-27B-QUASAR-NVFP4-fp16cfg`（dtype=fp16 + W4A16，权重符号链接）
+- `/data/models/Qwen3.8-27B-DFlash2-NVFP4-fp16cfg`
+- `/root/run/serve_1cat152_27b.sh`（他们的参考 argv）、`/data/sm70_results/bench_1cat152.sh`、`analyze_1cat152.py`
+- 经验：他们的 SM70 栈与"自家 checkpoint 的量化元数据"强耦合（W4A16 + fp16），外来 checkpoint 不能直接套用。
