@@ -18,17 +18,26 @@ class _Inert:
     def __bool__(self) -> bool:
         return False
 
+    def __int__(self) -> int:
+        return 0
 
-def bind_diagnostics(*args, **kwargs) -> None:
-    return None
-
-
-def diagnostics_for(*args, **kwargs) -> None:
-    return None
+    def value(self, name: str) -> int:
+        return 0
 
 
-def diagnostic_channel(*args, **kwargs) -> _Inert | None:
-    return None
+def bind_diagnostics(*args, **kwargs) -> "_Inert":
+    return _Inert()
+
+
+def diagnostics_for(*args, **kwargs) -> "_Inert":
+    # Callers do `diagnostics_for(cfg).sampling` and friends; the inert object
+    # keeps those chains valid while `__bool__` stays False so they still read
+    # as "diagnostics disabled".
+    return _Inert()
+
+
+def diagnostic_channel(*args, **kwargs) -> _Inert:
+    return _Inert()
 
 
 def write_payload(*args, **kwargs) -> None:

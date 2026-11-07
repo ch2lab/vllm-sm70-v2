@@ -962,7 +962,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
-        self._sampling_policy = vllm_config.speculative_config.sampling_policy
+        # This tree's SpeculativeConfig has no sampling_policy block; the only
+        # field used here is compact_aux_hidden, whose absence means off.
+        self._sampling_policy = getattr(
+            vllm_config.speculative_config, "sampling_policy", None
+        )
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
@@ -1068,8 +1072,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
 
     def get_aux_hidden_state_dtype(self) -> torch.dtype | None:
+        compact_aux_hidden = bool(
+            getattr(self._sampling_policy, "compact_aux_hidden", False)
+        )
         if (
-            not self._sampling_policy.compact_aux_hidden
+            not compact_aux_hidden
             or not self.model.use_aux_hidden_state
         ):
             return None

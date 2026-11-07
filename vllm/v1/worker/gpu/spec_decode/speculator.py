@@ -234,9 +234,14 @@ class DraftModelSpeculator(BaseSpeculator):
         self.acceptance_estimator: OnlineAcceptanceEstimator | None = None
 
         self.draft_logits: torch.Tensor | None = None
+        # 1cat's DFlash2 speculator reads this tuple to decide whether the
+        # dense compatibility buffer exists; keep it in sync with the eager
+        # allocation below.
+        self._draft_logits_init: tuple[torch.dtype, float] | None = None
         if self.speculative_config.draft_sample_method == "probabilistic":
             # Pre-temperature logits, cached from the previous decode step.
             dtype, fill = self.draft_logits_spec(vllm_config)
+            self._draft_logits_init = (dtype, fill)
             self.draft_logits = torch.full(
                 (
                     self.max_num_reqs,

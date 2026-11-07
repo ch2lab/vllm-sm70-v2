@@ -11,7 +11,11 @@ from __future__ import annotations
 
 class _TraceChannel:
     def value(self, name: str) -> int:
-        return 0
+        # Opt-in tracing: QUASAR_TRACE_PROPOSAL_STAGES=1 enables the ported
+        # DFlash2 token diagnostic without touching the speculator.
+        import os
+
+        return int(os.environ.get("QUASAR_TRACE_" + name.upper(), "0"))
 
     def __getattr__(self, name: str) -> "_TraceChannel":
         return _TraceChannel()
