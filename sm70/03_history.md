@@ -22049,3 +22049,22 @@ AR 侧同样接近地板，切片数 S 扫描（16 行，160 KB 载荷）：
 **nvfp4 KV + 256K maxlen** 下拿到的。原因：Flash-Next 走 QSA 的 page4 路径（内核内 nvfp4
 反量化），而 27B（非 QSA、D=128）只能落到慢的 Triton 内核 —— 这正是"D=128 专用快速内核"
 要补的东西。
+
+### (130) 27B 的 fp8_e5m2 三档吞吐 + D=128 内核的验证方法修正（2026-11-07 19:20–19:35）
+
+**27B / TP4 / MTP k=12 的 KV dtype 对照（同 harness、salt 9918）**：
+
+| KV dtype | 8K | 64K | conc8 |
+|---|---|---|---|
+| fp8_e4m3 | 243.5 | 155.8 | 288.1 |
+| **fp8_e5m2** | **245.0** | **156.4** | **278.8** |
+| nvfp4 | 43.4 | 6.7 | 未测 |
+
+⇒ e5m2 与 e4m3 在同一量级（差异在噪声内），两者都远好于 nvfp4 的 Triton 路径。
+
+**D=128 CUDA XQA：本轮的重要修正**。上一轮把它判为"运行期非法访问"，本轮定位到
+**测试构造本身是错的**：CUDA 内核按 split-plane 读 nvfp4
+（`kdata0 = kvh*(npg*KDD)`、`ksf0 = H*npg*KDD + kvh*(npg*KSD)`，数据区与尺度区分离），
+而我的对照脚本按 `[B,2H,N,F]`（每 token 行内 data+scale 交错）造 cache ⇒ 必然越界。
+所以"内核本身有 bug"这个结论**不成立**，真正缺的是：按生产 split-plane 布局构造 cache
+并逐元素对拍。内核改动已 `git checkout` 回退，不留半成品。
