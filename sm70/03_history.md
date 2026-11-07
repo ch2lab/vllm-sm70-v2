@@ -21858,3 +21858,14 @@ MTP 提交 2 行就有 AL 1.76。⇒ conc8 的瓶颈是**每行 verify 成本**�
 **性能结论**：flat AR 在 conc8 无缓存 A/B 为 591.0 vs NCCL 574.5（+2.9%），
 但在带 65k 前缀的完整臂上是 281.8 vs 288.1（−2.2%），8K/64K 持平。
 ⇒ **不把它设为默认**（默认仍 NCCL），env 保留供实验。
+
+**(122 续) 默认切换与端到端验证（14:11–14:24）**
+
+- MTP 复测（排除噪声）：8K 243.5 / 64K 155.8 / conc8 **287.6** vs NCCL 243.4/156.0/288.1 ⇒ **持平**
+- DFlash conc8（64 行，即注释所指形状）：**300.0 vs 286.8（+4.6%）**，AL 2.99
+- 因此把启动器默认改为 **flat**（`QUASAR_NCCL_AR=1` 可强制回 NCCL），并删除"flat 会非法访问"的过时注释，
+  改为记录实测与信封边界。
+- 端到端验证（默认配置、无任何 AR env）：日志出现
+  `SM70 flat AR: route ACTIVE (rank 0..3, world 4, cap 1048576 B, n_max 524288, region 8390656 B/rank, neighbours [1,2,3], SYS [])`，
+  请求正常完成，AL 5.22，**无 illegal access / 无信封拒绝**。
+- 启动器备份：`/data/sm70_results/serve_27b_quasar.flat_default.sh`。
