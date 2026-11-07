@@ -21407,3 +21407,26 @@ quantized : (51.10 − 30.90)/12 = 1.68 ms / extra draft pass
 在**随机词**提示上 ngram 的 AL 只有 1.0，conc8 因此从 MTP 的 287.9 掉到 175.9。
 ⇒ 纯 ngram 不适合通用负载，正确形态是**混合**：低并发（bs≤2）用 ngram、高并发（bs≥3）用 MTP，
 用同一条 `num_speculative_tokens_per_batch_size` 调度（bs≤2→24、bs≥3→1）即可分派。
+
+### (106) 混合 speculator（bs≤2→ngram、bs≥3→MTP）落地并首次实测（2026-11-07 08:29–08:45）
+
+**实现**：`vllm/v1/worker/gpu/spec_decode/hybrid/speculator.py` — `NgramMTPHybridSpeculator(MTPSpeculator)`，
+持有 `NgramGPUSpeculator` 子对象，`propose()` 按 `input_batch.num_reqs`
+（以及"本步是否含 prefill token"→ 强制走 MTP，保证 draft KV 被填充）分派；由环境变量
+`VLLM_SM70_HYBRID_NGRAM=1` 开启，阈值 `VLLM_SM70_HYBRID_NGRAM_MAX_REQS`（默认 2）。
+
+**踩到的坑**：`SpeculativeConfig` 对 `method != ngram` 的配置会在最后 `else` 分支把
+`prompt_lookup_min/max` **强制置 0**（`speculative.py:1325-1327`），导致 ngram 子对象断言
+`1 <= 0 <= 0` 失败。已在 hybrid 里用环境变量（`VLLM_SM70_HYBRID_LOOKUP_MIN/MAX`，默认 2/5）兜底。
+
+**首次实测**（同 harness，27B/TP4/fp8_e4m3，k=32 单流档 / k=1 并发档）：
+
+| 配置 | 8K 单流 | 64K | conc8 |
+|---|---|---|---|
+| 纯 MTP（k=12） | 243.2 | 156.1 | **287.9** |
+| 纯 ngram（k=32） | **698.9** | **417.0** | 173.0 |
+| **混合（bs≤2 ngram k=32 / bs≥3 MTP k=1）** | 641.2 | 398.2 | 271.1 |
+
+AL 证据：单流档出现 **33.00**（ngram 路径生效），并发档为 1.78/1.82（MTP 路径生效），分派正确。
+8K 641 vs 699 与 conc8 271 vs 288 的差需拆分（该次运行 prefill 也慢 4.7%，疑环境漂移；
+并发尾部 bs<3 时可能误走 ngram）。正在跑 `MAX_REQS=1`（只有 bs==1 走 ngram）与 `ng48` 两个臂判定。
