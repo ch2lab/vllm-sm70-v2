@@ -22403,3 +22403,8 @@ score cache）只在 dense、batch=1 前提下有意义，暂不移植。
 
 ⇒ 之前 90 µs vs 40 µs 的 2.2× 差距**全部来自发射开销**；图内我们的内核更快。
 **结论：#2 不移植**（移植还会引入混合 QKV 布局的数值风险）。
+
+**#1 的 e5m2 状态**：同一条字节路径启动 `FLASHNEXT_KV=fp8_e5m2` 仍失败 —— worker 在
+KV 初始化/捕获阶段以**空错误**死亡（`Worker failed with error ''`，随后 exit code None），
+无 OOM 记录、无 Triton 编译错误；e4m3 路径正常。⇒ e5m2 需要单独定位（大概率是
+page4/XQA 的 e5m2 分支或 KV 规格处），暂记为未完成项。
