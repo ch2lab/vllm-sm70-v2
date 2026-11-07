@@ -22017,3 +22017,35 @@ AR 侧同样接近地板，切片数 S 扫描（16 行，160 KB 载荷）：
 **能跑的组合**：Flash-Next + `QUASAR_TP=4` + `QUASAR_KV=fp8_e4m3` + `QUASAR_KV_LAYOUT=BLHNC`
 + `QUASAR_MAXLEN=131072` + `QUASAR_UTIL=0.90` → `Application startup complete`
 （四卡各约 30 GB）。
+
+### (129) Flash-Next：用**预测试 TP4 标准档**跑出三档（2026-11-07 19:12–19:35）
+
+**之前的问题是我的错**：我一直用 27B 的通用启动器自己拼参数（util 0.90/0.92/0.95、maxlen
+8192/98304），于是撞 `KV 池不够`、`QSA nvfp4 KV needs the page4-TP8 route` 等墙，并据此得出
+"TP4 不能用 nvfp4 / 256K 不可达"的**错误结论**。仓库里本来就有预测试的 TP4 标准档：
+`/root/run/serve_flashnext_tp4.sh` + systemd 单元 `vllm-flashnext.service`。
+
+**标准档关键参数**（与我自己拼的完全不同）：
+```
+--kv-cache-dtype nvfp4          --tensor-parallel-size 4
+--enable-expert-parallel        --enable-hc-sp
+--max-model-len 262144          --kv-cache-memory-bytes 2500000000   （固定 KV 池）
+--max-num-batched-tokens 8192   --max-num-seqs 16
+--cudagraph-capture-sizes 1 2 4 8 16 24 32 40 48 64 80
+--speculative-config {"method":"mtp","num_speculative_tokens":1,"use_local_argmax_reduction":true}
+端口 8003；SM70_PAGE4_TP8=1（名字带 TP8，但 TP4 下就是这条 nvfp4 读取路径）
+```
+
+**结果**：`systemctl start vllm-flashnext` → `Application startup complete`（19:20:06）。
+用它实测（同一 harness、salt 9918）：
+
+| 指标 | 结果 |
+|---|---|
+| 8K 单流 | **106.2 tok/s**（prefill 5631 tok/s） |
+| 64K 单流 | **116.4 tok/s**（prefill 5280 tok/s） |
+| **conc8** | **395.0 agg**（TTFT max 17.3 s） |
+
+⇒ 这是我们目前**最好的 conc8 数字**（对比 27B fp8 288.1、35B nvfp4 49.0），而且是在
+**nvfp4 KV + 256K maxlen** 下拿到的。原因：Flash-Next 走 QSA 的 page4 路径（内核内 nvfp4
+反量化），而 27B（非 QSA、D=128）只能落到慢的 Triton 内核 —— 这正是"D=128 专用快速内核"
+要补的东西。
