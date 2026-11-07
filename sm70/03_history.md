@@ -21980,3 +21980,25 @@ AR 侧同样接近地板，切片数 S 扫描（16 行，160 KB 载荷）：
 
 **启动器**：`QUASAR_MODEL/NAME/MAXLEN/TP/KV/PORT/DEVS` 全参数化，一个脚本服务三个模型
 （备份 `/data/sm70_results/serve_sm70_generic.sh`）。
+
+### (127) Qwen3.6-35B-A3B-NVFP4-Fast 首次在 SM70/TP4 上跑通并测量（2026-11-07 17:50–18:20）
+
+**启动**：参数化启动器 `QUASAR_MODEL=.../Qwen3.6-35B-A3B-NVFP4-Fast`、`QUASAR_TP=4`、
+`QUASAR_KV=nvfp4`、`QUASAR_MAXLEN=131072`、`QUASAR_UTIL=0.85`、端口 8005
+→ `Application startup complete`（**首次**），四卡各 29 GB。
+
+**测量**（同一 harness、salt 9918、MTP k=12、nvfp4 KV）：
+
+| 指标 | 结果 |
+|---|---|
+| 8K 单流 | 67.9 tok/s（另一次 94.4；两次差异大，需复测确认） |
+| 64K 单流 | 39.2 tok/s |
+| conc8 | 49.0 agg（per-stream 5.5 起） |
+
+对照：同口径下 27B（稠密）nvfp4 为 43.4 / 6.7。35B 虽然是 MoE 256 专家（3B 激活），
+在 nvfp4 下反而比稠密 27B 快，说明 27B 的 nvfp4 慢主要是**层数×隐藏维带来的注意力/KV 量**
+而非 MoE。两者都被同一个 nvfp4 Triton decode 内核拖住。
+
+**harness 已参数化**：`perf_arms.sh` 现在支持 `SM70_BASE / SM70_MODEL / SM70_MODEL_PATH`
+（模型/端口可换），配合启动器的 `QUASAR_MODEL/NAME/MAXLEN/TP/KV/PORT/DEVS`
+即可测任意模型；备份 `perf_arms.sh.bak2`。
