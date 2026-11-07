@@ -22247,3 +22247,35 @@ TP2 相对 TP4：8K 0.67×、64K 0.58×、conc8 0.55× —— 单流下降大致
 说明这套实现**没有随 TP 规模获得额外的单流收益**（TP4 的 4 卡并行把 per-token 延迟压下来了）。
 
 启动器默认 `--max-model-len 262144`，本轮 TP2/TP1 用 `QUASAR_MAXLEN=131072` 以留出 KV。
+
+### (139) 27B 的 nvfp4 慢根因 = **准入条件**，不是内核（2026-11-07 21:50–22:30）
+
+**关键纠正**：三个目标模型都是 **head_dim=256**（27B QUASAR: 24 qo/4 kv/D=256，
+35B: 16/2/256，Flash-Next: 24/2/256）。此前"27B 是 D=128 只能走 Triton"的记录是**错的**。
+
+27B/TP4 的 nvfp4 走不到 CUDA XQA，有两个原因（都在 `try_paged_decode_cuda` 的准入里）：
+1. 几何白名单只有 `(2,16)/(1,8)/(1,4)`，而 27B/TP4 是 `(H=1,HQ=6)`（G=6）⇒ 被拒；
+2. 页大小硬编码 `stride(0) == 2*H*16*144`，而 FlashInfer 后端用 **64 token/页**
+   （实测 `kv=(376,2,64,144) stride0=18432`，want 4608）⇒ 被拒。
+
+两者都只是**准入**，内核本身对 G 与 npg 都是通用的。改动（最小化）：
+- `sm70_attention_geometry.supported_decode`：按 `G = HQ//H ∈ [2,8]` 准入（D=256），
+  不动 prefill 的 `supported()`；
+- `try_paged_decode_cuda`：页大小/布局改为按真实 `kv.shape` 校验
+  （`F == D/2 + D/16` 且 `stride(0) == 2*H*N*F`）；
+- `serve_27b_quasar.sh`：nvfp4 时导出 `VLLM_SM70_DECODE_CUDA=1 / _XQA=1`
+  （该函数只处理 uint8 nvfp4 cache，对 fp8 无影响）。
+
+**数值校验**（split-plane 常量 fixture + Triton 对拍，2048 token）：
+- 常量用例（K=V=1）输出 **精确 1.0**，`l == kv_len`（16/128 均正确）；
+- `(1,6)` `(2,4)` `(1,8)` 三几何对 Triton：`max_abs 2.44e-4`（= 1 个 fp16 ulp），
+  rel 5.6e-4，与已认证的 `(1,8)` 完全一致。
+
+**27B / TP4 / nvfp4 / maxlen 262144 / salt 9918**：
+
+| 指标 | 修复前（Triton） | 修复后（XQA） | 倍差 |
+|---|---|---|---|
+| 8K 单流 | 43.3 | **229.2** | 5.3× |
+| 64K 单流 | 6.7 | **136.1** | 20× |
+
+⇒ nvfp4 从"不可用"变成与 fp8（243.5/155.8）同一量级，且仍是 **256K 上下文**。

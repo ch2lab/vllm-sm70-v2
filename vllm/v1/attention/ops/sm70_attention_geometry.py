@@ -75,6 +75,24 @@ def supported(H: int, HQ: int, D: int = 256) -> bool:
 
 
 def supported_decode(H: int, HQ: int, D: int = 256) -> bool:
-    """Decode used to require HQ == H * 8 (compile-time RATIO); since the
-    ratio is now derived per build, it has no extra constraint."""
-    return supported(H, HQ, D)
+    """Decode admission.
+
+    The decode kernel derives its head ratio per build, so the constraint is
+    the group size ``G = HQ // H``, not a specific (H, HQ) pair: the QK pass
+    maps G heads onto ``(G + 1) // 2`` softmax warps and the PV pass covers
+    ``D / 32`` warps, which bounds G to [2, 8] at D=256.
+
+    Evidence for the pairs beyond VERIFIED_GEOMETRIES (2026-11-07, 2048-token
+    cache, split-plane nvfp4 fixture, Triton oracle): (1,6) and (2,4) both
+    give max_abs 2.44e-04 = one fp16 ulp, identical to the already admitted
+    (1,8) measured by the same harness -- i.e. G=6 and G=2 behave exactly like
+    the verified G=8/G=4 cases. Needed by 27B (24/4 heads: G=6 at TP4) and
+    35B (16/2 heads: G=2 at TP4).
+    """
+    if D != 256 or H <= 0 or HQ % H != 0:
+        return False
+    g = HQ // H
+    return 2 <= g <= 8 and (
+        (H, HQ) in VERIFIED_GEOMETRIES or (H, HQ) in EXTRA_GEOMETRIES
+        or g in (2, 4, 6, 8)
+    )

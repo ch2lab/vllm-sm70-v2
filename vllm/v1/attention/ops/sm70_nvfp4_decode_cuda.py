@@ -1267,15 +1267,29 @@ def try_paged_decode_cuda(q, kv_cache, block_table, kv_lens, out,
                           nqt=1, q0=0):
     if os.environ.get("VLLM_SM70_DECODE_CUDA") != "1":
         return False
+    _dbg = os.environ.get("VLLM_SM70_DECODE_DEBUG") == "1"
     if q.dtype != torch.float16 or q.dim() != 3:
+        if _dbg:
+            print(f"[SM70ADMIT] reject q dtype/dim {q.dtype} {tuple(q.shape)}", flush=True)
         return False
     R, HQ, D = q.shape
     R = R // int(nqt)
     H = kv_cache.shape[1] // 2
-    # Verified geometries: TP1 (H=2, HQ=16), TP2 (H=1, HQ=8).
+    N = int(kv_cache.size(2))
+    F = int(kv_cache.size(3))
+    # Page size is engine-chosen (QSA uses 16-token pages, the FlashInfer
+    # backend 64); the kernel is generic in npg, so admit any page size whose
+    # row really is the split-plane nvfp4 layout.
+    want_stride = 2 * H * N * F
+    layout_ok = F == D // 2 + D // 16 and int(kv_cache.stride(0)) == want_stride
+    if _dbg:
+        print(f"[SM70ADMIT] H={H} HQ={HQ} D={D} R={R} nqt={nqt} "
+              f"kv={tuple(kv_cache.shape)} stride0={kv_cache.stride(0)} "
+              f"want={want_stride} layout_ok={layout_ok} "
+              f"geom_ok={supported_decode(H, HQ, D)}", flush=True)
     if not supported_decode(H, HQ, D):
         return False
-    if int(kv_cache.stride(0)) != 2 * H * 16 * 144:
+    if not layout_ok:
         return False
     if _BUF is None or R > _MAXR:
         return False
