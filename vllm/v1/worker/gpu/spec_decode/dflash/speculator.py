@@ -1,33 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-from collections.abc import Mapping
-from typing import Any, cast
+import copy
+from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.speculative import get_dflash_model_draft_tokens
-from vllm.diagnostics import diagnostic_channel, diagnostics_for
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    get_kv_cache_spec_sliding_window,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.cp_utils import cp_local_slot
+from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    get_eagle3_aux_layers_from_config,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
@@ -35,56 +35,42 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
-def _is_context_only_prefill(input_batch: InputBatch) -> bool:
-    incomplete_prefill = input_batch.is_incomplete_prefilling_np
-    return bool(
-        incomplete_prefill is not None
-        and incomplete_prefill.size == input_batch.num_reqs
-        and np.all(incomplete_prefill)
-    )
-
-
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        parallel_config = vllm_config.parallel_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        vllm_config = copy.copy(vllm_config)
+        vllm_config.parallel_config = replace(
+            parallel_config,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=(
+                parallel_config.decode_context_parallel_size
+                if speculative_config.draft_model_config.use_mla
+                else 1
+            ),
+        )
         super().__init__(vllm_config, device)
 
-        # Multimodal inputs not currently supported.
-        self.supports_mm_inputs = False
-
-        # A lookup-augmented DFlash2 proposal may be wider than the checkpoint
-        # block. The model still emits only its trained block; lookup fills the
-        # remaining target-verification positions.
-        self.draft_block = get_dflash_model_draft_tokens(self.speculative_config)
-        self.num_query_per_req = 1 + self.draft_block
-        draft_query_capacity = self.max_num_reqs * self.num_query_per_req
-        if draft_query_capacity > self.max_num_tokens:
-            # The target's token budget and the draft query batch are disjoint.
-            # Size only the draft-owned buffers up for K+1 queries per request
-            # instead of reducing the target prefill budget.
-            self.max_num_tokens = draft_query_capacity
-            self.input_buffers = InputBuffers(
-                max_num_reqs=self.max_num_reqs,
-                max_num_tokens=self.max_num_tokens,
-                device=device,
-            )
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
         # Keep embedding outside the compiled forward, with a graph-stable
-        # buffer sized after the draft query capacity has been expanded.
+        # buffer: the DFlash2 draft model overrides embed_input_ids (mask /
+        # parallel-drafting tokens), and going through the generic input_ids
+        # path silently bypassed that override -- the drafts were garbage in a
+        # way that no sampling setting could fix.
         self.inputs_embeds = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
-        if self.draft_block < self.num_speculative_steps:
-            logger.info(
-                "%s emits %d model drafts and lookup may fill %d additional "
-                "target-verification positions.",
-                self._speculator_name,
-                self.draft_block,
-                self.num_speculative_steps - self.draft_block,
-            )
+
+        # Multimodal inputs not currently supported.
+        self.supports_mm_inputs = False
+
+        # Each request emits exactly (bonus + N mask) query tokens per step.
+        self.num_query_per_req = 1 + self.num_speculative_steps
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -110,15 +96,27 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         self.sample_from_anchor = False
 
-        # Context positions for the K/V precompute. Populated by
-        # prepare_dflash_inputs, and processed by the model's
-        # precompute_and_store_context_kv method. NOT captured by CUDA graphs.
+        # Context positions for the K/V precompute, populated by prepare_dflash_inputs.
         self.context_positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
         )
 
+        # Fixed-address inputs of the FULL graph's context step: the target's aux
+        # hidden states and, for an anchor that reads them, the rejected counts.
+        self._aux_staging: torch.Tensor | None = None
+        self._num_rejected: torch.Tensor | None = None
+        aux_layers = get_eagle3_aux_layers_from_config(speculative_config)
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        if aux_layers and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+            self._aux_staging = torch.zeros(
+                self._num_graph_context_tokens(self.max_num_reqs),
+                len(aux_layers) * vllm_config.model_config.get_hidden_size(),
+                dtype=self.dtype,
+                device=device,
+            )
+
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
-        max_num_sampled_tokens = self.max_num_reqs * self.draft_block
+        max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
         self.sample_indices = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
@@ -129,187 +127,26 @@ class DFlashSpeculator(DraftModelSpeculator):
         # full buffer before a real batch has populated it, so zero would make
         # every padding row scatter into request slot 0.
         self.sample_idx_mapping = torch.full(
-            (max_num_sampled_tokens,), -1, dtype=torch.int32, device=device
+            (max_num_sampled_tokens,), -1, dtype=torch.int64, device=device
         )
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].
         self.sample_col = torch.arange(
-            self.draft_block, dtype=torch.int32, device=device
+            self.num_speculative_steps, dtype=torch.int32, device=device
         ).repeat(self.max_num_reqs)
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
-        self._context_only_prefill_logged = False
-        self._query_slot_mappings: torch.Tensor | None = None
-        _rt = getattr(vllm_config.observability_config, "runtime_trace", None)
-        _dflash_trace = getattr(_rt, "dflash", None)
-        if _dflash_trace is None:
-            # This tree has no observability_config.runtime_trace; use the
-            # standalone one, which reads QUASAR_TRACE_* for opt-in tracing.
-            from vllm.config.sm70_runtime import capture_runtime_trace
-
-            _dflash_trace = capture_runtime_trace().dflash
-        self._debug_proposal_stages = bool(_dflash_trace.value("proposal_stages"))
-        self._debug_real_proposal = False
-        self._debug_input_dump_count = 0
-        self._tensor_dump = diagnostic_channel(
-            "dflash_tensor", owner=diagnostics_for(vllm_config)
-        )
-        self._debug_tensor_dump_limit = max(
-            0, self._tensor_dump.policy.value("max_dumps")
-        )
-
-    def trace_target_output(
-        self, input_batch, output, num_sampled, num_rejected, hidden_states, logger
-    ) -> None:
-        if getattr(self, "_debug_proposal_stages", False):
-            logger.info(
-                "DFlash target verification diagnostic: draft_input=%s "
-                "sampled=%s num_sampled=%s num_rejected=%s "
-                "finite_hidden=%s",
-                input_batch.input_ids[input_batch.logits_indices].tolist(),
-                output.sampled_token_ids.tolist(),
-                num_sampled.tolist(),
-                num_rejected.tolist(),
-                bool(torch.isfinite(hidden_states).all().item()),
-            )
-
-    def _debug_proposal_stage(self, stage: str) -> None:
-        if not getattr(self, "_debug_proposal_stages", False):
-            return
-        # Opt-in CUDA-event split so a slow draft step can be attributed
-        # without a profiler (which this engine cannot run).
-        marks = getattr(self, "_stage_marks", None)
-        if marks is None:
-            marks = self._stage_marks = {}
-            self._stage_totals = {}
-            self._stage_count = 0
-        gpu = torch.cuda.current_stream().synchronize
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        previous = marks.get("_last")
-        if previous is not None:
-            gpu()
-            elapsed = previous.elapsed_time(event)
-            totals = self._stage_totals
-            totals[stage] = totals.get(stage, 0.0) + elapsed
-        marks["_last"] = event
-        if stage == "query and selector end":
-            self._stage_count += 1
-            if self._stage_count % 20 == 0:
-                totals = self._stage_totals
-                logger.info(
-                    "DFlash stage timing (avg of %d steps): %s",
-                    self._stage_count,
-                    {k: round(v / self._stage_count, 2) for k, v in totals.items()},
-                )
-
-    def _debug_dump_real_proposal(
-        self,
-        input_batch: InputBatch,
-        last_hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
-        projected_hidden_states: torch.Tensor,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-        num_target_tokens: int,
-        num_query_tokens: int,
-    ) -> None:
-        """Save one complete real-request DFlash boundary for offline A/B."""
-        if (
-            not self._tensor_dump.policy.directory
-            or not self._debug_real_proposal
-            or self._tensor_dump.reports >= self._debug_tensor_dump_limit
-            or get_tensor_model_parallel_rank() != 0
-        ):
-            return
-
-        def cpu(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.detach().cpu().clone()
-
-        num_reqs = input_batch.num_reqs
-        num_samples = num_reqs * self.draft_block
-        context_slot_mappings = [
-            cpu(mapping[:num_target_tokens]) for mapping in self._context_slot_mappings
-        ]
-        query_slot_mappings = {
-            int(gid): cpu(self._require_query_slot_mappings()[gid, :num_query_tokens])
-            for gid in self.draft_kv_cache_group_ids
-        }
-        payload = {
-            "request_ids": list(input_batch.req_ids[:num_reqs]),
-            "tp_rank": get_tensor_model_parallel_rank(),
-            "pp_rank": get_pp_group().rank_in_group,
-            "num_reqs": num_reqs,
-            "num_target_tokens": num_target_tokens,
-            "num_query_tokens": num_query_tokens,
-            "draft_block": self.draft_block,
-            "target_input_ids": cpu(input_batch.input_ids[:num_target_tokens]),
-            "target_positions": cpu(input_batch.positions[:num_target_tokens]),
-            "target_query_start_loc": cpu(input_batch.query_start_loc[: num_reqs + 1]),
-            "target_seq_lens": cpu(input_batch.seq_lens[:num_reqs]),
-            "target_idx_mapping": cpu(input_batch.idx_mapping[:num_reqs]),
-            "last_hidden_states": cpu(last_hidden_states[:num_target_tokens]),
-            "aux_hidden_states": (
-                [cpu(hidden[:num_target_tokens]) for hidden in aux_hidden_states]
-                if aux_hidden_states
-                else None
-            ),
-            "projected_hidden_states": cpu(projected_hidden_states[:num_target_tokens]),
-            "num_sampled": cpu(num_sampled[:num_reqs]),
-            "num_rejected": cpu(num_rejected[:num_reqs]),
-            "last_sampled": cpu(last_sampled),
-            "next_prefill_tokens": cpu(next_prefill_tokens),
-            "draft_input_ids": cpu(self.input_buffers.input_ids[:num_query_tokens]),
-            "draft_input_embeds": cpu(self.inputs_embeds[:num_query_tokens]),
-            "draft_positions": cpu(self.input_buffers.positions[:num_query_tokens]),
-            "draft_query_start_loc": cpu(
-                self.input_buffers.query_start_loc[: num_reqs + 1]
-            ),
-            "draft_seq_lens": cpu(self.input_buffers.seq_lens[:num_reqs]),
-            "context_positions": cpu(self.context_positions[:num_target_tokens]),
-            "context_slot_mappings": context_slot_mappings,
-            "query_slot_mappings": query_slot_mappings,
-            "sample_indices": cpu(self.sample_indices[:num_samples]),
-            "sample_pos": cpu(self.sample_pos[:num_samples]),
-            "sample_idx_mapping": cpu(self.sample_idx_mapping[:num_samples]),
-            "draft_tokens": cpu(self.draft_tokens[:num_reqs]),
-        }
-        debug_tensor_names = (
-            "_debug_backbone_hidden_states",
-            "_debug_candidate_ids",
-            "_debug_unary_logits",
-            "_debug_lattice_scores",
-        )
-        payload["dflash2"] = {
-            name.removeprefix("_debug_"): cpu(tensor[:num_reqs])
-            for name in debug_tensor_names
-            if (tensor := getattr(self, name, None)) is not None
-        }
-        dump_index = self._tensor_dump.reports
-        dump_path = self._tensor_dump.write(
-            f"proposal_{dump_index:02d}_pp{get_pp_group().rank_in_group}_"
-            f"tp{get_tensor_model_parallel_rank()}_pid{os.getpid()}.pt",
-            payload,
-        )
-        self._tensor_dump.reports += 1
-        logger.warning("Saved DFlash real-request tensor boundary to %s", dump_path)
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
-        return replace(
-            self.vllm_config,
-            is_speculative_draft=True,
-            model_config=self.draft_model_config,
-            parallel_config=self.speculative_config.draft_parallel_config,
-            attention_config=replace(
-                self.vllm_config.attention_config,
-                use_non_causal=self.requires_non_causal,
-            ),
+        config = copy.copy(super().attn_vllm_config)
+        config.attention_config = replace(
+            self.vllm_config.attention_config,
+            use_non_causal=self.requires_non_causal,
         )
+        return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -343,18 +180,69 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
+        # Capture must not write context K/V.
+        self._context_slot_mappings.fill_(PAD_SLOT_ID)
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
             self.input_buffers,
             self.block_tables,
-            self._require_query_slot_mappings(),
             self.attn_groups,
             self.kv_cache_config,
             self.max_model_len,
             causal=self._group_causal,
+            prepare_forward=self._prepare_graph_forward,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+
+    def _prepare_graph_forward(
+        self, num_reqs: int, attn_metadata: dict[str, Any] | None
+    ) -> None:
+        """The FULL graph's context step: combine the staged target hidden
+        states, publish the context anchor and store the context K/V."""
+        num_context = self._num_graph_context_tokens(num_reqs)
+        if self._aux_staging is not None:
+            self.hidden_states[:num_context].copy_(
+                self.model.combine_hidden_states(self._aux_staging[:num_context])
+            )
+        self.prepare_context_anchor(
+            num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
+        )
+        self._precompute_context_kv(0, num_context)
+        # Recorded in the FULL graph so replays skip the eager metadata build.
+        if attn_metadata is not None and self.supports_decode_metadata_update:
+            self._update_draft_decode_metadata(attn_metadata, num_reqs)
+
+    def _prepare_graph_replay(
+        self,
+        input_batch: InputBatch,
+        num_graph_reqs: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_rejected: torch.Tensor,
+        dummy_run: bool,
+    ) -> None:
+        """Eager work before a FULL replay: stage the inputs _prepare_graph_forward
+        reads and store the context rows past the graph's num_context rows."""
+        num_reqs = input_batch.num_reqs
+        num_target_tokens = input_batch.num_tokens
+        num_context = self._num_graph_context_tokens(num_graph_reqs)
+        self._store_hidden_states(
+            num_target_tokens, last_hidden_states, aux_hidden_states, num_context
+        )
+        if self._num_rejected is not None:
+            self._num_rejected[:num_reqs].copy_(num_rejected[:num_reqs])
+        if dummy_run:
+            # Dummy block tables are placeholders: write no context K/V.
+            self._context_slot_mappings[:, :num_context].fill_(PAD_SLOT_ID)
+        elif num_target_tokens <= num_context:
+            # Rows past the batch keep stale positions but write no K/V.
+            self._context_slot_mappings[:, num_target_tokens:num_context].fill_(
+                PAD_SLOT_ID
+            )
+        else:
+            # Prefill context beyond the graph's rows is stored before replay.
+            self._precompute_context_kv(num_context, num_target_tokens)
 
     def load_draft_model(
         self,
@@ -380,27 +268,23 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         # FlashAttention's AOT split schedule is wrong for a windowed drafter,
-        # and the global window scan can leave it enabled depending on the
-        # target backend. Resolve the drafter's own builders explicitly.
+        # and `_get_sliding_window_configs` leaves it on or off depending on
+        # whether the target also runs FlashAttention. Decide it here instead.
         for groups in self.attn_groups:
             for group in groups:
                 builder = group.get_metadata_builder()
-                if getattr(builder, "aot_schedule", False) and getattr(
-                    builder.kv_cache_spec, "sliding_window", None
-                ):
-                    cast(Any, builder).aot_schedule = False
+                if getattr(
+                    builder, "aot_schedule", False
+                ) and get_kv_cache_spec_sliding_window(builder.kv_cache_spec):
+                    # `aot_schedule` belongs to FlashAttention's builder, not
+                    # to the base class this loop is typed against.
+                    builder.aot_schedule = False  # type: ignore[attr-defined]
 
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
-        self._query_slot_mappings = torch.full(
-            (len(kv_cache_config.kv_cache_groups), self.max_num_tokens),
-            PAD_SLOT_ID,
-            dtype=torch.int64,
-            device=self.device,
-        )
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -435,11 +319,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                     )
                 }
 
-    def _require_query_slot_mappings(self) -> torch.Tensor:
-        if self._query_slot_mappings is None:
-            raise RuntimeError("DFlash attention buffers have not been initialized.")
-        return self._query_slot_mappings
-
     @torch.inference_mode()
     def _run_model(
         self,
@@ -458,12 +337,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_padding=self.input_buffers.is_padding[:num_tokens],
         ):
             self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
                 self.input_buffers.input_ids[:num_tokens]
             )
             last_hidden_states = self.model(
-                input_ids=None,
+                input_ids=self.input_buffers.input_ids[:num_tokens],
                 positions=self.input_buffers.positions[:num_tokens],
                 inputs_embeds=self.inputs_embeds[:num_tokens],
             )
@@ -478,7 +358,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        self._debug_proposal_stage("draft forward begin")
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -486,12 +365,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._debug_proposal_stage("draft forward end")
-        num_sample = num_reqs * self.draft_block
+        num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
-        self._debug_proposal_stage("draft sampling begin")
         draft_tokens = self.sample_draft(
             sample_hidden_states,
             self.sample_pos[:num_sample] - 1,
@@ -500,76 +377,70 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.seeds,
             self.sample_col[:num_sample],
             self.draft_logits,
+            num_steps=self.num_speculative_steps,
         )
-        self._debug_proposal_stage("draft sampling end")
-        self.draft_tokens[:num_reqs, : self.draft_block] = draft_tokens.view(
-            num_reqs, self.draft_block
+        self.draft_tokens[:num_reqs] = draft_tokens.view(
+            num_reqs, self.num_speculative_steps
         )
 
-    def _build_draft_attn_metadata(
+    def _num_graph_context_tokens(self, num_reqs: int) -> int:
+        # Context rows a captured draft step stores: one full verify per request.
+        return min(num_reqs * (self.num_speculative_steps + 1), self.max_num_tokens)
+
+    def _precompute_context_kv(
+        self, start: int, end: int, dummy_run: bool = False
+    ) -> None:
+        if dummy_run:
+            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+        elif self._layer_group_idx is not None:
+            context_slots = [
+                self._context_slot_mappings[gidx][start:end]
+                for gidx in self._layer_group_idx
+            ]
+        else:
+            context_slots = self._context_slot_mappings[0][start:end]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[start:end],
+            self.context_positions[start:end],
+            context_slots,
+        )
+
+    def _store_hidden_states(
+        self,
+        num_tokens: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_graph_tokens: int = 0,
+    ) -> None:
+        # A FULL graph combines its first num_graph_tokens rows from the staged
+        # aux hidden states; the remaining rows are combined here.
+        start = 0
+        if num_graph_tokens and self._aux_staging is not None:
+            assert aux_hidden_states
+            start = min(num_tokens, num_graph_tokens)
+            torch.cat(
+                [h[:start] for h in aux_hidden_states],
+                dim=-1,
+                out=self._aux_staging[:start],
+            )
+        if start == num_tokens:
+            return
+        if aux_hidden_states:
+            hidden_states = self.model.combine_hidden_states(
+                torch.cat([h[start:num_tokens] for h in aux_hidden_states], dim=-1)
+            )
+        else:
+            hidden_states = last_hidden_states[start:num_tokens]
+        self.hidden_states[start:num_tokens].copy_(hidden_states)
+
+    def prepare_context_anchor(
         self,
         num_reqs: int,
-        num_reqs_padded: int,
-        num_tokens_padded: int,
-        seq_lens_cpu_upper_bound: torch.Tensor,
-        step: int,
-        num_query_per_req: int | None = None,
-        causal: bool | Mapping[int, bool] = False,
-        query_start_loc_np: np.ndarray | None = None,
-        dcp_local_seq_lens: torch.Tensor | None = None,
-    ) -> dict[str, Any] | None:
-        if not self.draft_attn_layer_names:
-            return None
-        assert num_query_per_req is None  # Omitted for DFlash, read from self instead
-        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
-            prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
-                self.input_buffers.seq_lens,
-                num_reqs,
-                self.block_tables.cp_size,
-                self.block_tables.cp_rank,
-                self.block_tables.cp_interleave,
-            )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
-        return super()._build_draft_attn_metadata(
-            num_reqs,
-            num_reqs_padded,
-            num_tokens_padded,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            step=step,
-            num_query_per_req=self.num_query_per_req,
-            causal=causal,
-            query_start_loc_np=query_start_loc_np,
-            dcp_local_seq_lens=dcp_local_seq_lens,
-        )
-
-    def _prepare_ngram_assist(
-        self,
-        input_batch: InputBatch,
-        output_copy_event: torch.cuda.Event | None,
-        sampled_token_ids_cpu: np.ndarray | None,
-        num_sampled_tokens_cpu: np.ndarray | None,
-        all_token_ids_cpu: np.ndarray | None,
-    ) -> bool:
-        """Prepare an optional draftless proposal; return whether it is complete."""
-        return False
-
-    def _prepare_proposal_runtime(
-        self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_rejected: torch.Tensor | None,
     ) -> None:
-        """Refresh optional proposal-controller state before graph replay."""
-
-    def _apply_ngram_assist(self, num_reqs: int) -> None:
-        """Override model proposals for ngram-hit rows, if configured."""
-
-    def _combine_aux_hidden_states(self, aux_hidden_states: list[torch.Tensor]):
-        combine_aux = getattr(self.model, "combine_aux_hidden_states", None)
-        if combine_aux is not None:
-            return combine_aux(aux_hidden_states)
-        return self.model.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
+        """Publish context features required by a draft's candidate head. Runs
+        inside the FULL graph, so it must not sync with the host."""
 
     @torch.inference_mode()
     def propose(
@@ -593,315 +464,176 @@ class DFlashSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        num_tokens_across_dp: torch.Tensor | None = None,
+        dp_sync_state: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
-        output_copy_event: torch.cuda.Event | None = None,
-        sampled_token_ids_cpu: np.ndarray | None = None,
-        num_sampled_tokens_cpu: np.ndarray | None = None,
-        all_token_ids_cpu: np.ndarray | None = None,
-        # Compatibility with this tree's runner, which schedules K per batch
-        # size and passes the DP sync state by keyword.  DFlash keeps its own
-        # fixed block width, so the scheduled K is advisory here.
         num_speculative_tokens: int | None = None,
-        dp_sync_state: Any | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
+        if dummy_run and dp_sync_state is not None:
+            num_reqs = min(num_reqs, dp_sync_state.num_reqs)
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
-        self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
-        self._debug_real_proposal = not dummy_run and not is_profile
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        prepared_hidden = self._get_prepared_context_hidden(input_batch)
-        if prepared_hidden is not None:
-            hidden_states = prepared_hidden
-        elif aux_hidden_states:
-            if (
-                getattr(self, "_debug_proposal_stages", False)
-                and getattr(self, "_debug_real_proposal", False)
-                and getattr(self, "_debug_input_dump_count", 0) < 2
-            ):
-                aux_stats = []
-                for layer_idx, aux_hidden in enumerate(aux_hidden_states):
-                    row = aux_hidden[num_target_tokens - 1].detach().float().reshape(-1)
-                    aux_stats.append(
-                        {
-                            "layer": layer_idx,
-                            "shape": tuple(aux_hidden.shape),
-                            "sum": float(row.sum().item()),
-                            "sqsum": float((row * row).sum().item()),
-                            "absmax": float(row.abs().max().item()),
-                            "sample": row[:8].cpu().tolist(),
-                        }
-                    )
-                logger.info(
-                    "DFlash real target-hidden diagnostic: positions=%s "
-                    "input_ids=%s aux=%s",
-                    input_batch.positions[:num_target_tokens].tolist(),
-                    input_batch.input_ids[:num_target_tokens].tolist(),
-                    aux_stats,
-                )
-            with record_function_or_nullcontext("dflash: project target hidden"):
-                hidden_states = self._combine_aux_hidden_states(aux_hidden_states)
-        else:
-            hidden_states = last_hidden_states
-        with record_function_or_nullcontext("dflash: stage target hidden"):
-            self.hidden_states[:num_target_tokens].copy_(
-                hidden_states[:num_target_tokens]
-            )
-        if (
-            getattr(self, "_debug_proposal_stages", False)
-            and getattr(self, "_debug_real_proposal", False)
-            and getattr(self, "_debug_input_dump_count", 0) < 2
-        ):
-            row = hidden_states[num_target_tokens - 1].detach().float().reshape(-1)
-            logger.info(
-                "DFlash real projected-hidden diagnostic: shape=%s sum=%.9g "
-                "sqsum=%.9g absmax=%.9g sample=%s",
-                tuple(hidden_states.shape),
-                float(row.sum().item()),
-                float((row * row).sum().item()),
-                float(row.abs().max().item()),
-                row[:8].cpu().tolist(),
-            )
-            self._debug_input_dump_count = (
-                getattr(self, "_debug_input_dump_count", 0) + 1
-            )
-
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
+            self._store_hidden_states(
+                num_target_tokens, last_hidden_states, aux_hidden_states
+            )
+            self.prepare_context_anchor(
+                num_reqs, input_batch.query_start_loc, num_rejected
+            )
             self.model.precompute_and_store_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
+            # DFlash processes all speculative tokens in one forward pass,
+            # so the real token count is num_query_tokens.
+            self._prepare_eplb_forward(num_query_tokens)
             self._generate_draft(
                 num_reqs,
                 num_query_tokens,
                 attn_metadata=None,
                 slot_mappings=None,
-                num_tokens_across_dp=num_tokens_across_dp,
+                num_tokens_across_dp=None,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             return self.draft_tokens[:num_reqs]
 
-        # Query slots live in a DFlash-owned persistent buffer. Its address is
-        # captured by the draft CUDA graph and its capacity is independent of
-        # the target runner's max_num_batched_tokens allocation.
+        if self.pcp_manager is not None and not dummy_run:
+            self.block_tables.gather_block_tables(
+                input_batch.idx_mapping, num_reqs_padded=num_reqs
+            )
+
+        # The query slot mapping is written into the shared BlockTables slot_mappings.
+        # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        query_slot_mappings = self._require_query_slot_mappings()
         # Support multiple draft KV cache groups by preparing inputs once for each
-        with record_function_or_nullcontext("dflash: prepare inputs"):
-            for i, gid in enumerate(self.draft_kv_cache_group_ids):
-                prepare_dflash_inputs(
-                    self.input_buffers,
-                    query_slot_mappings[gid],
-                    self.context_positions,
-                    self._context_slot_mappings[i],
-                    self.sample_indices,
-                    self.sample_pos,
-                    self.sample_idx_mapping,
-                    self.temperature,
-                    self.seeds,
-                    input_batch,
-                    num_sampled,
-                    num_rejected,
-                    last_sampled,
-                    next_prefill_tokens,
-                    temperature,
-                    seeds,
-                    self.block_tables.input_block_tables[gid],
-                    self.block_tables.kernel_block_sizes[gid],
-                    self.block_tables.cp_rank,
-                    self.block_tables.cp_size,
-                    self.block_tables.cp_interleave,
-                    self.parallel_drafting_token_id,
-                    self.num_query_per_req,
-                    self.draft_block,
-                    self.max_num_reqs,
-                    self.max_num_tokens,
-                    self.max_model_len,
-                    self.sample_from_anchor,
-                )
-
-        # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
-        # because the context shape varies per step. During dummy runs the block tables
-        # are placeholders, so we skip the cache write to avoid clobbering real entries.
-        # Each layer uses the context slots of its own kv-cache group.
-        if dummy_run:
-            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-        elif self._layer_group_idx is not None:
-            context_slots = [
-                self._context_slot_mappings[gidx][:num_target_tokens]
-                for gidx in self._layer_group_idx
-            ]
-        else:
-            context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self._debug_proposal_stage("context kv begin")
-        with record_function_or_nullcontext("dflash: materialize context kv"):
-            self._precompute_context_kv(
-                self.hidden_states[:num_target_tokens],
-                self.context_positions[:num_target_tokens],
-                context_slots,
-            )
-        self._debug_proposal_stage("context kv end")
-        if (
-            getattr(self, "_debug_proposal_stages", False)
-            and getattr(self, "_debug_real_proposal", False)
-            and getattr(self, "_debug_draft_input_dumped", False) is False
-        ):
-            self._debug_draft_input_dumped = True
-            _slots = context_slots
-            if isinstance(_slots, (list, tuple)):
-                _slots = _slots[0] if _slots else None
-            logger.info(
-                "DFlash draft input facts: seq_lens=%s ctx_slots=%s "
-                "query_slots=%s draft_max_seq_len=%s num_target_tokens=%s "
-                "layer_group_idx=%s",
-                self.input_buffers.seq_lens[:num_reqs].tolist(),
-                None if _slots is None else _slots[:8].tolist(),
-                None
-                if self._query_slot_mappings is None
-                else self._query_slot_mappings[0, :8].tolist(),
-                self.draft_max_seq_len,
-                num_target_tokens,
-                self._layer_group_idx,
-            )
-
-        if not dummy_run and _is_context_only_prefill(input_batch):
-            # Intermediate chunked-prefill steps only need to materialize the
-            # target hidden states into draft KV. Their proposed tokens cannot
-            # be consumed before the final prompt chunk, which will run the
-            # normal query graph and replace this sentinel output.
-            self.draft_tokens[:num_reqs].fill_(-1)
-            if not self._context_only_prefill_logged:
-                logger.info(
-                    "%s context-only path is skipping unused draft queries "
-                    "for intermediate prefill chunks.",
-                    self._speculator_name,
-                )
-                self._context_only_prefill_logged = True
-            return self.draft_tokens[:num_reqs]
-
-        if self._prepare_ngram_assist(
-            input_batch,
-            output_copy_event,
-            sampled_token_ids_cpu,
-            num_sampled_tokens_cpu,
-            all_token_ids_cpu,
-        ):
-            self._apply_ngram_assist(num_reqs)
-            return self.draft_tokens[:num_reqs]
-
-        self._debug_proposal_stage("query preparation begin")
-        with record_function_or_nullcontext("dflash: query and selector"):
-            # Every DFlash step has exactly num_query_per_req tokens, so we can
-            # use FULL CUDA graphs.
-            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-                self.query_cudagraph_manager,
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.dcp_size,
+                self.block_tables.cp_interleave,
+                self.parallel_drafting_token_id,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
                 num_reqs,
-                num_query_tokens,
-                uniform_token_count=self.num_query_per_req,
-                dp_size=self.dp_size,
-                dp_rank=self.dp_rank,
-                need_eager=is_profile,
             )
 
-            num_reqs_padded = batch_desc.num_reqs or num_reqs
-            num_tokens_padded = batch_desc.num_tokens
-
-            # Refresh persistent metadata before FULL replay. The supported
-            # DFlash2 path copies its captured inputs; other routes rebuild.
-            if batch_desc.cg_mode == CUDAGraphMode.FULL and (
-                self._refresh_draft_graph_metadata(num_reqs_padded, num_tokens_padded)
-            ):
-                draft_attn_metadata = None
-                draft_slot_mappings_by_layer = None
-            else:
-                # Eager draft: no graph to satisfy, so use the exact batch
-                # instead of the graph-padded shape. Mixing the two made the
-                # query tensor (padded) and the metadata (unpadded) disagree.
-                num_reqs_padded = num_reqs
-                num_tokens_padded = num_reqs * self.num_query_per_req
-                draft_attn_metadata = self._build_draft_attn_metadata(
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    num_tokens_padded=num_tokens_padded,
-                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-                    step=self.num_query_per_req,
-                    causal=self._group_causal,
-                )
-                draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-                    query_slot_mappings[:, :num_tokens_padded],
-                    self.kv_cache_config,
-                )
-
-            self._debug_proposal_stage("query preparation end")
-            # The FULL graph replays metadata frozen at capture time. It is only
-            # usable when _refresh_draft_graph_metadata updated that state for
-            # this step; otherwise (e.g. FLASHINFER cannot update in place) the
-            # rebuilt metadata below would be ignored and the draft would attend
-            # to a stale context, accepting nothing.
-            if (
-                batch_desc.cg_mode == CUDAGraphMode.FULL
-                and draft_attn_metadata is None
-                and draft_slot_mappings_by_layer is None
-            ):
-                assert self.query_cudagraph_manager is not None
-                self.query_cudagraph_manager.run_fullgraph(batch_desc)
-            else:
-                self._generate_draft(
-                    num_reqs,
-                    num_tokens_padded,
-                    draft_attn_metadata,
-                    draft_slot_mappings_by_layer,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                )
-
-        self._debug_proposal_stage("query and selector end")
-        self._apply_ngram_assist(num_reqs)
-        self._debug_dump_real_proposal(
-            input_batch,
-            last_hidden_states,
-            aux_hidden_states,
-            hidden_states,
-            num_sampled,
-            num_rejected,
-            last_sampled,
-            next_prefill_tokens,
-            num_target_tokens,
-            num_query_tokens,
+        batch_sync, num_batch_tokens = (
+            self._build_uniform_batch_dp_sync(
+                dp_sync_state,
+                num_reqs,
+                self.num_query_per_req,
+            )
+            if dp_sync_state is not None
+            else (None, num_query_tokens)
+        )
+        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
+        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
+            self.query_cudagraph_manager,
+            num_reqs,
+            num_batch_tokens,
+            uniform_token_count=self.num_query_per_req,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=is_profile,
+            dp_sync_state=batch_sync,
+        )
+        num_tokens_padded = batch_desc.num_tokens
+        num_tokens_across_dp = (
+            batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
 
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            assert batch_desc.num_reqs is not None
+            self._prepare_graph_replay(
+                input_batch,
+                batch_desc.num_reqs,
+                last_hidden_states,
+                aux_hidden_states,
+                num_rejected,
+                dummy_run,
+            )
+        else:
+            self._store_hidden_states(
+                num_target_tokens, last_hidden_states, aux_hidden_states
+            )
+            self.prepare_context_anchor(
+                num_reqs, input_batch.query_start_loc, num_rejected
+            )
+            self._precompute_context_kv(0, num_target_tokens, dummy_run)
+
+        is_full_cudagraph = batch_desc.cg_mode == CUDAGraphMode.FULL
+        # During FULL cudagraph with a model that supports decode metadata updates,
+        # the metadata update is captured in the graph, and we can skip the full
+        # build below.
+        if not (is_full_cudagraph and self.supports_decode_metadata_update):
+            draft_attn_metadata = self._build_uniform_attn_metadata(
+                num_reqs=num_reqs,
+                batch_desc=batch_desc,
+                num_query_per_req=self.num_query_per_req,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                step=self.num_query_per_req,
+                causal=self._group_causal,
+            )
+
+        # DFlash processes all speculative tokens in one forward pass,
+        # so the real token count is num_query_tokens.
+        self._prepare_eplb_forward(num_query_tokens)
+
+        if is_full_cudagraph:
+            assert self.query_cudagraph_manager is not None
+            self.query_cudagraph_manager.run_fullgraph(batch_desc)
+        else:
+            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                self.block_tables.slot_mappings[:, :num_tokens_padded],
+                self.kv_cache_config,
+            )
+            self._generate_draft(
+                num_reqs,
+                num_tokens_padded,
+                draft_attn_metadata,
+                draft_slot_mappings_by_layer,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=batch_desc.cg_mode,
+            )
+
         return self.draft_tokens[:num_reqs]
-
-    def _precompute_context_kv(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        slots: torch.Tensor | list[torch.Tensor | None] | None,
-    ) -> None:
-        self.model.precompute_and_store_context_kv(hidden_states, positions, slots)
-
-    def _get_prepared_context_hidden(
-        self, input_batch: InputBatch
-    ) -> torch.Tensor | None:
-        return None
-
-    def _refresh_draft_graph_metadata(self, num_reqs: int, num_tokens: int) -> bool:
-        return False
 
 
 @triton.jit
@@ -909,6 +641,7 @@ def _prepare_dflash_inputs_kernel(
     # Outputs
     out_input_ids_ptr,
     out_query_positions_ptr,
+    out_is_padding_ptr,
     out_query_start_loc_ptr,
     out_seq_lens_ptr,
     out_query_slot_mapping_ptr,
@@ -1039,6 +772,7 @@ def _prepare_dflash_inputs_kernel(
     )
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
+    tl.store(out_is_padding_ptr + query_idx, False, mask=is_query)
     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
     tl.store(out_query_positions_ptr + query_idx, clamped_query_pos, mask=is_query)
     tl.store(out_query_slot_mapping_ptr + query_idx, q_slot, mask=is_query)
@@ -1101,6 +835,9 @@ def _prepare_dflash_inputs_kernel(
             for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
+                tl.store(out_input_ids_ptr + block, 0, mask=mask)
+                tl.store(out_query_positions_ptr + block, 0, mask=mask)
+                tl.store(out_is_padding_ptr + block, True, mask=mask)
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
@@ -1140,18 +877,21 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    num_reqs_override: int | None = None,
 ) -> None:
-    num_reqs = input_batch.num_reqs
+    num_reqs = input_batch.num_reqs if num_reqs_override is None else num_reqs_override
+    assert num_reqs <= input_batch.num_reqs
     assert num_reqs > 0
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
-    max_target_query_len = int(input_batch.num_scheduled_tokens.max())
+    max_target_query_len = int(input_batch.num_scheduled_tokens[:num_reqs].max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
+        input_buffers.is_padding,
         input_buffers.query_start_loc,
         input_buffers.seq_lens,
         query_slot_mapping,

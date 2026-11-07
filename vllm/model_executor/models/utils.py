@@ -245,18 +245,12 @@ class AutoWeightsLoader:
         *,
         ignore_unexpected_prefixes: list[str] | None = None,
         ignore_unexpected_suffixes: list[str] | None = None,
-        skip_prefixes: list[str] | None = None,
-        skip_substrs: list[str] | None = None,
     ) -> None:
         super().__init__()
 
         self.module = module
         self.ignore_unexpected_prefixes = ignore_unexpected_prefixes or []
         self.ignore_unexpected_suffixes = ignore_unexpected_suffixes or []
-        # Checkpoint names to drop outright (1cat's DFlash loaders pass these):
-        # shared target weights, absent mask embeddings and so on.
-        self.skip_prefixes = skip_prefixes or []
-        self.skip_substrs = skip_substrs or []
 
         # Weight tying makes two qualnames point at the same `nn.Parameter`
         # (e.g. `lm_head.weight` and `model.embed_tokens.weight`). Loading both
@@ -295,11 +289,7 @@ class AutoWeightsLoader:
         return ".".join((prefix, rest))
 
     def _can_skip(self, qualname: str) -> bool:
-        return (
-            qualname in self.aliased_params
-            or any(qualname.startswith(prefix) for prefix in self.skip_prefixes)
-            or any(substr in qualname for substr in self.skip_substrs)
-        )
+        return qualname in self.aliased_params
 
     def _can_ignore_unexpected(self, qualname: str) -> bool:
         iup = (qualname.startswith(p) for p in self.ignore_unexpected_prefixes)

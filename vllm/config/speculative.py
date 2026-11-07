@@ -382,18 +382,7 @@ _DRAFT_VLLM_CONFIG_OVERRIDES = (
 )
 
 
-def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
-    """Block width produced by the DFlash checkpoint itself.
-
-    Lookup-augmented DFlash2 may hand a wider proposal to the target while its
-    convolutions keep the trained block; this tree does not enable ngram_assist
-    yet, so the width is just the scheduled draft count.
-    """
-    return int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
-
-
 @config
-
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 

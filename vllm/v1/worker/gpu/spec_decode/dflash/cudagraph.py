@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -14,8 +14,8 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
+    AttentionState,
     BatchExecutionDescriptor,
-    CapturedAttentionState,
     CudaGraphManager,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -27,20 +27,15 @@ def _prepare_dflash_inputs_to_capture(
     num_tokens: int,
     input_buffers: InputBuffers,
     block_tables: BlockTables,
-    query_slot_mappings: torch.Tensor,
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     max_model_len: int,
     skip_attn: bool,
     causal: bool | Mapping[int, bool],
-) -> CapturedAttentionState:
+) -> AttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-    # DFlash owns a K+1 query batch which can be wider than the target token
-    # budget. Keep its persistent graph input independent from the target
-    # BlockTables slot-mapping allocation.
-    query_slot_mappings.fill_(PAD_SLOT_ID)
-    slot_mappings = query_slot_mappings[:, :num_tokens]
+    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
         slot_mappings, kv_cache_config
     )
@@ -48,17 +43,16 @@ def _prepare_dflash_inputs_to_capture(
     attn_metadata = None
     if not skip_attn:
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-        dcp_local_seq_lens = None
         if block_tables.cp_size > 1:
-            prepare_dcp_local_seq_lens(
+            input_batch.dcp_local_seq_lens = prepare_dcp_local_seq_lens(
                 input_buffers.dcp_local_seq_lens,
-                input_buffers.seq_lens,
-                num_reqs,
+                input_batch.seq_lens,
+                input_batch.num_reqs,
                 block_tables.cp_size,
                 block_tables.cp_rank,
                 block_tables.cp_interleave,
+                num_reqs_padded=input_batch.num_reqs_after_padding,
             )
-            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -67,7 +61,7 @@ def _prepare_dflash_inputs_to_capture(
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=num_tokens // num_reqs,
             seq_lens=input_batch.seq_lens,
-            dcp_local_seq_lens=dcp_local_seq_lens,
+            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             max_seq_len=max_model_len,
             block_tables=input_block_tables,
             slot_mappings=slot_mappings,
@@ -75,7 +69,7 @@ def _prepare_dflash_inputs_to_capture(
             for_cudagraph_capture=True,
             causal=causal,
         )
-    return CapturedAttentionState(attn_metadata, slot_mappings_by_layer)
+    return AttentionState(attn_metadata, slot_mappings_by_layer)
 
 
 class DFlashCudaGraphManager(CudaGraphManager):
@@ -87,19 +81,20 @@ class DFlashCudaGraphManager(CudaGraphManager):
         forward_fn: Callable,
         input_buffers: InputBuffers,
         block_tables: BlockTables,
-        query_slot_mappings: torch.Tensor,
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
         causal: bool | Mapping[int, bool],
+        prepare_forward: Callable[[int, dict[str, Any] | None], None],
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
+        """``prepare_forward(num_reqs, attn_metadata)`` is captured ahead of the
+        query forward."""
+
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
-            # This tree's CudaGraphManager.capture() distinguishes warmup from
-            # capture; the DFlash path builds identical state either way.
-            warmup: bool = False,
-        ) -> tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState]:
+            warmup: bool,
+        ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
             num_tokens_across_dp = (
@@ -112,7 +107,6 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 num_tokens,
                 input_buffers,
                 block_tables,
-                query_slot_mappings,
                 attn_groups,
                 kv_cache_config,
                 max_model_len,
@@ -121,16 +115,17 @@ class DFlashCudaGraphManager(CudaGraphManager):
             )
             attn_metadata, slot_mappings = attn_state
 
-            return (
-                lambda cg_mode: forward_fn(
+            def forward(cg_mode: CUDAGraphMode) -> None:
+                prepare_forward(num_reqs, attn_metadata)
+                forward_fn(
                     num_reqs,
                     num_tokens,
                     attn_metadata,
                     slot_mappings,
                     num_tokens_across_dp,
                     cg_mode,
-                ),
-                attn_state,
-            )
+                )
+
+            return forward
 
         super().capture(create_forward_fn, progress_bar_desc)

@@ -376,8 +376,6 @@ class VllmConfig:
     """Execution auxiliary output configuration."""
     engram_config: EngramConfig | None = None
     """N-gram embedding storage and sharding settings."""
-    is_speculative_draft: bool = Field(default=False, repr=False, exclude=True)
-    """Tag a config as describing a speculative draft model's forward."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)

@@ -220,8 +220,6 @@ class DraftModelSpeculator(BaseSpeculator):
             device=device,
         )
         self.arange_np = np.arange(self.max_num_reqs + 1, dtype=np.int32)
-        # CPU tensor twin used by the draft attention-metadata builder.
-        self.arange = torch.arange(self.max_num_reqs + 1, dtype=torch.int32)
         self.draft_is_prefilling = torch.zeros(self.max_num_reqs, dtype=torch.bool)
 
         self.draft_token_confidence_probs = torch.empty_like(
@@ -236,14 +234,9 @@ class DraftModelSpeculator(BaseSpeculator):
         self.acceptance_estimator: OnlineAcceptanceEstimator | None = None
 
         self.draft_logits: torch.Tensor | None = None
-        # 1cat's DFlash2 speculator reads this tuple to decide whether the
-        # dense compatibility buffer exists; keep it in sync with the eager
-        # allocation below.
-        self._draft_logits_init: tuple[torch.dtype, float] | None = None
         if self.speculative_config.draft_sample_method == "probabilistic":
             # Pre-temperature logits, cached from the previous decode step.
             dtype, fill = self.draft_logits_spec(vllm_config)
-            self._draft_logits_init = (dtype, fill)
             self.draft_logits = torch.full(
                 (
                     self.max_num_reqs,
@@ -464,75 +457,6 @@ class DraftModelSpeculator(BaseSpeculator):
                 "place; falling back to rebuilding attention metadata eagerly.",
                 ", ".join(unsupported_backends),
             )
-
-    def _build_draft_attn_metadata(
-        self,
-        num_reqs: int,
-        num_reqs_padded: int,
-        num_tokens_padded: int,
-        seq_lens_cpu_upper_bound: torch.Tensor,
-        step: int,
-        num_query_per_req: int = 1,
-        causal: bool | Mapping[int, bool] = True,
-        query_start_loc_np: np.ndarray | None = None,
-        dcp_local_seq_lens: torch.Tensor | None = None,
-    ) -> dict[str, Any] | None:
-        if query_start_loc_np is not None:
-            # Non-uniform query layout (e.g. multi-module MTP's mixed
-            # prefill/decode queries); num_query_per_req is ignored.
-            query_start_loc_cpu = torch.empty(num_reqs_padded + 1, dtype=torch.int32)
-            query_start_loc_cpu[: num_reqs + 1] = torch.from_numpy(
-                query_start_loc_np[: num_reqs + 1]
-            )
-            query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
-            max_query_len = int(
-                (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max()
-            )
-        else:
-            # Uniform query: query_start_loc[i] = min(i, num_reqs) * num_query_per_req.
-            # Clamp keeps the series non-decreasing past num_reqs, which some
-            # attention backends require.
-            query_start_loc_cpu = (
-                torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
-                * num_query_per_req
-            )
-            max_query_len = num_query_per_req
-        block_tables = [
-            x[:num_reqs_padded] for x in self.block_tables.input_block_tables
-        ]
-        slot_mappings = self.block_tables.slot_mappings[:, :num_tokens_padded]
-        draft_seq_lens_cpu_upper_bound = torch.zeros(
-            num_reqs_padded, dtype=torch.int32, device="cpu"
-        )
-        torch.add(
-            seq_lens_cpu_upper_bound[:num_reqs],
-            step,
-            out=draft_seq_lens_cpu_upper_bound[:num_reqs],
-        )
-        draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
-        attn_metadata = build_attn_metadata(
-            attn_groups=self.attn_groups,
-            num_reqs=num_reqs_padded,
-            num_tokens=num_tokens_padded,
-            query_start_loc_gpu=self.input_buffers.query_start_loc[
-                : num_reqs_padded + 1
-            ],
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
-            dcp_local_seq_lens=(
-                None
-                if dcp_local_seq_lens is None
-                else dcp_local_seq_lens[:num_reqs_padded]
-            ),
-            max_seq_len=self.draft_max_seq_len,
-            block_tables=block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=self.kv_cache_config,
-            causal=causal,
-            seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
-        )
-        return attn_metadata
 
     def _build_attn_metadata(
         self,

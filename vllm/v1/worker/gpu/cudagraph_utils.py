@@ -76,10 +76,6 @@ class AttentionState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor]
 
 
-# 1cat's DFlash cuda-graph manager names the same tuple CapturedAttentionState.
-CapturedAttentionState = AttentionState
-
-
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
@@ -507,12 +503,8 @@ class CudaGraphManager:
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
-                    # Prepare inputs and get forward function. A manager may
-                    # also return the attention state it captured; the graph
-                    # forward closes over it, so only the callable is needed.
+                    # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
-                    if isinstance(forward_fn, tuple):
-                        forward_fn = forward_fn[0]
 
                     # Warmup
                     forward_fn(CUDAGraphMode.NONE)
@@ -531,8 +523,6 @@ class CudaGraphManager:
                     else:
                         # Capture with fresh attention state.
                         forward_fn = create_forward_fn(desc, warmup=False)
-                        if isinstance(forward_fn, tuple):
-                            forward_fn = forward_fn[0]
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
                             continue
