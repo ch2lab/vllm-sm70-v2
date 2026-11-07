@@ -333,14 +333,13 @@ def sm70_nvfp4_paged_decode(
         from .sm70_nvfp4_decode_cuda import _rows_ok
 
         base = kv_lens - (nqt - 1)
-        if _rows_ok(q, nqt, block_table):
-            for p in range(nqt):
-                sm70_nvfp4_paged_decode(
-                    q, kv_cache, block_table, base + p, out,
-                    k_scale, v_scale, sm_scale, window_left, splits, workspace,
-                    q0=p, nqt=nqt, _single=True,
-                )
-            return
+        # The former "_single" fast path passed the full q to a kernel whose
+        # grid is (R, H, splits) with R = q.shape[0], i.e. num_reqs * nqt, while
+        # kv_lens/block_table only hold num_reqs rows. That read past both
+        # tensors and faulted with a Triton illegal memory access under graph
+        # capture (MTP k=12 verify, nqt=2). q0/nqt are not kernel arguments, so
+        # the path cannot select its row either: use the per-position slicing
+        # path below, which is correct and keeps the launch shapes exact.
         R = q.shape[0] // nqt
         for p in range(nqt):
             out_p = torch.empty(R, q.shape[1], q.shape[2], dtype=out.dtype,
