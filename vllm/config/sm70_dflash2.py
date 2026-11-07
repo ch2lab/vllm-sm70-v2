@@ -59,10 +59,21 @@ def capture_sm70_dflash2_config(vllm_config: Any = None) -> dict[str, Any] | Non
     return dict(extra) if isinstance(extra, dict) else {}
 
 
+# Optional SM70 DFlash2 accelerations that are safe without the FLASH_ATTN_V100
+# backend. Everything else stays off until it is ported and validated.
+# context_kv_graph was tried here and faults: capturing the context-KV store
+# graph raises an illegal memory access in this tree (see 03_history (119)).
+# Treat the set as empty until a port is validated end to end.
+_SAFE_SM70_DFLASH2_FEATURES: frozenset[str] = frozenset()
+
+
 def sm70_dflash2_enabled(feature: str, config: Any) -> bool:
-    if not isinstance(config, dict):
+    """Whether an optional SM70 DFlash2 acceleration is enabled."""
+    if feature not in _SAFE_SM70_DFLASH2_FEATURES:
         return False
-    return bool(config.get(feature, False))
+    if isinstance(config, dict):
+        return bool(config.get(feature, True))
+    return True
 
 def dflash2_bf16_emulation(policy: "Sm70DFlash2Config | None") -> bool:
     """Whether the range-preserving FP16 path for BF16 drafts is enabled.

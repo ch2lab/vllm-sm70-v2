@@ -21770,3 +21770,16 @@ in-place metadata builder，本树没有这个后端，于是每步 8 行 × 5 �
 在高并发下摊不掉。DFlash2 目前**只在 64K 单流有优势**（190.8 vs 155.2）。
 
 后续要么补 `FLASH_ATTN_V100`（使其可走 FULL graph），要么只在长上下文档启用 DFlash2。
+
+### (119) DFlash2 的可选图加速在本树不可用（2026-11-07 13:10–13:20）
+
+conc8 上 DFlash2 每步约 **75.8 ms**（MTP 约 24.5 ms），草稿是 eager、每步还有
+Python 侧 metadata 重建。尝试打开策略里的 `context_kv_graph`（把 context-KV 的
+投影+写缓存捕成 CUDA graph，复用草稿的 persistent buffers）时，**capture 阶段直接
+`CUDA error: an illegal memory access`**，引擎起不来。已回退，`_SAFE_SM70_DFLASH2_FEATURES`
+置空，并把 V100-only 的 `_capture_draft_metadata_graph` 做成"缺后端时打印一次并跳过"，
+保证策略开关不会再把启动打崩。
+
+结论：DFlash2 在本树只有 **eager 草稿**这一条可用路径。要走 FULL graph 必须补
+`vllm/v1/attention/backends/flash_v100/`（1cat 树里 **10,728 行 / 23 文件**，另依赖
+`config/execution_policy.py` 878 行等），属于独立的移植周期，不在本次范围。

@@ -874,10 +874,20 @@ class DFlash2Speculator(DFlashSpeculator):
         self._capture_draft_metadata_graph(shapes)
 
     def _capture_draft_metadata_graph(self, shapes: list[tuple[int, int]]) -> None:
-        from vllm.v1.attention.backends.flash_v100 import (
-            FlashAttnV100Impl,
-            FlashAttnV100MetadataBuilder,
-        )
+        try:
+            from vllm.v1.attention.backends.flash_v100 import (
+                FlashAttnV100Impl,
+                FlashAttnV100MetadataBuilder,
+            )
+        except ImportError:
+            # This tree has no FLASH_ATTN_V100 backend; its in-place draft
+            # metadata builder is what makes a FULL draft graph replayable.
+            # Say so once and keep the (correct) eager draft path.
+            logger.info_once(
+                "DFlash2 draft metadata refresh graphs need FLASH_ATTN_V100, "
+                "which this build does not ship; draft steps stay eager."
+            )
+            return
 
         has_causal = (
             any(self._group_causal.values())

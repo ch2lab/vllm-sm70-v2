@@ -175,8 +175,34 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
     def _debug_proposal_stage(self, stage: str) -> None:
-        if getattr(self, "_debug_proposal_stages", False):
-            logger.info("DFlash proposal stage: %s", stage)
+        if not getattr(self, "_debug_proposal_stages", False):
+            return
+        # Opt-in CUDA-event split so a slow draft step can be attributed
+        # without a profiler (which this engine cannot run).
+        marks = getattr(self, "_stage_marks", None)
+        if marks is None:
+            marks = self._stage_marks = {}
+            self._stage_totals = {}
+            self._stage_count = 0
+        gpu = torch.cuda.current_stream().synchronize
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        previous = marks.get("_last")
+        if previous is not None:
+            gpu()
+            elapsed = previous.elapsed_time(event)
+            totals = self._stage_totals
+            totals[stage] = totals.get(stage, 0.0) + elapsed
+        marks["_last"] = event
+        if stage == "query and selector end":
+            self._stage_count += 1
+            if self._stage_count % 20 == 0:
+                totals = self._stage_totals
+                logger.info(
+                    "DFlash stage timing (avg of %d steps): %s",
+                    self._stage_count,
+                    {k: round(v / self._stage_count, 2) for k, v in totals.items()},
+                )
 
     def _debug_dump_real_proposal(
         self,
