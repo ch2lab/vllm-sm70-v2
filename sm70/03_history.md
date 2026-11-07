@@ -21928,3 +21928,30 @@ AR 侧同样接近地板，切片数 S 扫描（16 行，160 KB 载荷）：
 **flat AR 回退**：引擎内（graph 显存 profile 阶段）在 n=409600（80 行）触发
 `flat AR launch rc=700` 并伴随 Xid 31；微基准复现不出。它只值 +2.9%（conc8 无缓存），
 故默认改回 NCCL（`QUASAR_NCCL_AR=0` 可opt-in），信封 `VALIDATED_N_MAX` 保留作二道防线。
+
+### (125) nvfp4 KV + CUDA graph 修复；暴露出 D=128 缺快速内核（2026-11-07 16:05–16:45）
+
+**修复的 bug（真 bug，我定位到具体行）**：`sm70_nvfp4_decode.py` 的 `_single` 快路径
+把**完整的 q** 传给 grid 为 `(R,H,splits)` 的 Triton 内核，而 `R = q.shape[0] = num_reqs*nqt`；
+`kv_lens` / `block_table` 只有 `num_reqs` 行 ⇒ 越界读 ⇒ MTP k=12（nqt=2）图捕获时
+`Triton Error [CUDA]: an illegal memory access`。且 `q0/nqt` 只是 Python 参数、内核并不接收，
+该路径也无法选中自己那一行。已改为走逐位置切片路径（`R = q.shape[0] // nqt`）。
+
+**验证**：nvfp4 + MTP k=12 + FULL_AND_PIECEWISE 图 → `Application startup complete`，
+请求正常返回 48 tokens（修复前是 4 卡 Xid 31 MMU fault / CUBLAS_STATUS_INTERNAL_ERROR）。
+
+**但性能不可接受**（同一 harness、salt 9918、nvfp4）：
+
+| 指标 | nvfp4（修复后） | fp8_e4m3（对照） | 倍差 |
+|---|---|---|---|
+| 8K 单流 | 43.4 tok/s | 243.5 | 5.6× 慢 |
+| 64K 单流 | 6.7 tok/s | 155.8 | 23× 慢 |
+
+**根因方向**：树里的"快"decode CUDA 内核（`sm70_nvfp4_decode_cuda.py` 的 XQA 家族）在源码里
+`#define HD 256`，即**为 D=256 几何写死的**（`supported_decode` 只列 `(H=2,HQ=16)`、`(H=1,HQ=8)`）。
+我们的 27B 在 TP4 下是 `H=1, HQ=6, D=128` ⇒ 命中不了快路径，回落到 Triton 内核，
+长上下文极慢。这正是目标里"为每个量化设计专用快速内核"要补的部分。
+
+**启动器已参数化**：`QUASAR_MODEL` / `QUASAR_NAME` / `QUASAR_MAXLEN`（外加已有的
+`QUASAR_TP` / `QUASAR_KV` / `QUASAR_PORT` / `QUASAR_DEVS`），同一脚本可服务三个模型；
+备份 `/data/sm70_results/serve_sm70_generic.sh`。
