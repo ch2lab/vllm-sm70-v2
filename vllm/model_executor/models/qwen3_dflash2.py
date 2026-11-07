@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
+from functools import cache
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -8,12 +11,34 @@ from torch import nn
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
+from vllm.config.speculative import get_dflash_model_draft_tokens
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+)
+from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer
 
+from .dflash_sm70 import (
+    DFLASH_SM70_WIDE_OUTPUT_SCALE,
+    DFlashSM70MLP,
+    DFlashSM70RMSNorm,
+)
 from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
     DFlashQwen3ForCausalLM,
@@ -21,124 +46,68 @@ from .qwen3_dflash import (
 )
 from .utils import maybe_prefix
 
+logger = init_logger(__name__)
 
-@triton.jit
-def _dflash2_grouped_conv_kernel(
-    x_ptr,
-    delta_ptr,
-    base_ptr,
-    output_ptr,
-    x_stride_row,
-    delta_stride_row,
-    delta_stride_tap,
-    base_stride_tap,
-    output_stride_row,
-    NUM_CHANNELS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    TAPS: tl.constexpr,
-    ELEMENT_BLOCK: tl.constexpr,
-) -> None:
-    row = tl.program_id(0) // triton.cdiv(NUM_CHANNELS, ELEMENT_BLOCK)
-    col_block = tl.program_id(0) % triton.cdiv(NUM_CHANNELS, ELEMENT_BLOCK)
-    channels = col_block * ELEMENT_BLOCK + tl.arange(0, ELEMENT_BLOCK)
-    mask = channels < NUM_CHANNELS
-    groups = channels // GROUP_SIZE
-    position = row % BLOCK_SIZE
 
-    delta_row = delta_ptr + row * delta_stride_row
-    x_row = x_ptr + row * x_stride_row
-    accumulator = (
-        tl.load(base_ptr + channels, mask=mask, other=0.0).to(tl.float32)
-        + tl.load(delta_row + groups, mask=mask, other=0.0).to(tl.float32)
-    ) * tl.load(x_row + channels, mask=mask, other=0.0).to(tl.float32)
+def _use_sm70_bf16_emulation(config) -> bool:
+    declared_dtype = getattr(config, "dtype", None)
+    if declared_dtype is None:
+        declared_dtype = getattr(config, "torch_dtype", None)
+    is_bf16 = declared_dtype is torch.bfloat16 or str(declared_dtype).lower() in {
+        "bfloat16",
+        "bf16",
+        "torch.bfloat16",
+    }
+    policy = capture_sm70_dflash2_config()
+    from vllm.config.sm70_dflash2 import dflash2_bf16_emulation
 
-    for tap in tl.static_range(1, TAPS):
-        tap_mask = mask & (position >= tap)
-        coefficient = tl.load(
-            base_ptr + tap * base_stride_tap + channels,
-            mask=tap_mask,
-            other=0.0,
-        ).to(tl.float32) + tl.load(
-            delta_row + tap * delta_stride_tap + groups,
-            mask=tap_mask,
-            other=0.0,
-        ).to(tl.float32)
-        x = tl.load(
-            x_ptr + (row - tap) * x_stride_row + channels,
-            mask=tap_mask,
-            other=0.0,
-        ).to(tl.float32)
-        accumulator += coefficient * x
-
-    tl.store(
-        output_ptr + row * output_stride_row + channels,
-        accumulator,
-        mask=mask,
+    enabled = dflash2_bf16_emulation(policy)
+    if not (enabled and is_bf16 and current_platform.is_cuda()):
+        return False
+    # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
+    # draft in FP16, so both need the range-preserving path: the criterion is
+    # the missing capability, not one architecture number. Ask the device this
+    # worker builds on; device 0 of the visibility list may be another card on
+    # a node that mixes architectures.
+    return not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
     )
 
 
-def dflash2_grouped_conv_impl(
-    x: torch.Tensor,
-    delta: torch.Tensor,
-    base: torch.Tensor,
-    block_size: int,
-    group_size: int,
-) -> torch.Tensor:
-    """DFlash2 grouped convolution adapted from LightSeek TokenSpeed PR #1399."""
-    num_rows, num_channels = x.shape
-    output = torch.empty_like(x)
-    if num_rows == 0:
-        return output
+@cache
+def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | None:
+    """Return FlashInfer radix top-k only where the installed kernel can run.
 
-    element_block = 1024 if num_rows >= 128 and num_channels % 1024 == 0 else 512
-    grid = (num_rows * triton.cdiv(num_channels, element_block),)
-    _dflash2_grouped_conv_kernel[grid](
-        x,
-        delta,
-        base,
-        output,
-        x.stride(0),
-        delta.stride(0),
-        delta.stride(1),
-        base.stride(0),
-        output.stride(0),
-        NUM_CHANNELS=num_channels,
-        BLOCK_SIZE=block_size,
-        GROUP_SIZE=group_size,
-        TAPS=base.shape[0],
-        ELEMENT_BLOCK=element_block,
-        num_warps=4,
-    )
-    return output
+    Presence is not a sufficient capability check: FlashInfer can be installed
+    in the V100 environment while its radix top-k has no SM70 implementation.
+    """
+    if not current_platform.is_cuda():
+        return None
+    # Same rule as _use_sm70_bf16_emulation: ask the worker's own device, not
+    # device 0 of the visibility list; the cache is per process, i.e. per
+    # worker.
+    if not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
+    ):
+        logger.info_once(
+            "DFlash2 disables FlashInfer top-k below SM80; using torch.topk."
+        )
+        return None
+    if not has_flashinfer():
+        logger.info_once(
+            "FlashInfer is unavailable; the DFlash2 selector uses torch.topk."
+        )
+        return None
+    from flashinfer import top_k
+
+    return top_k
 
 
-def dflash2_grouped_conv_fake(
-    x: torch.Tensor,
-    delta: torch.Tensor,
-    base: torch.Tensor,
-    block_size: int,
-    group_size: int,
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-direct_register_custom_op(
-    op_name="dflash2_grouped_conv",
-    op_func=dflash2_grouped_conv_impl,
-    fake_impl=dflash2_grouped_conv_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
-
-
-def dflash2_grouped_conv(
-    x: torch.Tensor,
-    delta: torch.Tensor,
-    base: torch.Tensor,
-    block_size: int,
-    group_size: int,
-) -> torch.Tensor:
-    return torch.ops.vllm.dflash2_grouped_conv(x, delta, base, block_size, group_size)
+def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    impl = _flashinfer_topk()
+    if impl is None or not scores.is_cuda:
+        return torch.topk(scores, k, dim=-1)
+    return impl(scores, k, sorted=True, deterministic=True)
 
 
 def _grouped_conv(
@@ -150,9 +119,6 @@ def _grouped_conv(
     group_size: int,
     taps: int,
 ) -> torch.Tensor:
-    if hidden_states.is_cuda:
-        return dflash2_grouped_conv(hidden_states, delta, base, block_size, group_size)
-
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     output = coefficients[:, 0] * blocks
@@ -176,7 +142,6 @@ class DFlashGroupedConv(nn.Module):
         block_size: int,
         params_dtype: torch.dtype,
         prefix: str,
-        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -196,7 +161,7 @@ class DFlashGroupedConv(nn.Module):
             2 * taps * self.num_groups,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=maybe_prefix(prefix, "kernel_projection"),
             return_bias=False,
         )
@@ -245,6 +210,52 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
+        self.use_sm70_bf16_emulation = _use_sm70_bf16_emulation(config)
+        if self.use_sm70_bf16_emulation:
+            runtime_dtype = vllm_config.model_config.dtype
+            if runtime_dtype != torch.float16:
+                raise ValueError(
+                    "BF16 DFlash2 on SM70 requires FP16 runtime transport; "
+                    f"got runtime dtype {runtime_dtype}."
+                )
+            self.self_attn.output_input_scale = DFLASH_SM70_WIDE_OUTPUT_SCALE
+            self.mlp = DFlashSM70MLP(self.mlp)
+            self.input_layernorm = DFlashSM70RMSNorm(
+                config.hidden_size,
+                config.rms_norm_eps,
+                runtime_dtype,
+            )
+            self.post_attention_layernorm = DFlashSM70RMSNorm(
+                config.hidden_size,
+                config.rms_norm_eps,
+                runtime_dtype,
+            )
+        self.self_attn._sm70_dflash2_qk_rope = bool(
+            self.use_sm70_bf16_emulation
+            and config.hidden_size == 5120
+            and vllm_config.speculative_config is not None
+            and get_dflash_model_draft_tokens(vllm_config.speculative_config) == 7
+            and vllm_config.model_config.dtype == torch.float16
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+            and self.self_attn.q_size == 1024
+            and self.self_attn.kv_size == 256
+            and self.self_attn.head_dim == 128
+            and self.self_attn.is_neox_style
+            and self.self_attn.rotary_emb.rotary_dim == 128
+            and self.self_attn.attn.attn_backend.get_name() == "FLASH_ATTN_V100"
+        )
+        if self.self_attn._sm70_dflash2_qk_rope:
+            # Import registers the cache-aware opaque op before model tracing.
+            from vllm.model_executor.layers.attention import (
+                sm70_dflash2_qk_rope,  # noqa: F401
+            )
+
+            logger.info_once(
+                "SM70 DFlash2 fused Q/K norm, RoPE and KV publication enabled."
+            )
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
@@ -252,10 +263,10 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),
             group_size=int(draft_config["conv_group_size"]),
-            # Query tokens per request: the bonus token plus the mask tokens.
-            block_size=1 + speculative_config.num_speculative_tokens,
+            # Keep the convolution boundary at the checkpoint-trained block
+            # even when lookup augments the target verification block.
+            block_size=1 + get_dflash_model_draft_tokens(speculative_config),
             params_dtype=vllm_config.model_config.dtype,
-            quant_config=quant_config,
         )
         self.attention_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "attention_conv")
@@ -263,6 +274,27 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
+
+        if (
+            self.use_sm70_bf16_emulation
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+        ):
+            for projection in (
+                self.self_attn.qkv_proj,
+                self.self_attn.o_proj,
+                self.mlp.gate_up_proj,
+                self.mlp.down_proj,
+                self.attention_conv.kernel_projection,
+                self.mlp_conv.kernel_projection,
+            ):
+                if isinstance(projection.quant_method, UnquantizedLinearMethod):
+                    projection._sm70_dflash2_fp16_m8 = True
+                    projection._sm70_dflash2_fp8_m8 = (
+                        get_dflash_model_draft_tokens(speculative_config) == 7
+                    )
 
     def forward(
         self,
@@ -296,7 +328,8 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    successors = successor_table[candidate_ids]
+    vocab_size = successor_table.shape[0]
+    successors = successor_table[candidate_ids.clamp(0, vocab_size - 1)]
     predecessor_ids = torch.cat(
         (
             anchor_token_ids[:, None, None].expand(-1, 1, top_k),
@@ -304,7 +337,7 @@ def _score_edges(
         ),
         dim=1,
     )
-    predecessors = predecessor_table[predecessor_ids]
+    predecessors = predecessor_table[predecessor_ids.clamp(0, vocab_size - 1)]
     return unary_logits[:, :, None] + torch.einsum(
         "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
     )
@@ -361,6 +394,61 @@ class CandidateSelector(nn.Module):
 class DFlash2Qwen3Model(DFlashQwen3Model):
     decoder_layer_cls = DFlash2Qwen3DecoderLayer
 
+    def _make_context_projection(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+    ) -> nn.Module:
+        from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+
+        use_sharded_fc = (
+            sm70_dflash2_enabled(
+                "sharded_context_fc", capture_sm70_dflash2_config(vllm_config)
+            )
+            and (self.quant_config is None or isinstance(self.quant_config, GGUFConfig))
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and (input_size, output_size)
+            in {
+                (25600, 5120),
+                (20480, 4096),
+            }
+        )
+        if not use_sharded_fc:
+            return super()._make_context_projection(
+                vllm_config=vllm_config,
+                input_size=input_size,
+                output_size=output_size,
+                prefix=prefix,
+            )
+
+        projection = ColumnParallelLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            gather_output=True,
+            params_dtype=vllm_config.model_config.dtype,
+            quant_config=self.quant_config,
+            prefix=prefix,
+            return_bias=False,
+        )
+        projection._sm70_f16_force_enable = True
+        # TurboMind wins at the 8-row decode shape, while cuBLAS is faster for
+        # 128+ context rows. Keep the exact small-M path and let ordinary
+        # F.linear handle chunked-prefill projection shapes.
+        projection._sm70_f16_max_m = 64
+        logger.info_once(
+            "Using TP4 output-sharded DFlash2 target-hidden projection on SM70 "
+            "(%d->%d plus compact all-gather).",
+            input_size,
+            output_size,
+        )
+        return projection
+
     def __init__(
         self,
         *,
@@ -374,10 +462,30 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             prefix=prefix,
         )
         draft_config = self.config.dflash_config
+        self.use_sm70_bf16_emulation = _use_sm70_bf16_emulation(self.config)
+        if self.use_sm70_bf16_emulation:
+            runtime_dtype = vllm_config.model_config.dtype
+            self.hidden_norm = DFlashSM70RMSNorm(
+                self.config.hidden_size,
+                self.config.rms_norm_eps,
+                runtime_dtype,
+                residual_scale=1.0,
+            )
+            self.norm = DFlashSM70RMSNorm(
+                self.config.hidden_size,
+                self.config.rms_norm_eps,
+                runtime_dtype,
+            )
+            logger.info_once(
+                "Using range-preserving BF16 DFlash2 arithmetic on SM70 "
+                "(FP32 residual, BF16 RNE, scaled FP16 projections)."
+            )
         self.input_embedding_scale = float(
             draft_config.get("input_embedding_scale", 1.0)
         )
-        # Without its own tag the selector shares the draft head's compile cache.
+        # The selector is compiled separately from the draft backbone. A unique
+        # model tag prevents the two incompatible input signatures from sharing
+        # a persistent compile-cache namespace.
         with set_model_tag("dflash2_candidate_selector"):
             self.candidate_selector = CandidateSelector(
                 hidden_size=self.config.hidden_size,
@@ -391,26 +499,94 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return super().embed_input_ids(input_ids) * self.input_embedding_scale
 
+    def _normalize_context_states(self, context_states: torch.Tensor) -> torch.Tensor:
+        if self.use_sm70_bf16_emulation:
+            return self.hidden_norm(context_states)
+        return super()._normalize_context_states(context_states)
+
 
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = DFlash2Qwen3Model
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        draft_config = self.config.dflash_config
-        softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
-        self.candidate_logits_processor = LogitsProcessor(
-            vllm_config.model_config.get_vocab_size(),
-            scale=float(draft_config.get("output_multiplier", 1.0)),
-            soft_cap=softcap if softcap > 0 else None,
+        self._packed_topk_enabled = vllm_config.kernel_config.sm70_packed_topk_gather
+        self._packed_topk_selections = (
+            vllm_config.kernel_config.collective_kernel_selections
         )
+        self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
+        draft_config = self.config.dflash_config
+        self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
+        softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
+        self.final_logit_softcapping = softcap if softcap > 0 else None
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.candidate_logits_processor.get_top_k_tokens(
-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
+        unquantized_head = isinstance(
+            self.lm_head.quant_method,
+            (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
         )
+        if not unquantized_head:
+            if not sm70_dflash2_enabled("quant_lm_head", self._sm70_dflash2_policy):
+                raise ValueError(
+                    "DFlash2 requires an unquantized target LM head for "
+                    "candidate TopK; got "
+                    f"{type(self.lm_head.quant_method).__name__}. Set "
+                    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD=1 to use the "
+                    "dense-logit fallback over the quantized head."
+                )
+            logger.info_once(
+                "VLLM_SM70_DFLASH2_QUANT_LM_HEAD=1: DFlash2 candidate TopK "
+                "uses the dense-logit fallback over the quantized target "
+                "LM head (%s).",
+                type(self.lm_head.quant_method).__name__,
+            )
+
+        selector = self.model.candidate_selector
+        local_candidates = (
+            self.lm_head.maybe_get_sm70_dflash2_top20(hidden_states, selector.top_k)
+            if unquantized_head
+            else None
+        )
+        if local_candidates is None:
+            logits = self.lm_head.quant_method.apply(
+                self.lm_head, hidden_states, bias=None
+            )
+            num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+            if num_pad > 0:
+                logits[..., -num_pad:] = -float("inf")
+            values, ids = _topk(logits, selector.top_k)
+            ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+        else:
+            values, ids = local_candidates
+
+        if get_tensor_model_parallel_world_size() > 1:
+            packed = gather_topk_pairs(
+                values,
+                ids,
+                vocab_size=self.lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
+            )
+            if packed is None:
+                values = tensor_model_parallel_all_gather(values, dim=-1)
+                ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            else:
+                values, ids = packed
+
+        if values.shape[-1] > selector.top_k:
+            values, selected = _topk(values, selector.top_k)
+            ids = ids.gather(-1, selected)
+
+        values = values.float() * self.output_multiplier
+        if self.final_logit_softcapping is not None:
+            cap = self.final_logit_softcapping
+            values = torch.tanh(values / cap) * cap
+        return ids, values
 
 
 EntryClass = DFlash2Qwen3ForCausalLM

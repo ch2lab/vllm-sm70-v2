@@ -122,6 +122,7 @@ class InputBatch:
     # drafts) over existing context and so compute exactly like decodes.
     # None if there are no prefills.
     prefill_runs_as_decode_np: np.ndarray | None = None
+    is_incomplete_prefilling_np: np.ndarray | None = None
 
     @classmethod
     def make_dummy(

@@ -33,6 +33,10 @@ class BlockTables:
         sliding_window_reach: list[int] | None = None,
     ):
         self.block_sizes = block_sizes
+        # The DFlash/DFlash2 speculators (ported from 1cat) index the
+        # kernel block sizes separately; this tree has no kernel/
+        # scheduler split, so they are the same list.
+        self.kernel_block_sizes = block_sizes
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.device = device
