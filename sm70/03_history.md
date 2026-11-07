@@ -21466,3 +21466,29 @@ AL 证据：单流档出现 **33.00**（ngram 路径生效），并发档为 1.7
 ⇒ 1→4 行 **2.96 ms/行**，8→16 行 **2.56 ms/行**（扣掉 1.8 ms 的 draft 前传后 2.33）；
 而单流只有 1.36–1.52 ms/行 ⇒ **并发下每行贵 ~1.7×**（all-reduce 载荷随行数增长）。
 这解释了为什么"加大 k"在并发下不划算，也是 c8k2/c8k3 要验证的边界。
+
+### (109) DFlash2 移植面实测清点（2026-11-07 09:07，为 conc8 的 block drafting 立项）
+
+本树现状 vs 1cat 1.5.2 的 DFlash2 栈（行数实测）：
+
+| 文件 | 1cat | 我们 | 说明 |
+|---|---|---|---|
+| `spec_decode/dflash/speculator.py` | 1118 | — | DFlash 基础 speculator（DFlash2 继承它） |
+| `spec_decode/dflash2/speculator.py` | 1356 | **265** | 块并行草稿 + selector 主逻辑 |
+| `spec_decode/dflash2/lookup.py` | 336 | — | successor 表（lookup） |
+| `spec_decode/dflash2/ngram_assist.py` | 162 | — | host 侧 prompt-ngram 补位 |
+| `spec_decode/dflash2/sampler_graph.py` | 434 | — | 图内采样 |
+| `spec_decode/dflash2/sparse_rejection.py` | 559 | — | 稀疏拒绝（树验证） |
+| `config/sm70_dflash2.py` | 532 | — | 专用配置 |
+| `models/qwen3_dflash2.py` | 592 | 416 | 草稿模型本体 |
+| **合计** | **5091** | **681** | 缺口 ≈ 4400 行 |
+
+**关键依赖**：`vllm.config.sm70_dflash2`（本树没有）、`gumbel_noised_argmax`、以及
+`sm70_greedy_verify` / `sm70_sparse_target` 一类 SM70 专用验证内核；他们的 DFlash2 还依赖
+"2–4 请求共用草稿投影"的多请求验证。
+
+**建议的最小切片（若立项）**：只移植"一次前传出 block_size=8 个 token"的草稿路径 +
+selector，验证侧**复用我们已有的双位置 XQA（已支持 nqt=7/11/13）**与原生 rejection sampler，
+暂不移植 `sparse_rejection`/`sampler_graph`。风险：32 行/请求在并发下按我们实测
+2.56 ms/行会变成 ~176 ms/步，AL 必须 ≥5.5 才可能追平；所以**先等 1.5.2 同机基线的
+step/AL 实测**，用它反推他们的行成本，再决定是否值得这 4400 行。
