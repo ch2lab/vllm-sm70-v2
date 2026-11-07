@@ -35,6 +35,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, required=True)
     ap.add_argument("--max-bytes", type=int, default=1 << 20)
+    ap.add_argument("--s-max", type=int, default=8)
     args = ap.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -49,7 +50,7 @@ def main() -> None:
         group=cpu_group,
         device=torch.device(f"cuda:{rank}"),
         max_bytes=args.max_bytes,
-        s_max=8,
+        s_max=args.s_max,
     )
     rows = args.rows
     x = torch.randn(rows, HIDDEN, dtype=torch.float16, device=f"cuda:{rank}")
@@ -57,7 +58,7 @@ def main() -> None:
     dist.all_reduce(ref)
     torch.cuda.synchronize()
     if rank == 0:
-        print(f"rows={rows} n={x.numel()} bytes={x.numel() * 2} "
+        print(f"rows={rows} S={args.s_max} n={x.numel()} bytes={x.numel() * 2} "
               f"cap={args.max_bytes} should_use={flat.should_use(x)}")
     if not flat.should_use(x):
         print(f"[rank {rank}] shapes outside the flat route; nothing to test")
