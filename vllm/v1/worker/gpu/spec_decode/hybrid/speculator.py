@@ -28,10 +28,6 @@ import torch
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.ngram.speculator import NgramGPUSpeculator
 
-# Position of num_sampled in BaseSpeculator.propose's argument list.
-_NUM_SAMPLED_ARG = 5
-
-
 class NgramMTPHybridSpeculator(MTPSpeculator):
     """MTPSpeculator that hands small, decode-only batches to prompt lookup."""
 
@@ -62,14 +58,17 @@ class NgramMTPHybridSpeculator(MTPSpeculator):
         batch = kwargs.get("input_batch", args[0] if args else None)
         if batch is None or batch.num_reqs > self.ngram_max_reqs:
             return False
-        # Prefill steps must reach the MTP drafter so its KV cache is filled
-        # for requests that may later be verified against MTP drafts.
-        num_sampled = kwargs.get("num_sampled")
-        if num_sampled is None and len(args) > _NUM_SAMPLED_ARG:
-            num_sampled = args[_NUM_SAMPLED_ARG]
-        if num_sampled is not None and bool((num_sampled == 0).any()):
+        k = kwargs.get("num_speculative_tokens") or self.num_speculative_steps
+        # Decode steps schedule exactly k+1 tokens per request.  Anything else
+        # (chunked prefill, mixed batches) must reach the MTP drafter so its KV
+        # cache is filled for requests that may later be served by MTP.
+        # num_scheduled_tokens is a host numpy array, so this costs no sync --
+        # probing the GPU num_sampled tensor here cost ~8% of the step.
+        sched = getattr(batch, "num_scheduled_tokens", None)
+        if sched is None:
             return False
-        return True
+        width = int(k) + 1
+        return bool((sched[: batch.num_reqs] == width).all())
 
     @torch.inference_mode()
     def propose(self, *args, **kwargs):
