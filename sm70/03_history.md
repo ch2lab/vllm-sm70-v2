@@ -21727,3 +21727,32 @@ Per-position: 0.846, 0.462, 0.385, 0.308, 0.231, 0.231, 0.154
 **保留的诊断开关**（默认全关，仅诊断时用）：
 `QUASAR_TRACE_PROPOSAL_STAGES=1`（1cat 的 token diagnostic）、
 `QUASAR_TRACE_DFLASH_STAGES=1`（逐阶段 finite/nan/inf/absmax）。
+
+### (118) DFlash2 的首个端到端性能读数与一个 harness 兼容性问题（2026-11-07 12:40–13:00）
+
+修复 (117) 后用固定 harness（`perf_arms.sh`，`ARMS="dflash7"`，NVFP4 drafter，k=7）测到：
+
+| 指标 | DFlash2 | MTP k=12（同期基线） | ngram k=32 |
+|---|---|---|---|
+| 8K 单流 | 223.5 tok/s | 243.6 | 698.9 |
+| 64K 单流 | **190.8 tok/s** | 155.2 | 417.0 |
+| conc8 | **不可测（见下）** | 287.9 | 173.0 |
+
+⇒ 64K 比 MTP 快 **+23%**（155.2→190.8）；8K 仍低于 MTP（草稿 eager 前向的固定开销）。
+首次 8K 读数 195.5，修掉 eager 回退沿用 graph padding 形状的 bug 后升到 223.5。
+
+**conc8 的 harness 阻塞**：`sm70_tests/qsa_conc_tput.py` 的 decode 模式默认发 65k 共享前缀，
+并要求 `cached_tokens >= 0.95 × 前缀长度`。DFlash2 下实测（同 prompt 连发两次）：
+
+```
+first : cached=0 prompt_tokens=9040
+second: cached=0 prompt_tokens=9040
+```
+
+即**前缀缓存完全不命中**。MTP/ngram（无独立 draft KV group）同期是命中的。
+原因方向：DFlash 的独立 draft KV cache group 让 `HybridKVCacheCoordinator` 的
+公共命中长度被拉到 0（Mamba 'align' + draft group 的组合）。这是**新发现的能力缺口**，
+不是本次修复引入的数值问题。
+
+**处置**：给 harness 加 `--decode-no-prefix`（decode 模式改用独立 prompt、不做 APC 校验），
+用**同脚本、同 salt、同长度**对 DFlash2 与 MTP 做同期 A/B，避免拿不同口径比。

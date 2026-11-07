@@ -186,6 +186,10 @@ def main() -> int:
     ap.add_argument("--rounds", type=int, default=2,
                     help="1 = warm only; N = 1 warm + N-1 timed")
     ap.add_argument("--tag", default="conc_tput")
+    ap.add_argument("--decode-no-prefix", action="store_true",
+                    help="decode mode with independent prompts (no APC): for "
+                         "speculators whose draft KV group never reuses a "
+                         "shared prefix, where prefix mode reports INVALID.")
     ap.add_argument("--decode-prefix-len", type=int, default=None,
                     help="decode mode: shared prompt length (default "
                          "65536) — identical for all slots; warm round "
@@ -200,7 +204,16 @@ def main() -> int:
         args.max_tokens = d_out
 
     tok = common._tokenizer()
-    if args.mode == "decode":
+    if args.mode == "decode" and args.decode_no_prefix:
+        def mk_prompt(r: int, i: int) -> list[int]:
+            return tok.encode(
+                common.make_prompt(args.len,
+                                   seed=args.salt_seed * 100000 + r * 1000 + i),
+                add_special_tokens=False)
+
+        cache_policy: tuple[str, int] = ("none", 0)
+        warm_n = args.conc
+    elif args.mode == "decode":
         # ONE identical prompt for every slot (user directive 10-16):
         # the warm round fills the APC with the whole prompt, every timed
         # slot then hits the full block-aligned prefix (100% within block
