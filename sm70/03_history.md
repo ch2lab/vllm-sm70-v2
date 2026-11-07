@@ -22096,3 +22096,20 @@ Flash-Next 是唯一 nvfp4 反而快的模型（106.2/116.4/395.0），因为它
 （split-plane vs 交错），内核本身未证伪；但因内核文件已回退（只支持 HD=256），
 **在 D=128 上做 Triton↔CUDA 对拍的前提（CUDA 侧能跑 D=128）目前不成立**，
 需先把 D=128 支持做到"能跑通"，对拍才有意义。
+
+### (132) Flash-Next 的 fp8 两种 KV 在 TP4 下**不可用**（2026-11-07 19:45–20:05）
+
+把标准脚本的 dtype 参数化（`FLASHNEXT_KV`，默认 nvfp4）后逐一试：
+
+| dtype | 结果 |
+|---|---|
+| nvfp4 | ✅ 已测：106.2 / 116.4 / 395.0 |
+| **fp8_e4m3** | ❌ `NotImplementedError: QSA fp8-e4m3 KV on sm_70 needs the page4-TP8 route (SM70_PAGE4_TP8=1); the Triton arm cannot compile fp8e4nv on this architecture`（`qsa.py:2508`） |
+| **fp8_e5m2** | ❌ 在 `compile_or_warm_up_model → _initialize_kv_caches` 阶段 worker 直接死掉，错误串为空（`Worker failed with error ''`），即无可用读取路径 |
+
+⇒ **Flash-Next 在 TP4 只有 nvfp4 一条路**（这也是它 nvfp4 反而快的原因：走的是 page4 内核内反量化）。
+fp8 需要 page4-TP8，而 TP8 在本机 4 卡上无法验证。
+
+另注：**标准脚本里任何一次 `--kv-cache-dtype` 变更都必须先 `systemctl stop vllm-qwen36`**
+—— 否则 GPU0 被待机服务占掉 25 GB，会以
+`Free memory on device cuda:0 (6.11/31.73 GiB) ... less than desired` 失败（本轮撞过一次）。
