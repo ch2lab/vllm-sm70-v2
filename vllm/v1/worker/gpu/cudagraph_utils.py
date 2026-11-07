@@ -76,6 +76,10 @@ class AttentionState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor]
 
 
+# 1cat's DFlash cuda-graph manager names the same tuple CapturedAttentionState.
+CapturedAttentionState = AttentionState
+
+
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
