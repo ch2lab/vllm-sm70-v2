@@ -21808,3 +21808,29 @@ Python 侧 metadata 重建。尝试打开策略里的 `context_kv_graph`（把 c
 MTP 提交 2 行就有 AL 1.76。⇒ conc8 的瓶颈是**每行 verify 成本**，不是草稿质量。
 1cat 的 8 并发优势来自其 `FLASH_ATTN_V100` 长上下文后端（10,728 行），
 本树未移植，属独立周期。
+
+### (121) 与 1cat profile 逐项对账：两个可疑差异，一个无效、一个会打崩（2026-11-07 13:38–13:48）
+
+1cat 的 `qwen38_27b_nvfp4_dflash2.json` 里，我们的 arm 有两项不一致：
+
+| 项 | 1cat | 我们 | 单变量实测 |
+|---|---|---|---|
+| `speculative_config.kv_cache_dtype` | `auto`（草稿用自己的 fp16 缓存） | 未设（继承目标 fp8） | **设 auto → AL 1.00**（0/329），不可用 |
+| `draft_sample_method` | `probabilistic` | 未设（默认 greedy） | **完全等价**：3.62 / 34-of-91 / 逐位置 0.846,0.462,… 与 greedy 一模一样 |
+
+⇒ 我们的树里 **draft KV group 不能独立指定 dtype**（scheduler 按目标配置分配，草稿按 auto 解释会错位），
+所以生产配置保持"继承 fp8 + greedy"。这两项都不是接受率差距的来源。
+
+其余 profile 项已核对为一致或不可用：`tensor_parallel_size=4`、`kv_cache_dtype=fp8_e4m3`、
+`max_num_batched_tokens=4096`、`max_num_seqs=8`、`gpu_memory_utilization=0.83`、
+`block_size`（我们自动取 1648，与 mamba page 对齐）、`enable_prefix_caching=True`。
+唯一硬差异仍是 `attention_backend=FLASH_ATTN_V100`（草稿侧），本树没有。
+
+**由此得到的 conc8 归因（本轮新增）**：
+- 模型是**稠密** 27B（19.1 GiB NVFP4，无 MoE），TP4 下每卡每步需读 ~4.8 GiB；
+- `vllm bench forward` 形状基准显示 m8 就要 **20.4 ms**（≈253 GB/s，仅 HBM 的 28%），
+  m16 27.4 ms ⇒ 每步存在 ~20 ms 的**固定成本**，行边际 ~0.9 ms；
+- 即 conc8 不是草稿问题、也不是带宽打满，而是**每步固定开销**（64 层 × 多 kernel 启动、
+  每层 all-reduce、NVFP4 反量化链）叠加。
+- DFlash2 在 conc8 每行只换 0.34 token（2.72/8 行），MTP 每行 0.88（1.76/2 行）⇒
+  高并发下 DFlash 的 8 行验证不划算，这是它 conc8 只有 MTP 一半的直接原因。
