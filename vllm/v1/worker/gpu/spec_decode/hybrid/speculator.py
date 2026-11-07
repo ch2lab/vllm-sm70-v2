@@ -59,16 +59,26 @@ class NgramMTPHybridSpeculator(MTPSpeculator):
         if batch is None or batch.num_reqs > self.ngram_max_reqs:
             return False
         k = kwargs.get("num_speculative_tokens") or self.num_speculative_steps
-        # Decode steps schedule exactly k+1 tokens per request.  Anything else
-        # (chunked prefill, mixed batches) must reach the MTP drafter so its KV
-        # cache is filled for requests that may later be served by MTP.
-        # num_scheduled_tokens is a host numpy array, so this costs no sync --
-        # probing the GPU num_sampled tensor here cost ~8% of the step.
+        # Host pre-filter: a decode step cannot schedule more than k+1 tokens
+        # per request, so anything above that is chunked prefill and must reach
+        # the MTP drafter (which fills its own KV cache for those tokens).
         sched = getattr(batch, "num_scheduled_tokens", None)
         if sched is None:
             return False
         width = int(k) + 1
-        return bool((sched[: batch.num_reqs] == width).all())
+        if bool((sched[: batch.num_reqs] > width).any()):
+            return False
+        # Exact check on the sampler's own count.  An earlier host-only version
+        # compared num_scheduled_tokens == width and misclassified ~1/3 of the
+        # decode steps (measured 8K 487.9 vs 641.2 tok/s), sending them to MTP
+        # with the full k, so the exact signal is used here.  It costs one
+        # device-to-host read per step.
+        num_sampled = kwargs.get("num_sampled")
+        if num_sampled is None and len(args) > 5:
+            num_sampled = args[5]
+        if num_sampled is None:
+            return False
+        return not bool((num_sampled[: batch.num_reqs] == 0).any())
 
     @torch.inference_mode()
     def propose(self, *args, **kwargs):
