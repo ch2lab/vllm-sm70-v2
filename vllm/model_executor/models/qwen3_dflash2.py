@@ -308,14 +308,33 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        from vllm.model_executor.models.qwen3_dflash import _log_dflash_stage
+
+        trace = getattr(self, "_trace_sub", False)
+        if trace:
+            _log_dflash_stage("l0.input_ln", hidden_states)
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
+        if trace:
+            _log_dflash_stage("l0.attn_conv_prepare", hidden_states)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        if trace:
+            _log_dflash_stage("l0.self_attn", hidden_states)
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
+        if trace:
+            _log_dflash_stage("l0.attn_conv_finish", hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if trace:
+            _log_dflash_stage("l0.post_ln", hidden_states)
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
+        if trace:
+            _log_dflash_stage("l0.mlp_conv_prepare", hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if trace:
+            _log_dflash_stage("l0.mlp", hidden_states)
         hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
+        if trace:
+            _log_dflash_stage("l0.mlp_conv_finish", hidden_states)
         return hidden_states, residual
 
 

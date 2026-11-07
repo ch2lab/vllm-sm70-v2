@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -59,6 +60,23 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Opt-in per-stage finiteness tracing for the DFlash draft forward. Keep it off
+# in production; with --enforce-eager it pinpoints the first non-finite stage.
+_DFLASH_STAGE_TRACE = os.environ.get("QUASAR_TRACE_DFLASH_STAGES") == "1"
+
+
+def _log_dflash_stage(name: str, tensor: torch.Tensor) -> None:
+    values = tensor.detach().float()
+    logger.info(
+        "DFlash stage %s: dtype=%s finite=%s nan=%d inf=%d absmax=%.6g",
+        name,
+        tensor.dtype,
+        bool(torch.isfinite(values).all()),
+        int(torch.isnan(values).sum()),
+        int(torch.isinf(values).sum()),
+        float(values.abs().max()) if values.numel() else 0.0,
+    )
 
 
 _SLIDING_ATTENTION = "sliding_attention"
@@ -394,13 +412,21 @@ class DFlashQwen3DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        if getattr(self, "_trace_sub", False):
+            _log_dflash_stage("l0.input_ln", hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        if getattr(self, "_trace_sub", False):
+            _log_dflash_stage("l0.self_attn", hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if getattr(self, "_trace_sub", False):
+            _log_dflash_stage("l0.post_ln", hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if getattr(self, "_trace_sub", False):
+            _log_dflash_stage("l0.mlp", hidden_states)
         return hidden_states, residual
 
 
@@ -884,15 +910,26 @@ class DFlashQwen3Model(nn.Module):
 
         hidden_states = input_embeds
 
+        if _DFLASH_STAGE_TRACE:
+            self._trace_stage("embed", hidden_states)
         residual = None
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
+            if _DFLASH_STAGE_TRACE and layer_index == 0:
+                layer._trace_sub = True
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if _DFLASH_STAGE_TRACE:
+                self._trace_stage(f"layer{layer_index}", hidden_states)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if _DFLASH_STAGE_TRACE:
+            self._trace_stage("norm", hidden_states)
         return hidden_states
+
+    def _trace_stage(self, name: str, tensor: torch.Tensor) -> None:
+        _log_dflash_stage(name, tensor)
 
     def _preprocess(
         self, weights: Iterable[tuple[str, torch.Tensor]]

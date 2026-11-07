@@ -730,6 +730,28 @@ class DFlashSpeculator(DraftModelSpeculator):
                 context_slots,
             )
         self._debug_proposal_stage("context kv end")
+        if (
+            getattr(self, "_debug_proposal_stages", False)
+            and getattr(self, "_debug_real_proposal", False)
+            and getattr(self, "_debug_draft_input_dumped", False) is False
+        ):
+            self._debug_draft_input_dumped = True
+            _slots = context_slots
+            if isinstance(_slots, (list, tuple)):
+                _slots = _slots[0] if _slots else None
+            logger.info(
+                "DFlash draft input facts: seq_lens=%s ctx_slots=%s "
+                "query_slots=%s draft_max_seq_len=%s num_target_tokens=%s "
+                "layer_group_idx=%s",
+                self.input_buffers.seq_lens[:num_reqs].tolist(),
+                None if _slots is None else _slots[:8].tolist(),
+                None
+                if self._query_slot_mappings is None
+                else self._query_slot_mappings[0, :8].tolist(),
+                self.draft_max_seq_len,
+                num_target_tokens,
+                self._layer_group_idx,
+            )
 
         if not dummy_run and _is_context_only_prefill(input_batch):
             # Intermediate chunked-prefill steps only need to materialize the

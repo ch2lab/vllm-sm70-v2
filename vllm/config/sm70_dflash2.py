@@ -35,6 +35,10 @@ class Sm70DFlash2Config:
     """
 
     resolved: bool = False
+    # The DFlash2 checkpoints declare bfloat16 weights, but SM70 has no native
+    # BF16 arithmetic, so the draft runs in FP16. Without the range-preserving
+    # path the MLP overflows FP16 and poisons every downstream layer with NaN.
+    bf16_emulation: bool = True
     proposal_temperature_scale: float | None = None
     proposal_top_p: float | None = None
     lookup: DFlashLookupPolicy = field(default_factory=DFlashLookupPolicy)
@@ -61,7 +65,11 @@ def sm70_dflash2_enabled(feature: str, config: Any) -> bool:
     return bool(config.get(feature, False))
 
 def dflash2_bf16_emulation(policy: "Sm70DFlash2Config | None") -> bool:
-    """Whether the SM70 BF16-emulation path is requested (never, here)."""
-    if policy is not None and getattr(policy, "resolved", False):
-        return bool(getattr(policy, "bf16_emulation", False))
-    return False
+    """Whether the range-preserving FP16 path for BF16 drafts is enabled.
+
+    Default on: the DFlash2 drafter is BF16-trained and SM70 lacks BF16
+    arithmetic, so plain FP16 transport overflows.
+    """
+    if policy is not None:
+        return bool(getattr(policy, "bf16_emulation", True))
+    return True
