@@ -21756,3 +21756,17 @@ second: cached=0 prompt_tokens=9040
 
 **处置**：给 harness 加 `--decode-no-prefix`（decode 模式改用独立 prompt、不做 APC 校验），
 用**同脚本、同 salt、同长度**对 DFlash2 与 MTP 做同期 A/B，避免拿不同口径比。
+
+**同期 A/B（conc8、2k prompt、无 APC、salt 9918，同脚本同轮次）**：
+
+| 臂 | decode_agg | AL | per-stream |
+|---|---|---|---|
+| MTP（bs≥3 时 k=1） | **574.5** | 1.76 | 47.9–73.9 |
+| DFlash2（k=7） | 286.8 | 2.72 | 29.7–43.x |
+
+⇒ conc8 上 DFlash2 只有 MTP 的 **50%**，单流 8K 也低 8%。原因是草稿只能走
+**eager 前向**（见 (117) 第二条修复）：FULL graph 需要 `FLASH_ATTN_V100` 的
+in-place metadata builder，本树没有这个后端，于是每步 8 行 × 5 层的草稿开销
+在高并发下摊不掉。DFlash2 目前**只在 64K 单流有优势**（190.8 vs 155.2）。
+
+后续要么补 `FLASH_ATTN_V100`（使其可走 FULL graph），要么只在长上下文档启用 DFlash2。
