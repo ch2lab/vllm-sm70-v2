@@ -828,7 +828,11 @@ def _qsa_page4_eligible(
     """
     # On sm_70 the fp8 QSA readers are the byte path in _maybe_dequant: the
     # nvfp4/page4 kernels assume e4m3 cell semantics and fault on e5m2.
-    if k_cache.dtype == torch.float8_e5m2 and _is_sm70():
+    if (
+        k_cache.dtype == torch.float8_e5m2
+        and _is_sm70()
+        and os.environ.get("VLLM_SM70_FP8_PREFILL_PAGE4", "1") != "1"
+    ):
         return False
     global _page4_tp4_probe_logged
     if not _page4_tp4_probe_logged and q.dim() == 3 and int(q.shape[0]) >= 1024:
@@ -1225,7 +1229,11 @@ def _qsa_page4_tp8_eligible(
     """TP8 3-head page4 gate (same shape rules as the TP4 gate, heads==3)."""
     # On sm_70 the fp8 QSA readers are the byte path in _maybe_dequant: the
     # nvfp4/page4 kernels assume e4m3 cell semantics and fault on e5m2.
-    if k_cache.dtype == torch.float8_e5m2 and _is_sm70():
+    if (
+        k_cache.dtype == torch.float8_e5m2
+        and _is_sm70()
+        and os.environ.get("VLLM_SM70_FP8_PREFILL_PAGE4", "1") != "1"
+    ):
         return False
     if not _qsa_page4_tp8_enabled():
         return False
@@ -1816,7 +1824,11 @@ def _qsa_xqa_page4_eligible(
     """FP8-KV rows (decode or unaligned prefill) take the XQA batch route."""
     # On sm_70 the fp8 QSA readers are the byte path in _maybe_dequant: the
     # nvfp4/page4 kernels assume e4m3 cell semantics and fault on e5m2.
-    if k_cache.dtype == torch.float8_e5m2 and _is_sm70():
+    if (
+        k_cache.dtype == torch.float8_e5m2
+        and _is_sm70()
+        and os.environ.get("VLLM_SM70_FP8_PREFILL_PAGE4", "1") != "1"
+    ):
         return False
     if not _qsa_page4_tp8_enabled():
         return False
@@ -2416,6 +2428,19 @@ def qsa_sparse_paged_attention(
     # (313632 CTAs, ~71 ms per 96-row call) and this gate was unreachable.
     # It only accepts single-request prefill (block_table rows == 1), so
     # decode and multi-request batches keep the fallback path unchanged.
+    if (
+        os.environ.get("VLLM_SM70_FP8_PREFILL_PAGE4", "1") == "1"
+        and k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and _is_sm70()
+        and use_prefill_config
+    ):
+        # page4 addresses KV in 4-token microblocks and rejects a block stride
+        # that is not a multiple of 4*token_stride; the engine's fp8 block is
+        # padded past that (e4m3: 11,860,992 % 2048 = 1024).  Hand the route a
+        # packed copy: 85 MB per tensor, a few ms against the prefill it
+        # accelerates.  Read-only path, so the copy cannot shadow a write.
+        k_cache = k_cache.contiguous()
+        v_cache = v_cache.contiguous()
     if _qsa_page4_eligible(
         q,
         k_cache,

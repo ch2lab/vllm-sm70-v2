@@ -22506,3 +22506,26 @@ microblock 布局 —— 放开这道门会算错页表，不能改（除非改 
 12–50% 的 page 重叠，而 Triton splitk 是逐行 gather。要抹平必须二选一：
 ① 改 fp8 KV cache 的分配布局使其满足 page4 的 4-token microblock 整除；
 ② 写一个分组的 fp8 prefill 内核。两者都超出"改配置/调 tile"的范围，需单独立项。
+
+### (148) 【采纳】fp8 prefill 提速 24–41%：packed 拷贝让 page4 路由可用（2026-11-08 03:20–06:00）
+
+**做法**（选项 b）：fp8 的 KV 视图在进入 page4 前做一次 `contiguous()` 拷贝，使
+`stride(0) % (4*stride(1)) == 0` 成立（e4m3 原始 11,860,992 % 2048 = 1024 → 拷贝后
+405,504 % 1024 = 0）。拷贝量 85 MB/张量，相对被加速的 prefill 可忽略；page4 只读，
+不会遮蔽写。阀门 `VLLM_SM70_FP8_PREFILL_PAGE4`（默认 1，可置 0 回退 Triton）。
+
+**Flash-Next / TP4 / maxlen 262144 / salt 9918（同 harness）**：
+
+| KV | 指标 | 改前 | **改后** | 提升 |
+|---|---|---|---|---|
+| fp8_e4m3 | 8K prefill | 4231 | **5483 / 5541** | **+30%** |
+| fp8_e4m3 | 64K prefill | 4135 | **5120** | **+24%** |
+| fp8_e4m3 | 8K/64K decode | 116.0/121.2 | 117.1/123.3 | +1% |
+| fp8_e5m2 | 8K prefill | 4010 | **5614 / 5683** | **+41%** |
+| fp8_e5m2 | 64K prefill | 4141 | **5332** | **+29%** |
+| fp8_e5m2 | 8K/64K decode | 117.3/121.9 | 119.8/124.3 | +2% |
+
+**数值校验**：同一 greedy 请求（96 token，temperature 0）在 page4 与 Triton 两条路由下
+输出 **逐字完全相同**（211 字符，e5m2）。
+**路由证据**：日志出现 `QSA arm: TP4 6-head page4 (grouped verify)`。
+nvfp4 不经过该分支（仅 fp8 dtype 触发），基线 5630/5283、111.0/117.2 保持不变。
