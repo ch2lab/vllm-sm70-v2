@@ -22333,3 +22333,62 @@ verify 的开销完全抵消收益。**⇒ TP1 应关 MTP**（TP4 上接受长�
 \* conc8 的 `INVALID(min_cached=61200 need>=62259)` 仍是 harness 前缀门限（16-token 页）口径问题；
 immune 模式（`--decode-no-prefix`）下测得 571.6 agg。
 注意：TP4 的 309.1 是 `mtpsched` 臂，与这里的 nospec **不可直接比**，需补 TP4 nospec 才能做 TP 扫描结论。
+
+### (143) 三项"参考 1cat 算法"的实测结论（2026-11-08 00:50–01:30）
+
+#### #1 fp8 KV 在 sm_70 的字节解码（已采纳，Flash-Next TP4 打通）
+
+算法来源：1cat `csrc/attention/sm70_v37/bridge.cu:15-66` 的精确位展开
+（E5M2 = `raw<<8`；E4M3 = `(mag<<7)+0x2000` 再 ×2^8，次正规走 float，NaN→0x7e00）。
+
+- 逐码点对拍：**E4M3 256/256、E5M2 256/256 与 torch 转换逐位相同（0 处不一致）**；
+- 我们树内早已有 e4m3 的 PTX 字节解码（`qsa.py:_maybe_dequant`，shf/lop3/prmt，一次 4 字节，
+  输出 x*2^-8），缺的只是"把 fp8 cache 当 uint8 传入"这一步；
+- 改动：`qsa_sparse_paged_attention` 在 sm_70 上对 fp8_e4m3/e5m2 改为
+  `k_cache.view(torch.uint8)` + `_maybe_dequant(tile, E5M2)`，e4m3 标度折 2^8、e5m2 不折；
+  warmup 同步带上 `KV_E5M2`。**删除**了原来的 `NotImplementedError`。
+
+**Flash-Next / TP4 / fp8_e4m3（此前直接 NotImplementedError）**：
+
+| 项 | nvfp4（基线） | **fp8_e4m3（新）** |
+|---|---|---|
+| 8K decode | 109.2 | **116.0** |
+| 64K decode | 116.0 | **121.2** |
+| 8K prefill | 5630 | 4231 |
+| 64K prefill | 5278 | 4135 |
+| KV 池 token 数 | 487,446 | 307,543 |
+
+⇒ decode 略快（fp8 的 uint8 字节路径比 nvfp4 的反量化更轻），prefill 慢 ~22%；
+吞吐与输出均正常（"KV cache 是大模型推理时缓存历史 token 的 Key/…"）。
+
+#### #2 GDN 融合 decode（1cat 更快，但需先对齐布局）
+
+同形状 A/B（Flash-Next TP4：H=4、HV=12、K=V=128，Triton packed decode vs
+1cat `gdn_decode_mixed_qkv_global_state_sm70`，同卡、无 CUDA graph、200 次取中位）：
+
+| T | 我们（Triton packed） | 1cat（CUDA 融合） | 倍差 |
+|---|---|---|---|
+| 1 | 90.1 µs | **39.9 µs** | 2.26× |
+| 8 | 88.1 µs | **41.0 µs** | 2.15× |
+
+按 36 层折算：3.2 ms vs 1.44 ms/步。但两者**都远离带宽地板**（state 12×128×128 fp32
+= 786 KB，读写合计 1.57 MB ⇒ ~1.7 µs），说明当前测的是 launch/占用率主导，生产里
+CUDA graph 会吃掉一部分差距 —— 真正的收益要等"图内 A/B"才能定。
+另外逐元素对拍 rel≈0.9（absmax 相同 0.03226），说明混合 QKV 的头部排布/归一化约定
+还没对齐，**移植前必须先对齐再做数值等价**。
+
+#### #3 v37 式长 prefill（1cat 的 shipped 实现不占优）
+
+1cat 1.5.2 的 wheel 里没有 `sm70_d256_gqa_v37_fwd` 符号（只有 `flash_attn_v100`），
+故用其 shipped 的 dense d256 GQA prefill 在同形状计时（Hq=6/Hkv=1/D=256）：
+
+| Q | KV | 每层 | 
+|---|---|---|
+| 4096 | 65536 | **134.3 ms** |
+| 8192 | 65536 | 259.6 ms |
+| 1024 | 262144 | 168.5 ms |
+
+按 64K prompt、4096 分块、12 个 attention 层外推：Σ ≈ 16×67 ms×12 ≈ **12.9 s（仅 attention）**，
+而我们 Flash-Next 的 64K **端到端** prefill 是 **12.1 s**（含 36 GDN + MoE + PLE）。
+⇒ dense 路径不占优，我们保持 QSA 稀疏 prefill；v37 的具体优化（prefix/tail 拆分 +
+score cache）只在 dense、batch=1 前提下有意义，暂不移植。

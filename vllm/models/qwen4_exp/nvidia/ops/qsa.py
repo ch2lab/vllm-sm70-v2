@@ -94,8 +94,12 @@ def _is_sm120() -> bool:
 
 
 @triton.jit
-def _maybe_dequant(tile):
+def _maybe_dequant(tile, E5M2: tl.constexpr):
     if tile.dtype == tl.uint8:
+        if E5M2:
+            # E5M2 shares fp16's exponent/mantissa layout, so a byte shifted
+            # into the high half is the exact fp16 value (no arithmetic).
+            return (tile.to(tl.uint16) << 8).to(tl.float16, bitcast=True)
         # e4m3 bytes below sm_89 (no Triton fp8e4nv pointer type): sign to bit
         # 15, exp+mantissa to bits 13..7 gives the fp16 of x * 2^-8. Exact for
         # every finite code; the two NaN codes decode to +-480 after the host
@@ -188,6 +192,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_E5M2: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -261,7 +266,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
         # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
         # measured slower here and less accurate).
-        keys = _maybe_dequant(keys).to(query.dtype)
+        keys = _maybe_dequant(keys, KV_E5M2).to(query.dtype)
         values = tl.load(
             v_cache_ptr
             + safe_page[:, None] * stride_v_block
@@ -274,7 +279,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
         # softmax) so fp16 has the range, its wider mantissa is more
         # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
-        values = _maybe_dequant(values)
+        values = _maybe_dequant(values, KV_E5M2)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
         # caches the K dequant scale is already folded into softmax_scale on the
@@ -2497,17 +2502,29 @@ def qsa_sparse_paged_attention(
         )
 
     if (
-        k_cache.dtype == torch.float8_e4m3fn
+        k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         and _is_sm70()
     ):
-        # sm_70 Triton cannot compile fp8e4nv; the FMA arm above already
-        # skips fp8, so on this architecture the e4m3 KV has no reader but
-        # the page4-TP8 route. Fail loud at the call site instead of dying
-        # deep in Triton with a CompilationError.
-        raise NotImplementedError(
-            "QSA fp8-e4m3 KV on sm_70 needs the page4-TP8 route "
-            "(SM70_PAGE4_TP8=1); the Triton arm "
-            "cannot compile fp8e4nv on this architecture"
+        # sm_70 has no Triton fp8 pointer type, so read the 1-byte codes as
+        # uint8 and decode them with integer math in the kernel: E4M3 through
+        # the PTX path (which yields x * 2^-8, hence the 2^8 fold below) and
+        # E5M2 through a plain <<8 bitcast (exact, no fold).
+        kv_e5m2 = k_cache.dtype == torch.float8_e5m2
+        fold = 1.0 if kv_e5m2 else 256.0
+        return _qsa_triton_body(
+            q,
+            k_cache.view(torch.uint8),
+            v_cache.view(torch.uint8),
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config,
+            out,
+            output_gate_view,
+            True,
+            softmax_scale * fold,
+            output_scale * fold,
+            kv_e5m2=kv_e5m2,
         )
 
     return _qsa_triton_body(
@@ -2539,6 +2556,7 @@ def _qsa_triton_body(
     is_fp8: bool,
     softmax_scale: float,
     output_scale: float,
+    kv_e5m2: bool = False,
 ) -> torch.Tensor:
     """The Triton split-K GQA route over paged K/V caches (default path)."""
     if not q.shape[0]:
@@ -2610,6 +2628,7 @@ def _qsa_triton_body(
         BLOCK_N=block_n,
         num_warps=partial_warps,
         num_stages=_QSA_NUM_STAGES,
+        KV_E5M2=kv_e5m2,
     )
     if num_splits == 1:
         return out
@@ -2760,6 +2779,7 @@ def warmup_qsa_sparse_paged_attention(
             NUM_TILES=num_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            KV_E5M2=(kv_cache.dtype == torch.float8_e5m2),
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),
