@@ -21639,3 +21639,34 @@ m8→m32 共 1.98×（4 倍行数）。
 `greedy_verify`（grid=num_reqs 的小 Triton 内核）、AR（已含在模型前向里）。
 ⇒ 剩下的候选：verify 路径的元数据/slot-mapping/图边界与调度器逐请求开销；
 这三者都无法在引擎内进一步归因（nsys/torch.profiler 在本引擎均不可用，见 (83)(94)）。
+
+### (116) DFlash2：整文件移植 1cat 实现 + 10 层适配（2026-11-07 10:20–10:50）
+
+**动机**：我们的 DFlash2 在自己的 918 行基座上连续三版修复（嵌入路径 / 关键字 / input_ids）
+仍是 AL=1.00（0/329）。改为**整文件替换** 1cat 的 `dflash/speculator.py` + `dflash2/*` +
+`qwen3_dflash2.py`，并只为真正需要的接口写适配。
+
+**适配清单（每一层都有原始报错）**：
+
+| # | 缺口 | 修法 |
+|---|---|---|
+| 1 | `No module named sm70_topk_gather` | 拷贝（126 行，自包含） |
+| 2 | `No module named dflash_sm70` | 拷贝（419 行，自包含） |
+| 3 | `No module named target_sampling` | 拷贝（15 行） |
+| 4 | `DPSyncState` 丢失（我误覆盖 dp_utils/cp_utils） | `git checkout` 回滚（我们的版本本就提供所需函数） |
+| 5 | `cannot import Sm70DFlash2Config` | 写惰性策略类（`resolved=False` → 所有可选加速关闭） |
+| 6 | `'ObservabilityConfig' has no attribute runtime_trace` | getattr 守卫 |
+| 7 | `'Sm70DFlash2Config' has no attribute resolve` | 补 `resolve()`（temp_scale=1.0、top_p=1.0、lookup.nstrong=0） |
+| 8 | `'NoneType' object has no attribute 'sampling'` | `diagnostics_for()` 改为返回惰性对象而非 None |
+| 9–10 | `kernel_config.sm70_packed_topk_gather` / `collective_kernel_selections` | 静态扫描提前发现，`getattr` 默认值 |
+
+累计适配约 **200 行**（远小于最初估计的 ~5000 行基础设施）。**关键结论**：
+1cat 的 DFlash2 与我们的 runner 接口高度兼容（`InputBatch`/`InputBuffers`/`BlockTables`
+22 个成员中只缺 2 个，已补），真正的耦合只在**配置/诊断对象**上。
+
+**drafter 参考核对**：`/data/models/Qwen3.8-27B-DFlash2`（fp16）的 `config.json`
+sha256 = `873e3556509b0da0…`，与 1cat profile 钉死的 `config_sha256`
+逐字节一致；`-NVFP4` 版本被改过（`106a0e81…`）。
+
+**状态**：port3 探针仍在验证（AL 待测）。若 AL 仍 1.00，则 DFlash2 记为独立移植周期，
+不再在本会话继续投入。
