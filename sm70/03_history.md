@@ -22113,3 +22113,27 @@ fp8 需要 page4-TP8，而 TP8 在本机 4 卡上无法验证。
 另注：**标准脚本里任何一次 `--kv-cache-dtype` 变更都必须先 `systemctl stop vllm-qwen36`**
 —— 否则 GPU0 被待机服务占掉 25 GB，会以
 `Free memory on device cuda:0 (6.11/31.73 GiB) ... less than desired` 失败（本轮撞过一次）。
+
+### (133) D=128 XQA：越界根因找到（smem 欠分配），但数值仍未通过（2026-11-07 20:05–20:35）
+
+**方法**：先做 fixture 验证布局 —— 全 1 常量用例（data byte 0x22、scale 0x38）下 Triton 输出精确
+为 1.0，证明 split-plane 偏移与 e2m1/e4m3 解码理解正确。
+
+**用 compute-sanitizer 定位越界**（这是关键工具，之前没用）：
+```
+Invalid __shared__ write of size 8 bytes
+  at decode_xqa16, thread (228,0,0), Address 0x4b00 (19200) is out of bounds
+```
+启动器在 D=128 下只申请了 **18880 B** 动态共享内存 —— 公式
+`(16*QS + 2*BN*KVS)*2 + 4*16*16*4 + 16*SS*2 + 16*12 + 1024` 的尾部常数按 HD=256 对齐，
+QS/KVS 缩小后 `sSp/sP/sA/sM/sL/sLUT` 实际起点后移，尾部越界 ~320 B。
+给 `decode_xqa16` 的两处 smem 各加 4096 余量后**不再越界**。
+
+**但数值仍不对**：同一常量用例（正确输出应为全 1.0）得到
+`mean 1.0498 / min 0.9536 / max 1.1709`，且误差**按 head 奇偶交替**
+（even 1.0596 / odd 0.9526，所有 dim 一致）⇒ PV 段的 `sA`+`rbase` 行映射在
+G=6（D=128）下仍有错，不是简单几何问题。内核改动已 `git checkout` 回退。
+
+**结论**：D=128 的 XQA 移植已从"越界崩溃"推进到"能跑但数值错"，剩余问题定位在
+PV/softmax 的行-头映射；这需要逐 lane 对照实现（或直接为 D=128 写独立内核），
+不宜再在共享代码上做无验证的修改。
