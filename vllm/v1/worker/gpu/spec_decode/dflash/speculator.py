@@ -803,6 +803,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 draft_attn_metadata = None
                 draft_slot_mappings_by_layer = None
             else:
+                # Eager draft: no graph to satisfy, so use the exact batch
+                # instead of the graph-padded shape. Mixing the two made the
+                # query tensor (padded) and the metadata (unpadded) disagree.
+                num_reqs_padded = num_reqs
+                num_tokens_padded = num_reqs * self.num_query_per_req
                 draft_attn_metadata = self._build_draft_attn_metadata(
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded,
