@@ -244,6 +244,15 @@ def derive_tables(
     return neigh, sysp, relay, hosted
 
 
+# Payload envelope this kernel is validated for, in fp16 elements:
+# 80 rows x hidden 5120 = 409600, i.e. the largest decode batch the captured
+# FULL graphs produce (60 rows is the largest single-stream k=32 verify; 8 x
+# 8 = 64 rows is DFlash at conc8). Shapes above this were never covered by a
+# correctness + graph-replay test, so the route declines them instead of
+# risking an out-of-envelope access.
+VALIDATED_N_MAX = 80 * 5120
+
+
 class Sm70FlatAR:
     def __init__(self, group, device, max_bytes: int, s_max: int = 4,
                  lib_path: str | None = None, strict: bool = False) -> None:
@@ -484,7 +493,7 @@ class Sm70FlatAR:
         if inp.dtype is not torch.float16 or not inp.is_contiguous():
             return False
         n = inp.numel()
-        if n > self._n_max or n % 128:
+        if n > min(self._n_max, VALIDATED_N_MAX) or n % 128:
             return False
         if self._pick_s(n) == 0:
             return False
@@ -499,6 +508,12 @@ class Sm70FlatAR:
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         n = inp.numel()
+        if n > min(self._n_max, VALIDATED_N_MAX):
+            raise RuntimeError(
+                f"SM70 flat AR: n={n} exceeds the validated envelope "
+                f"({min(self._n_max, VALIDATED_N_MAX)} elems); call should_use() "
+                "and fall back to the next backend."
+            )
         s = self._pick_s(n)
         out = torch.empty_like(inp)
         stream = torch.cuda.current_stream(self.dev).cuda_stream
