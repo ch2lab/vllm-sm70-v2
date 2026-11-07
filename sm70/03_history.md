@@ -21430,3 +21430,16 @@ quantized : (51.10 − 30.90)/12 = 1.68 ms / extra draft pass
 AL 证据：单流档出现 **33.00**（ngram 路径生效），并发档为 1.78/1.82（MTP 路径生效），分派正确。
 8K 641 vs 699 与 conc8 271 vs 288 的差需拆分（该次运行 prefill 也慢 4.7%，疑环境漂移；
 并发尾部 bs<3 时可能误走 ngram）。正在跑 `MAX_REQS=1`（只有 bs==1 走 ngram）与 `ng48` 两个臂判定。
+
+### (107) 三档 speculation profile 固化（2026-11-07 08:52）
+
+`/root/run/serve_27b_quasar.sh` 新增 `QUASAR_PROFILE`（显式 `QUASAR_SPEC` 仍优先）：
+
+| profile | 配置 | 8K 单流 | 64K | conc8 | 适用 |
+|---|---|---|---|---|---|
+| `mtp`（默认） | MTP k=12 + 调度 | 243.2 | 156.1 | **287.9** | 任意内容、并发 |
+| `ngram` | lookup k=32 + 调度 | **698.9** | **417.0** | 173.0 | lookup 友好内容（重复/引用密集） |
+| `hybrid` | bs≤2 ngram / bs≥3 MTP | 641.2 | 398.2 | 271.1 | 两者兼得，代价 ~8% |
+
+`hybrid` 的 8% 与"同时常驻两个 drafter 后目标 KV 池 −8.1%"数值重合（1,466,266 → 1,347,702 tokens），
+但因果未定；`hybrid32m0`（混合框架内永不使用 ngram）对照臂用于判定它是否与分派无关。
