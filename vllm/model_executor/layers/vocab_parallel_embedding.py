@@ -593,6 +593,19 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     """
 
+    def maybe_get_sm70_dflash2_top20(
+        self,
+        hidden_states: torch.Tensor,
+        selector_k: int,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """SM70 packed top-k head for the DFlash2 drafter (not available here).
+
+        Returning None makes the caller take the generic quant_method.apply
+        path, which is numerically the same computation.
+        """
+        return None
+
     # --8<-- [end:parallel_lm_head]
 
     def __init__(

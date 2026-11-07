@@ -9,23 +9,47 @@ speculator then runs its plain block-drafting path.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass
+class DFlashLookupPolicy:
+    """Inert lookup policy (successor table disabled)."""
+
+    nstrong: int | None = None
+
+    def resolve(self) -> None:
+        if self.nstrong is None:
+            self.nstrong = 0
+
+
+@dataclass
 class Sm70DFlash2Config:
     """Inert SM70 DFlash2 policy: every optional extra stays disabled.
 
-    ``resolved=False`` makes the speculator's ``sm70_dflash2_enabled`` lookups
-    fall through to this module's own (always False) implementation instead of
-    reading per-field policy attributes.
+    ``resolved`` stays False so ``sm70_dflash2_enabled`` falls through to this
+    module's always-False implementation instead of reading policy fields.
+    ``resolve`` only fills the two proposal filters the speculator asserts on,
+    with the neutral values (temperature scale 1.0, top-p 1.0).
     """
 
     resolved: bool = False
+    proposal_temperature_scale: float | None = None
+    proposal_top_p: float | None = None
+    lookup: DFlashLookupPolicy = field(default_factory=DFlashLookupPolicy)
+
+    def resolve(self, *, qualified: bool = False) -> None:
+        if self.proposal_temperature_scale is None:
+            self.proposal_temperature_scale = 1.0
+        if self.proposal_top_p is None:
+            self.proposal_top_p = 1.0
+        self.lookup.resolve()
 
 
-def capture_sm70_dflash2_config(vllm_config: Any) -> dict[str, Any]:
+def capture_sm70_dflash2_config(vllm_config: Any = None) -> dict[str, Any] | None:
+    if vllm_config is None:
+        return None
     spec = getattr(vllm_config, "speculative_config", None)
     extra = getattr(spec, "dflash2", None) if spec is not None else None
     return dict(extra) if isinstance(extra, dict) else {}
@@ -35,3 +59,9 @@ def sm70_dflash2_enabled(feature: str, config: Any) -> bool:
     if not isinstance(config, dict):
         return False
     return bool(config.get(feature, False))
+
+def dflash2_bf16_emulation(policy: "Sm70DFlash2Config | None") -> bool:
+    """Whether the SM70 BF16-emulation path is requested (never, here)."""
+    if policy is not None and getattr(policy, "resolved", False):
+        return bool(getattr(policy, "bf16_emulation", False))
+    return False

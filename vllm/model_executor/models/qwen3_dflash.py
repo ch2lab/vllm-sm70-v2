@@ -927,9 +927,14 @@ class DFlashQwen3Model(nn.Module):
             if mapped_name is None:
                 continue
             name = mapped_name
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
+            # This tree's QuantizationConfig has no get_cache_scale(); the
+            # generic "scale" remap below covers the same checkpoints.
+            scale_name = None
+            if self.quant_config is not None and hasattr(
+                self.quant_config, "get_cache_scale"
             ):
+                scale_name = self.quant_config.get_cache_scale(name)
+            if scale_name:
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 loaded_weight = (
