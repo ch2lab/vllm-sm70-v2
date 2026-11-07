@@ -22472,3 +22472,37 @@ QSA 有界窗口"的量级一致 ⇒ **decode 已贴近权重带宽地板**，�
 按 8.3 ms/步 × 900 GB/s ≈ 7.5 GB/卡/步 判断已贴权重带宽地板。
 **prefill**：nvfp4 走 page4 内核内反量化（5629/5283），fp8 走 Triton splitk 字节路径
 （4010–4231），差 ~22%——这是后续 prefill 优化的入口（把 fp8 也接到 page4 路由）。
+
+### (147) fp8 prefill 加速的两个尝试：定点测量后均否决（2026-11-08 03:00–04:40）
+
+**目标**：把 fp8 prefill（4231 tok/s @8K、4138 @64K）向 nvfp4（5629/5283）靠近。
+
+**先定位**（e4m3 prefill-only profile，`/data/sm70_results/fn_prof_e4`）：
+`_qsa_sparse_paged_gqa_splitk_kernel` **2584 ms / 38.8%** 是第一热点（nvfp4 走 page4 CUDA 内核）。
+其余：MoE wide 17.1%、GDN prefill 14.4%、cutlass 10%、NCCL 7%。
+
+**为什么不能直接改用 page4**：`_qsa_page4_eligible` 的最后一道门是
+`k_cache.stride(0) % (4*k_cache.stride(1)) == 0`。实测：
+- e4m3: stride(0)=11,860,992，4×stride(1)=2048 ⇒ 余 1024 ⇒ **拒**
+- nvfp4: stride(0)=7,248,384，4×stride(1)=1152 ⇒ 整除 ⇒ 通过
+fp8 的页步长含有非 4-token 对齐的 padding，而 page4 的 `as_strided` 物理视图假定紧密
+microblock 布局 —— 放开这道门会算错页表，不能改（除非改 KV cache 分配布局）。
+
+**尝试 1（tile/stage 扫描，离线微基准）**：2048 行、2051 宽度选择、1584-token 页：
+| 配置 | 时间(2048行) | 备注 |
+|---|---|---|
+| BLOCK_N=32 w4 s2（现状） | 17.80 ms | ref |
+| BLOCK_N=32 w4 **s4** | **16.62 ms** | **逐位一致** |
+| BLOCK_N=16 w4 | 15.89 ms | 结果 DIFF（tile 改变归约顺序） |
+| BLOCK_N=64 | 22.37 ms | 更慢 |
+| BLOCK_N=128 | OOM（139 KB > 98 KB） | |
+
+**端到端复测（同 harness、salt 9918、maxlen 262144）**：
+- `num_stages=4`：8K **4230.6 / 4233.4**（改动前 4231）⇒ **无变化**；
+- `BLOCK_N=16`：8K **3632 / 3657**、64K **3441** ⇒ **明显更慢**。
+⇒ 离线微基准（合成选择集）不能代表生产的页面局部性；两处改动都已 `git checkout` 回退。
+
+**结论**：fp8 prefill 的 ~22% 缺口是**结构性**的——page4 的分组读取利用了相邻行
+12–50% 的 page 重叠，而 Triton splitk 是逐行 gather。要抹平必须二选一：
+① 改 fp8 KV cache 的分配布局使其满足 page4 的 4-token microblock 整除；
+② 写一个分组的 fp8 prefill 内核。两者都超出"改配置/调 tile"的范围，需单独立项。
