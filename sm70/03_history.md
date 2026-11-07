@@ -22002,3 +22002,18 @@ AR 侧同样接近地板，切片数 S 扫描（16 行，160 KB 载荷）：
 **harness 已参数化**：`perf_arms.sh` 现在支持 `SM70_BASE / SM70_MODEL / SM70_MODEL_PATH`
 （模型/端口可换），配合启动器的 `QUASAR_MODEL/NAME/MAXLEN/TP/KV/PORT/DEVS`
 即可测任意模型；备份 `perf_arms.sh.bak2`。
+
+### (128) Qwen3.8-Flash-Next 首次启动：TP4 只能用 fp8，nvfp4 需 page4-TP8（2026-11-07 18:20–18:52）
+
+**两次失败的根因（都记原始行）**：
+
+1. `VLLM_KV_CACHE_LAYOUT=HND does not satisfy every supported set; valid layouts:
+   ['BLNHC','BLHNC']` —— 该模型不接受 27B 用的 HND。启动器已把布局参数化
+   （`QUASAR_KV_LAYOUT`，默认 HND）。
+2. `QSA nvfp4 KV needs the page4-TP8 route (SM70_PAGE4_TP8=1)`（`qwen4_exp/nvidia/ops/qsa.py:2495`）
+   —— QSA 的 nvfp4 池**没有** Triton 读取器，唯一能消费它的 page4 路径按名字就是 **TP8**。
+   ⇒ **Flash-Next 在 TP4 下不能用 nvfp4 KV**（技能缺口，不是配置问题）。
+
+**能跑的组合**：Flash-Next + `QUASAR_TP=4` + `QUASAR_KV=fp8_e4m3` + `QUASAR_KV_LAYOUT=BLHNC`
++ `QUASAR_MAXLEN=131072` + `QUASAR_UTIL=0.90` → `Application startup complete`
+（四卡各约 30 GB）。
