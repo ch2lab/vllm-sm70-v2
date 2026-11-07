@@ -21670,3 +21670,60 @@ sha256 = `873e3556509b0da0…`，与 1cat profile 钉死的 `config_sha256`
 
 **状态**：port3 探针仍在验证（AL 待测）。若 AL 仍 1.00，则 DFlash2 记为独立移植周期，
 不再在本会话继续投入。
+
+### (117) DFlash2 AL=1.00 的真正根因：BF16 草稿在 V100 上以 FP16 运行 → MLP 溢出（2026-11-07 12:00–12:40）
+
+**现象**：整文件移植 1cat 的 `dflash/` + `dflash2/` + `qwen3_dflash2.py` 后，
+DFlash2 能启动、能服务，但 `Mean acceptance length: 1.00`，`Accepted 0 / Drafted 329`，
+逐位置接受率全 0。两种 drafter（NVFP4 与 fp16）、所有采样设置结果相同。
+
+**定位手段**（这是关键，之前 10 层适配都是"接口不存在"，不是算法错）：
+移植代码自带 `DFlash2 token diagnostic`，用 `QUASAR_TRACE_PROPOSAL_STAGES=1` 打开后得到
+
+```
+finite_hidden=False max_abs_hidden=nan
+query_input_ids=[729, 248070×7]  anchor_token_id=729      # 输入侧完全正确
+```
+
+即**草稿前向输出 NaN**。再加逐阶段有限性追踪（`QUASAR_TRACE_DFLASH_STAGES=1`）：
+
+| 阶段 | 结果 |
+|---|---|
+| embed | finite, absmax 0.121 |
+| l0.input_ln | finite, absmax 2.89 |
+| l0.attn_conv_prepare | finite, absmax 20.5 |
+| l0.self_attn | finite 但**全 0** |
+| l0.post_ln | finite, absmax 4.09 |
+| **l0.mlp** | **56 个 Inf, absmax=inf** |
+| l0.mlp_conv_finish | 63 NaN + 57 Inf |
+| layer1 | 全部 327680 个 NaN |
+
+**根因**：DFlash2 的 checkpoint 声明 `dtype=bfloat16`，而 V100 没有原生 BF16 运算，
+草稿以 FP16 跑，MLP 在 FP16 下溢出 → Inf → 下游全 NaN → 任何草稿都不可能被接受。
+1cat 用 `_use_sm70_bf16_emulation()` 防这个：它换入 `DFlashSM70MLP` / `DFlashSM70RMSNorm`
+（FP32 residual、BF16 RNE、缩放 FP16 投影）。我们的惰性策略把 `dflash2_bf16_emulation()`
+写死成 False，于是这条保护被关掉。
+
+**修复**：`vllm/config/sm70_dflash2.py` 的 `dflash2_bf16_emulation()` 默认返回 True
+（`Sm70DFlash2Config.bf16_emulation = True`）。
+
+**结果**：
+
+```
+Mean acceptance length: 3.62
+Accepted 34 / Drafted 91
+Per-position: 0.846, 0.462, 0.385, 0.308, 0.231, 0.231, 0.154
+```
+
+**第二个必要修复**：FULL CUDA graph 会重放**捕获时冻结的** attention metadata。只有在
+`_refresh_draft_graph_metadata()` 成功刷新时它才有效，而该刷新依赖 `FLASH_ATTN_V100`
+的 in-place builder —— 本树只有 FLASHINFER，走的是"重建 metadata"分支。原代码在重建后
+**仍然回放 FULL graph**，于是草稿看到的是过期 context，非 eager 下 AL 又回到 1.00。
+修复为：metadata 被重建时必须走 eager 草稿路径。
+
+**副产品**：`l0.self_attn` 输出全 0 —— 这是 metadata 过期（seq_lens 冻结）的直接表现，
+与上面第二条修复一致，不是独立问题。
+
+**保留的诊断开关**（默认全关，仅诊断时用）：
+`QUASAR_TRACE_PROPOSAL_STAGES=1`（1cat 的 token diagnostic）、
+`QUASAR_TRACE_DFLASH_STAGES=1`（逐阶段 finite/nan/inf/absmax）。
