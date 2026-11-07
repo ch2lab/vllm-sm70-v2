@@ -22392,3 +22392,14 @@ CUDA graph 会吃掉一部分差距 —— 真正的收益要等"图内 A/B"才�
 而我们 Flash-Next 的 64K **端到端** prefill 是 **12.1 s**（含 36 GDN + MoE + PLE）。
 ⇒ dense 路径不占优，我们保持 QSA 稀疏 prefill；v37 的具体优化（prefix/tail 拆分 +
 score cache）只在 dense、batch=1 前提下有意义，暂不移植。
+
+**#2 补充（图内 A/B，决定性）**：把同一对内核放进 CUDA graph 后重测
+（生产就是图内执行，能剔除 Python/Triton 的发射开销）：
+
+| T | 我们（Triton packed，图内） | 1cat（CUDA 融合，图内） |
+|---|---|---|
+| 1 | **14.3 µs** | 17.4 µs |
+| 8 | **16.4 µs** | 19.5 µs |
+
+⇒ 之前 90 µs vs 40 µs 的 2.2× 差距**全部来自发射开销**；图内我们的内核更快。
+**结论：#2 不移植**（移植还会引入混合 QKV 布局的数值风险）。
