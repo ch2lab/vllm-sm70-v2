@@ -21955,3 +21955,28 @@ AR 侧同样接近地板，切片数 S 扫描（16 行，160 KB 载荷）：
 **启动器已参数化**：`QUASAR_MODEL` / `QUASAR_NAME` / `QUASAR_MAXLEN`（外加已有的
 `QUASAR_TP` / `QUASAR_KV` / `QUASAR_PORT` / `QUASAR_DEVS`），同一脚本可服务三个模型；
 备份 `/data/sm70_results/serve_sm70_generic.sh`。
+
+### (126) nvfp4 图修复的验证 + 三种 KV 口径现状 + D=128 内核尝试（2026-11-07 16:45–17:00）
+
+**三种 KV 在 27B/TP4 上的真实现状**（同一 harness、同一 MTP k=12 配置）：
+
+| KV dtype | 可用性 | AL | 8K / 64K 单流 |
+|---|---|---|---|
+| fp8_e4m3 | ✅ | 5.22 | 243.5 / 155.8 |
+| **fp8_e5m2** | ✅（本轮首次验证） | **4.55** | 未测吞吐 |
+| nvfp4 | ✅（本轮修复图捕获后） | 2.40 | **43.4 / 6.7** |
+
+**为什么 nvfp4 慢**：`supported_decode` 只允许 `(H=2,HQ=16,D=256)`；27B 在 TP4 是
+`H=1,HQ=6,D=128` ⇒ **fp8 与 nvfp4 都走 Triton**。同一族 Triton 内核下 nvfp4 比 fp8 慢
+5.6–23×，即 **nvfp4 的 Triton decode 内核本身慢**（4-bit + per-16 scale 的标量反量化），
+不是几何门造成的。
+
+**D=128 的 CUDA XQA 尝试（已回退，未留下未验证代码）**：
+把 `#define HD 256` 参数化为 `HD_DEF`、`QS/KVS=HD+8`、`KDD=HD/2`、`KSD=HD/16`、
+`SUBS=HD/16`、`SLOTS=THREADS/SUBS`，并给 fetch/commit 加 `stok >= BN` 守卫
+（D=256 时数学上完全等价）。D=128 编译通过但仍在运行期非法访问 ⇒ 内核还有其它
+256 专用假设（warp→head 映射、sQ/sK 尺寸、wmma 分块）。已 `git checkout` 回退该文件，
+保持已验证路径不变。**D=128 快速内核是一个独立的移植任务**，不宜在本轮仓促留下。
+
+**启动器**：`QUASAR_MODEL/NAME/MAXLEN/TP/KV/PORT/DEVS` 全参数化，一个脚本服务三个模型
+（备份 `/data/sm70_results/serve_sm70_generic.sh`）。
