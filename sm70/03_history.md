@@ -22434,3 +22434,28 @@ e5m2 的失败与"字节解码"无关，逐个排除后定位到三处：
 输出正常（e5m2 下 reasoning 连贯："用户问'1+1等于几？只回答数字。' 需要只…"）。
 
 **用户可见行为**：`--kv-cache-dtype fp8_e5m2 / fp8_e4m3` 在 TP4 下从此可用（此前分别崩溃/NotImplementedError）。
+
+### (145) Flash-Next nvfp4 decode 的逐内核归因（2026-11-08 02:20）
+
+方法：前缀缓存预热后只 profile decode（128 步，torch profiler，`/data/sm70_results/fn_prof2`）。
+kernel 合计 1743 ms（profiler 有开销，实际墙钟 8.5 ms/步）：
+
+| 占比 | kernel | 说明 |
+|---:|---|---|
+| 13.2% | `_qwen38_fp16_row_gemv2_kernel` | M=2 verify 的行 GEMV（词表投影类），一次权重读供两行 |
+| 12.3% | `flash_attention_decode_xqa_tc_partition_kernel_256_wide<64,6,...>` | QSA decode |
+| 7.3% | cutlass wmma d256 GEMM | |
+| 6.7% | `_qwen38_hc_up_gate_wide_kernel` | HC |
+| 5.8%+4.5% | `nvfp4_qpn2_moe_sm70` + `..._wide` | MoE |
+| 5.6% | `_qwen38_hc_down_silu_kernel` | HC |
+| 5.0% | `flat_kernel`（我们的 flat AR） | |
+| 3.7% | `gdn_forward_vlk_varlen`（GDN decode） | |
+| 4.5%+3.1% | NCCL RS / cross_device_reduce_scatter / topk_softmax | |
+
+**带宽地板核算**：8.3 ms/步 × 900 GB/s ≈ **7.5 GB/卡/步**，与"MoE top-k + lm_head 词表 +
+QSA 有界窗口"的量级一致 ⇒ **decode 已贴近权重带宽地板**，且 8K 与 64K 的步时几乎相同
+（8.53 vs 8.20 ms）说明 QSA 的有界读取生效、没有长上下文退化。
+
+⇒ decode 的剩余空间不在"再快一点的 kernel"（top-1 的 GEMV 实测 1.8 ms/步 vs 理论 1.4 ms/步，
+已 78% 带宽效率），而在算法层（更少权重可读：路由/量化/稀疏）。**当前配置参数下**不改这些，
+故本轮 decode 优化到此为止；prefill 仍是主要可优化项（nvfp4 5630/5278 vs fp8 4010–4231）。
