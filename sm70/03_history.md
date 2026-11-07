@@ -22408,3 +22408,29 @@ score cache）只在 dense、batch=1 前提下有意义，暂不移植。
 KV 初始化/捕获阶段以**空错误**死亡（`Worker failed with error ''`，随后 exit code None），
 无 OOM 记录、无 Triton 编译错误；e4m3 路径正常。⇒ e5m2 需要单独定位（大概率是
 page4/XQA 的 e5m2 分支或 KV 规格处），暂记为未完成项。
+
+### (144) fp8_e5m2 打通：根因是三个 dtype 假设（2026-11-08 01:30–02:15）
+
+e5m2 的失败与"字节解码"无关，逐个排除后定位到三处：
+
+1. **warmup 的 `is_fp8` 只认 `uint8`** —— 真实 e5m2 tensor 被当成普通 dtype，
+   在 sm_70 上编译 fp8 指针 ⇒ worker 直接死（空错误）。
+   改为 fp8 三态（uint8 / e4m3 / e5m2）并沿用 sm_70 跳过 Triton-arm warmup；
+2. **三处 page4/XQA 路由的 e5m2 准入** —— 它们在 sm_70 上会走假定 e4m3 cell 语义的
+   CUDA 内核（非法访存）。加 `e5m2 + sm_70 ⇒ return False`，统一落到字节路径；
+3. **标度折算处 `assert dtype == float8_e4m3fn`** —— e5m2 在此抛 AssertionError；
+   该断言正好发生在 **CUDA graph 捕获阶段**，异常会把 worker 带走（表现为"空错误"），
+   这也解释了为什么 `--enforce-eager` 能启动而带图不能。
+
+**Flash-Next / TP4 / 三种 KV 全矩阵（maxlen 262144、salt 9918）**：
+
+| KV | 8K dec | 64K dec | 8K prefill | 64K prefill | KV 池 tokens |
+|---|---|---|---|---|---|
+| **nvfp4（主）** | 109.2 | 116.0 | **5630** | **5278** | 487,446 |
+| fp8_e4m3 | **116.0** | **121.2** | 4231 | 4135 | 307,543 |
+| fp8_e5m2 | **117.3** | **121.9** | 4010 | 4141 | 307,543 |
+
+⇒ decode：fp8 略快（字节路径比 nvfp4 反量化轻）；prefill：nvfp4 快 ~30%（page4 内核内反量化）。
+输出正常（e5m2 下 reasoning 连贯："用户问'1+1等于几？只回答数字。' 需要只…"）。
+
+**用户可见行为**：`--kv-cache-dtype fp8_e5m2 / fp8_e4m3` 在 TP4 下从此可用（此前分别崩溃/NotImplementedError）。

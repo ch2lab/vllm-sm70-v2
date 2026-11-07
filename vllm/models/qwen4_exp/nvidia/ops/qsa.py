@@ -826,6 +826,10 @@ def _qsa_page4_eligible(
     a token-major reference; an earlier "small-window bug" was a reference
     flattening artifact, see /root/run/sm70/PHASE5_QSA_FLASHV100.md).
     """
+    # On sm_70 the fp8 QSA readers are the byte path in _maybe_dequant: the
+    # nvfp4/page4 kernels assume e4m3 cell semantics and fault on e5m2.
+    if k_cache.dtype == torch.float8_e5m2 and _is_sm70():
+        return False
     global _page4_tp4_probe_logged
     if not _page4_tp4_probe_logged and q.dim() == 3 and int(q.shape[0]) >= 1024:
         _page4_tp4_probe_logged = True
@@ -1219,6 +1223,10 @@ def _qsa_page4_tp8_eligible(
     use_prefill_config: bool,
 ) -> bool:
     """TP8 3-head page4 gate (same shape rules as the TP4 gate, heads==3)."""
+    # On sm_70 the fp8 QSA readers are the byte path in _maybe_dequant: the
+    # nvfp4/page4 kernels assume e4m3 cell semantics and fault on e5m2.
+    if k_cache.dtype == torch.float8_e5m2 and _is_sm70():
+        return False
     if not _qsa_page4_tp8_enabled():
         return False
     if not use_prefill_config:
@@ -1806,6 +1814,10 @@ def _qsa_xqa_page4_eligible(
     sequence_lengths: torch.Tensor | None,
 ) -> bool:
     """FP8-KV rows (decode or unaligned prefill) take the XQA batch route."""
+    # On sm_70 the fp8 QSA readers are the byte path in _maybe_dequant: the
+    # nvfp4/page4 kernels assume e4m3 cell semantics and fault on e5m2.
+    if k_cache.dtype == torch.float8_e5m2 and _is_sm70():
+        return False
     if not _qsa_page4_tp8_enabled():
         return False
     if k_cache.dtype not in (
@@ -2317,7 +2329,9 @@ def qsa_sparse_paged_attention(
             softmax_scale *= 256.0
             output_scale *= 256.0
         else:
-            assert k_cache.dtype == torch.float8_e4m3fn
+            assert k_cache.dtype in (
+                torch.float8_e4m3fn, torch.float8_e5m2
+            )
     else:
         assert q.dtype in (torch.bfloat16, torch.float16)
         assert k_cache.dtype in (torch.bfloat16, torch.float16)
@@ -2665,8 +2679,14 @@ def warmup_qsa_sparse_paged_attention(
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
     # An fp8 cache is allocated as uint8 storage; warm the dtype the impl hands
     # over: an e4m3 view on sm_89+, the raw bytes below.
-    is_fp8 = kv_cache.dtype == torch.uint8
-    cache_dtype = torch.float8_e4m3fn if is_fp8 else key_cache.dtype
+    is_fp8 = kv_cache.dtype in (
+        torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2
+    )
+    cache_dtype = (
+        kv_cache.dtype
+        if kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        else (torch.float8_e4m3fn if is_fp8 else key_cache.dtype)
+    )
     if is_fp8 and _is_sm70():
         # sm_70 Triton cannot compile fp8e4nv; on sm_70 the in-service fp8
         # reader is the page4-TP8 route, so the fp8 Triton-arm warmup is
