@@ -76,6 +76,17 @@ Flash-Next TP4、单卡、QSA 层 KV：
 
 两种实现，按风险排序：
 
+### 实现层事实（2026-11-08 复核）
+
+- **读路径是 Triton**：`vllm/models/qwen4_exp/nvidia/ops/qsa.py:126` 的内核直接
+  `keys = tl.load(k_cache_ptr + …)`（211 行）。⇒ nvfp4 解码可以在 Python/Triton 里加分支，
+  **读侧不需要重编 CUDA**。
+- **写路径是 CUDA**：`torch.ops._C.qsa_prep_sm70_out`（`qsa.py:1420`）把归一化后的 K/V
+  直接写进 cache。nvfp4 需要量化，方案：给它一个**紧凑 scratch**（只覆盖本步新 token，
+  行数 = num_tokens，slot 重映射为 0..n-1），再用 Triton 编码器把 scratch 量化成
+  nvfp4 cell 写进真正的 cache。scratch 内存可忽略，不动 CUDA 算子。
+- 结论：B 的两侧都可以用 Python/Triton 完成，CUDA 重编仅在需要性能时（B2）才做。
+
 ### B1（推荐先做）分块反量化（fallback，最稳）
 
 - 缓存仍按 **nvfp4 cell 布局**分配（复用 1cat 已有的
