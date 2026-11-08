@@ -48,7 +48,8 @@
 
 ## 1. Workstream A：NVFP4 PLE（纯 Python/Triton，不改 CUDA）
 
-目标：Flash-Next 能在 1cat 上 **以 nvfp4 PLE 启动**（KV 先用 fp16，作为 A 的验收条件）。
+目标：把 nvfp4 PLE 的装载/解码实现完整（**不能**用 fp16 KV 启动做验收：见 §2.0 的显存算术）。
+A 的验收改为**行级/单元级对拍**，端到端启动放到 M2 与 nvfp4 KV 一起验。
 
 | 步骤 | 内容 | 文件 |
 |---|---|---|
@@ -62,7 +63,16 @@
 **验收（A）**：`Application startup complete` + 32-token 生成语义连贯；
 用我们的解码函数做行级对拍（随机 1k 行，fp16 输出 bit-exact 或 rel<1e-3）。
 
-## 2. Workstream B：NVFP4 KV（必须改 CUDA）
+## 2. Workstream B：NVFP4 KV（必须改 CUDA；**启动的硬前提**）
+
+### 2.0 为什么不能用 fp16 KV 过渡（显存算术）
+
+Flash-Next TP4、单卡、QSA 层 KV：
+- fp8 实测：2.5 GB 池 = **307,543 tokens** ⇒ **8,129 B/token**；
+- 262144 tokens ⇒ fp16 ≈ **4.26 GB**，fp8 ≈ 2.13 GB，nvfp4 ≈ **1.34 GB**（实测 5,129 B/token）。
+- TP4 每卡权重+激活 ≈ 24.9 GB，util 0.93 预算 29.5 GB ⇒ 余量 ≈ 4.6 GB。
+  fp16 的 4.26 GB 叠加 prefill 激活（8192 token chunk）必然 OOM。
+⇒ **fp16 KV 不能作为过渡态**，nvfp4 KV 与 PLE 必须一起就绪才能启动 256K。
 
 两种实现，按风险排序：
 
@@ -106,8 +116,8 @@
 
 | 里程碑 | 内容 | 判定 |
 |---|---|---|
-| M1 | A 完成，Flash-Next 以 **nvfp4 PLE + fp16 KV** 启动 | 启动日志 + 生成连贯 + 行级解码对拍 |
-| M2 | B1，Flash-Next 以 **nvfp4 KV** 启动（分块反量化） | 同上 + 与 fp16 KV 输出一致性（greedy 文本） |
+| M1 | A（PLE）完成 + B（KV）完成到可运行 | 行级解码对拍（PLE）；KV 单元/一致性对拍 |
+| M2 | **Flash-Next 以 nvfp4 PLE + nvfp4 KV 启动**（B1 分块反量化） | `Application startup complete` + 32-token 生成连贯 |
 | M3 | B2，内核内反量化，替换 B1 | M2 全部门 + prefill/decode 不劣于 B1 |
 
 ## 5. 风险与预案
