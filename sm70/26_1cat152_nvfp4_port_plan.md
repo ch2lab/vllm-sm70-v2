@@ -4,7 +4,7 @@
 
 ## 0. 基线与事实核验
 
-- **正确源码位置**：`/data/src/1cat-vllm-152`（tag `v1.5.2`，commit `2bb8c2b9cd`，2026-11-06）。
+- **正确源码位置**：`/data/src/1cat-vllm-src`（tag `v1.5.2`，commit `2bb8c2b9cd`，2026-11-06）。
   证据：该树与 `1cat_vllm-1.5.2+cu128` wheel 抽样 60/60 个 `.py` 哈希一致，`ple_layer.py`
   哈希同为 `b4499f55`。
 - 排除项：`/data/vllm-1cat/src` 是 **v1.5.1**（分离头指针，2026-10-03）；已 `git checkout` 复原，未留改动。
@@ -93,7 +93,7 @@
 
 ## 3. 构建与验证
 
-1. **Python-only 阶段（A）**：可用 `PYTHONPATH=/data/src/1cat-vllm-152` 覆盖到已安装环境验证，
+1. **Python-only 阶段（A）**：可用 `PYTHONPATH=/data/src/1cat-vllm-src` 覆盖到已安装环境验证，
    不触发重编；确认后仍以源码树构建产物为准。
 2. **CUDA 阶段（B）**：在 `/root/vllm-1cat` 环境里对源码树构建
    （`pip install -e . --no-build-isolation`，ccache 复用），只重编改动到的 TU。
